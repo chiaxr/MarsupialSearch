@@ -13,7 +13,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
 
-from marsupial_search.core import RobotMode, RobotType, Terrain
+from marsupial_search.core import EventType, RobotMode, RobotType, Terrain
 from marsupial_search.sim import MissionResult, Scenario
 
 TERRAIN_COLORS = {
@@ -24,6 +24,7 @@ TERRAIN_COLORS = {
 _TERRAIN_CMAP = ListedColormap([TERRAIN_COLORS[t] for t in Terrain])
 ROAD_COLOR = "#4a4a4a"
 NODE_FACE, NODE_EDGE = "white", "#333333"
+TARGET_COLOR, SIGHTED_COLOR = "gold", "#00e5ff"  # the target star, before and after a robot sees it
 UGV_COLORS = ["#c0392b", "#8e44ad", "#d35400", "#2c3e50", "#16a085"]
 UAV_COLORS = ["#2980b9", "#27ae60", "#f39c12", "#e84393", "#00b8d4"]
 
@@ -87,7 +88,7 @@ def draw_prior(ax, scenario: Scenario, cbar: bool = True) -> None:
                    interpolation="nearest")
     road = scenario.graphs[RobotType.UGV]
     ax.add_collection(LineCollection(road.positions[road.edges], colors="w", linewidths=0.3, alpha=0.35))
-    ax.plot(*scenario.target_xy, "*", color="gold", ms=14, mec="k", zorder=6)
+    ax.plot(*scenario.target_xy, "*", color=TARGET_COLOR, ms=14, mec="k", zorder=6)
     ax.set_aspect("equal")
     if cbar:
         cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02, extend="min")
@@ -107,13 +108,13 @@ def plot_scenario(scenario: Scenario, path: Optional[str] = None, show_target: b
             p = scenario.graphs[RobotType.UGV].positions[init.node]
             ax.plot(*p, "s", color=_robot_color(rid, RobotType.UGV), ms=8, mec="k", zorder=5)
     if show_target:
-        ax.plot(*scenario.target_xy, "*", color="gold", ms=18, mec="k", zorder=6, label="target")
+        ax.plot(*scenario.target_xy, "*", color=TARGET_COLOR, ms=18, mec="k", zorder=6, label="target")
     handles = _legend_handles() + [
         plt.Line2D([], [], color=ROAD_COLOR, label="road graph edge"),
         plt.Line2D([], [], ls="", marker="o", ms=5, mfc=NODE_FACE, mec=NODE_EDGE, mew=0.6, label="UGV graph node"),
     ]
     if show_target:
-        handles.append(plt.Line2D([], [], marker="*", ls="", color="gold", mec="k", ms=12, label="target"))
+        handles.append(plt.Line2D([], [], marker="*", ls="", color=TARGET_COLOR, mec="k", ms=12, label="target"))
     ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
     m = scenario.meta
     ax.set_title(f"{scenario.name}: {scenario.graphs[RobotType.UGV].n_nodes} road nodes, "
@@ -142,7 +143,7 @@ def plot_result(scenario: Scenario, result: MissionResult, path: Optional[str] =
         else:
             ax.plot(traj[:, 0], traj[:, 1], color=col, lw=2.2, alpha=0.9, zorder=4, label=rid)
         ax.plot(*traj[-1], "o" if rtype == RobotType.UAV else "s", color=col, mec="k", ms=7, zorder=6)
-    ax.plot(*scenario.target_xy, "*", color="gold", ms=18, mec="k", zorder=7)
+    ax.plot(*scenario.target_xy, "*", color=TARGET_COLOR, ms=18, mec="k", zorder=7)
     ax.legend(loc="upper right", fontsize=8, ncol=2)
     ax.set_title(f"{result.controller_name}: {result.outcome} at t={result.time_s / 60:.1f} min"
                  + (f" by {result.found_by}" if result.found_by else ""))
@@ -174,7 +175,7 @@ def plot_result(scenario: Scenario, result: MissionResult, path: Optional[str] =
     _, vmin, vmax = _log_mass(scenario.prior, 3.0)
     ax3.imshow(_log10(result.final_mass), origin="lower", extent=scenario.grid.extent, cmap="magma",
                vmin=vmin, vmax=vmax, interpolation="nearest")
-    ax3.plot(*scenario.target_xy, "*", color="gold", ms=10, mec="k")
+    ax3.plot(*scenario.target_xy, "*", color=TARGET_COLOR, ms=10, mec="k")
     ax3.set_title("unsearched prior at end (same scale)", fontsize=9)
     for a in (axp, ax3):
         a.set_xticks([])
@@ -197,8 +198,10 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
     """GIF of robot motion over the remaining belief (needs belief snapshots).
 
     Side panel: robot legend with live energy bars and modes, plus a target/terrain key.
-    The colour bar explains the belief heatmap. ``step_s`` (mission time per frame)
-    defaults to about 150 frames per mission, clipped to 10-60 s.
+    The colour bar explains the belief heatmap. The target star turns from gold to cyan once a
+    robot has seen it, and a label next to it names the last robot to see it (bordered in that
+    robot's colour): the first UAV sighting, then the UGV's find. ``step_s`` (mission time per
+    frame) defaults to about 150 frames per mission, clipped to 10-60 s.
     """
     from matplotlib.patches import Rectangle
 
@@ -221,7 +224,19 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
     cb.solids.set_alpha(0.55)
     cb.set_label(r"unsearched probability of target per cell ($\log_{10}$)", fontsize=9)
     cb.ax.tick_params(labelsize=8)
-    ax.plot(*scenario.target_xy, "*", color="gold", ms=16, mec="k", zorder=7)
+    star = ax.plot(*scenario.target_xy, "*", color=TARGET_COLOR, ms=16, mec="k", zorder=7)[0]
+    # "Seen by" label: the first sighting, then the find (it ends the mission).
+    seen_by = [e for e in (next((e for e in result.events if e.type == t), None)
+                           for t in (EventType.TARGET_SIGHTED, EventType.TARGET_FOUND)) if e is not None]
+    seen = None
+    if seen_by:  # next to the star, on the side towards the map centre
+        (x0, x1, y0, y1), (tx, ty) = scenario.grid.extent, scenario.target_xy
+        right, up = tx < (x0 + x1) / 2, ty < (y0 + y1) / 2
+        seen = ax.annotate("", scenario.target_xy,
+                           xytext=(12 if right else -12, 12 if up else -12), textcoords="offset points",
+                           ha="left" if right else "right", va="bottom" if up else "top", fontsize=9, zorder=8,
+                           bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=SIGHTED_COLOR, lw=1.5),
+                           visible=False)
 
     markers = {}
     for rid, spec in robots:
@@ -258,8 +273,11 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
     y -= 0.04
     side.text(0.0, y, "terrain is drawn beneath the heatmap", fontsize=8, color="#555", va="top")
     y -= 0.05
-    side.plot(0.05, y, "*", color="gold", mec="k", ms=14, clip_on=False)
+    side.plot(0.05, y, "*", color=TARGET_COLOR, mec="k", ms=14, clip_on=False)
     side.text(bar_x, y, "target (ground truth)", fontsize=9, va="center")
+    y -= 0.05
+    side.plot(0.05, y, "*", color=SIGHTED_COLOR, mec="k", ms=14, clip_on=False)
+    side.text(bar_x, y, "target, sighted", fontsize=9, va="center")
     y -= 0.05
     side.plot([0.01, 0.09], [y, y], color=ROAD_COLOR, lw=1.2)
     side.text(bar_x, y, "road (UGV graph edge)", fontsize=9, va="center")
@@ -293,23 +311,33 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
             fill.set_facecolor(_energy_color(frac))
             pct.set_text(f"{frac:.0%}")
             mode_txt.set_text(MissionResult.MODE_ORDER[result.modes[rid][i]].value)
-        txt = f"t = {tk / 60:.0f} min"
-        if k == len(times) - 1:
-            txt += f"  ({result.outcome}" + (f" by {result.found_by}" if result.found_by else "") + ")"
-        title.set_text(txt)
+        title.set_text(f"t = {_clock(tk)}")
+        last = [e for e in seen_by if e.time <= tk]
+        star.set_color(SIGHTED_COLOR if last else TARGET_COLOR)
+        if seen is not None:
+            seen.set_visible(bool(last))
+            if last:
+                rid = last[-1].robot_id
+                seen.set_text(f"Seen by {rid} at {_clock(last[-1].time)}")
+                seen.get_bbox_patch().set_edgecolor(_robot_color(rid, scenario.robots[rid].robot_type))
 
     def render(k):
         update(k)
         fig.canvas.draw()
         return np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
 
-    key_colors = ["gold", "black", "white", "#e6e6e6", "#888888", "#555555", ROAD_COLOR, NODE_FACE, NODE_EDGE,
+    key_colors = [TARGET_COLOR, SIGHTED_COLOR, "black", "white", "#e6e6e6", "#888888", "#555555", ROAD_COLOR,
+                  NODE_FACE, NODE_EDGE,
                   *TERRAIN_COLORS.values(), *(_energy_color(f) for f in (1.0, 0.3, 0.0)),
                   *(_robot_color(rid, spec.robot_type) for rid, spec in robots)]
     n = len(times)
     palette = _gif_palette([render(k) for k in sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})], key_colors)
     _save_gif((render(k) for k in range(n)), palette, path, fps)
     plt.close(fig)
+
+
+def _clock(t: float) -> str:
+    return f"{int(t // 60)}:{int(t % 60):02d}"
 
 
 def _gif_palette(samples: list[np.ndarray], key_colors: list) -> tuple["Image.Image", list[tuple[int, int, int]]]:

@@ -16,6 +16,8 @@ sim:
 
 mission:
   seed: 0
+  target_seed: 3           # uav1 sights the car, then the UGV drives over to confirm it
+  gif_speedup: 30          # small missions last minutes: play the GIF at 30x real time
 
 compare:
   maps: [0, 1, 2, 3, 4]

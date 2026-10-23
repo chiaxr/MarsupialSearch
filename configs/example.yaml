@@ -165,6 +165,7 @@ mission:
   seed: 0                  # map seed
   target_seed: 7           # resample the hidden target (null: the map's own target) (default: null)
   animate: true            # write a GIF per team
+  gif_speedup: null        # GIF playback: mission seconds per second of GIF (null: about 150 frames per mission)
 
 # --- compare.py only ----------------------------------------------------------
 compare:

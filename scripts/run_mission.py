@@ -36,6 +36,9 @@ from marsupial_search.sim.config_io import (
 from marsupial_search.viz.plot import animate_result, plot_result, plot_scenario
 
 
+GIF_FPS = 10
+
+
 def _pick(*values, default=None):
     return next((v for v in values if v is not None), default)
 
@@ -58,6 +61,8 @@ def main() -> None:
     ap.add_argument("--no-terminate", action="store_true", help="ignore the target; run to full coverage")
     ap.add_argument("--animate", action=argparse.BooleanOptionalAction, default=None,
                     help="write a GIF per team (default: on)")
+    ap.add_argument("--gif-speedup", type=float,
+                    help="mission seconds per second of GIF (default: about 150 frames per mission)")
     ap.add_argument("--out")
     args = ap.parse_args()
 
@@ -72,6 +77,8 @@ def main() -> None:
     for team in teams:
         make_team(team, params)  # fail fast on bad names or parameters
     animate = _pick(args.animate, mission["animate"])
+    gif_speedup = _pick(args.gif_speedup, mission["gif_speedup"])
+    gif_step_s = gif_speedup / GIF_FPS if gif_speedup else None  # mission time per frame
     out = pathlib.Path(_pick(args.out, doc.get("out"), default="outputs"))
 
     cfg.seed = seed
@@ -93,12 +100,13 @@ def main() -> None:
     if animate and sim_cfg.belief_snapshot_interval_s is None:
         # Snapshot as often as a ~100 MB budget allows over the time limit (10 s minimum).
         snapshot_bytes = 4 * sc.grid.rows * sc.grid.cols
-        sim_cfg.belief_snapshot_interval_s = max(10.0, float(np.ceil(snapshot_bytes * sim_cfg.max_time_s / 100e6)))
+        budget_s = float(np.ceil(snapshot_bytes * sim_cfg.max_time_s / 100e6))
+        sim_cfg.belief_snapshot_interval_s = max(budget_s, gif_step_s or 10.0)
 
     out.mkdir(parents=True, exist_ok=True)
     stem = sc.name + (f"_t{target_seed}" if target_seed is not None else "")
     run = {"teams": teams, "controller_params": params, "out": str(out),
-           "mission": {"seed": seed, "target_seed": target_seed, "animate": animate}}
+           "mission": {"seed": seed, "target_seed": target_seed, "animate": animate, "gif_speedup": gif_speedup}}
     dump_resolved(out / f"{stem}_config.yaml", run, cfg, sim_cfg, base)
     plot_scenario(sc, str(out / f"{sc.name}_map.png"))
     print(f"scenario {sc.name}: {sc.graphs[RobotType.UGV].n_nodes} road nodes, "
@@ -113,7 +121,7 @@ def main() -> None:
             print(f"  {k:>16}: {v:.3f}" if isinstance(v, float) else f"  {k:>16}: {v}")
         print("  events:", dict(collections.Counter(e.type.value for e in res.events)))
         if animate:
-            animate_result(sc, res, str(out / f"{stem}_{label}.gif"))
+            animate_result(sc, res, str(out / f"{stem}_{label}.gif"), step_s=gif_step_s, fps=GIF_FPS)
             print(f"  animation: {out / f'{stem}_{label}.gif'}")
     print(f"outputs written to {out}/ (resolved settings: {stem}_config.yaml)")
 

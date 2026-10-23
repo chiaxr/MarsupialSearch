@@ -8,6 +8,11 @@ Each robot runs its own controller (a *policy*), so the two UAVs can run the sam
 different ones. A centralised oracle that plans for the whole team is the reference they are
 measured against.
 
+![joint_planner on the small map: a UAV sights the car, then the UGV drives over and confirms it](docs/media/small_car_joint_planner.gif)
+
+*`joint_planner` on the `small` map (1.5 km × 1.5 km) searching for a car, at 30× real time. The heatmap is the target probability not yet searched.
+Reproduce with `python scripts/run_mission.py --config configs/small_car.yaml --teams joint_planner`.*
+
 ## Contents
 
 - [Quick start](#quick-start)
@@ -299,6 +304,7 @@ one. `python -m marsupial_search.sim.config_io` lists every controller parameter
 python scripts/run_mission.py --scenario small --teams joint_planner --seed 0 --target-seed 7
 python scripts/run_mission.py --teams joint_planner ugv0=ugv_timed_route,uav0=uav_greedy_tour,uav1=uav_greedy_tour
 python scripts/run_mission.py --no-animate      # skip the GIFs (faster)
+python scripts/run_mission.py --gif-speedup 20  # GIF playback: 20 mission seconds per GIF second
 python scripts/run_mission.py --no-terminate    # ignore the target; run to full coverage
 ```
 
@@ -307,6 +313,8 @@ Without `--teams` it runs the experiment file's `teams` (default: `joint_planner
 team). It writes to `outputs/` (`--out`): the map (`<map>_map.png`), a plot and GIF per team
 (`<map>[_t<target seed>]_<team>.png` / `.gif`) and the resolved settings
 (`<map>[_t<target seed>]_config.yaml`). Here `<map>` is the base scenario and map seed, e.g. `small_s0`.
+GIFs play at 10 frames per second. By default each frame covers 1/150 of the mission (10–60 s),
+i.e. 100–600× real time; `mission.gif_speedup` (or `--gif-speedup`) sets the speed instead.
 
 ### 3.2 Experiment files (YAML)
 
@@ -341,6 +349,7 @@ mission:                     # run_mission.py only
   seed: 0                    # map seed
   target_seed: 7             # resample the hidden target (optional)
   animate: true              # a GIF per team
+  gif_speedup: 20            # GIF playback: mission seconds per GIF second (optional)
 compare:                     # compare.py only
   maps: [0, 1, 2]            # map seeds
   targets: 2                 # missions per team and map (default: 2 for cv, 10 for plain)

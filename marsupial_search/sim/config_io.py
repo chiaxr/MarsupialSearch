@@ -17,6 +17,7 @@ its section::
       seed: 0                     # map seed
       target_seed: 7              # resample the hidden target (optional)
       animate: true               # write a GIF per team
+      gif_speedup: 20             # mission seconds per second of GIF (default: about 150 frames per mission)
     compare:                      # compare.py: every team on the same maps and targets
       maps: [0, 1, 2]             # map seeds
       targets: 2                  # missions per team and map
@@ -54,7 +55,7 @@ DEFAULT_TEAMS = ["joint_planner", DEFAULT_TEAM]
 ESTIMATORS = ("cv", "plain")
 # Defaults of the script sections. compare.targets defaults to 2 for cv and 10 for plain.
 SECTIONS: dict[str, dict[str, Any]] = {
-    "mission": {"seed": 0, "target_seed": None, "animate": True},
+    "mission": {"seed": 0, "target_seed": None, "animate": True, "gif_speedup": None},
     "compare": {"maps": [0, 1, 2, 3, 4], "targets": None, "estimator": "cv", "workers": 4},
 }
 TOP_LEVEL_KEYS = {"teams", "controller_params", "out", "scenario", "sim", *SECTIONS}
