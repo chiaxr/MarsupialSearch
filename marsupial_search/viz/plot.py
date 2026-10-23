@@ -24,6 +24,8 @@ TERRAIN_COLORS = {
 _TERRAIN_CMAP = ListedColormap([TERRAIN_COLORS[t] for t in Terrain])
 ROAD_COLOR = "#4a4a4a"
 NODE_FACE, NODE_EDGE = "white", "#333333"
+UNMAPPED_COLOR, BLOCKED_COLOR = "#1565c0", "#d62728"  # the true roads where they differ from the robots' map
+UNMAPPED_STYLE = (0, (2.5, 1.5))
 TARGET_COLOR, SIGHTED_COLOR = "gold", "#00e5ff"  # the target star, before and after a robot sees it
 UGV_COLORS = ["#c0392b", "#8e44ad", "#d35400", "#2c3e50", "#16a085"]
 UAV_COLORS = ["#2980b9", "#27ae60", "#f39c12", "#e84393", "#00b8d4"]
@@ -50,10 +52,18 @@ def draw_map(ax, scenario: Scenario, prior: bool = True, uav_grid: bool = False,
     road = scenario.graphs[RobotType.UGV]
     segs = road.positions[road.edges]
     ax.add_collection(LineCollection(segs, colors=ROAD_COLOR, linewidths=0.8, zorder=2))
+    mm = scenario.road_mismatch
+    if mm:  # roads missing from the map, dashed
+        true = scenario.true_road(blocked=False)
+        new = true.edges[(true.edges >= road.n_nodes).any(axis=1)]
+        ax.add_collection(LineCollection(true.positions[new], colors=UNMAPPED_COLOR, linewidths=0.9,
+                                         linestyles=[UNMAPPED_STYLE], zorder=2))
     if road_nodes:
         ax.set_aspect("equal")
         ax.scatter(*road.positions.T, s=_node_marker_size(ax, scenario), c=NODE_FACE, edgecolors=NODE_EDGE,
                    linewidths=0.4, zorder=2.6)
+    if mm.blocked:
+        ax.scatter(*road.positions[list(mm.blocked)].T, marker="x", s=30, c=BLOCKED_COLOR, linewidths=1.4, zorder=2.7)
     if uav_grid:
         uav = scenario.graphs[RobotType.UAV]
         ax.scatter(*uav.positions.T, s=0.5, c="#555", alpha=0.3, zorder=2)
@@ -71,6 +81,16 @@ def draw_map(ax, scenario: Scenario, prior: bool = True, uav_grid: bool = False,
 
 def _legend_handles():
     return [Patch(color=TERRAIN_COLORS[t], label=t.name.lower()) for t in Terrain]
+
+
+def _mismatch_handles(scenario: Scenario) -> list:
+    """Legend entries for the true roads where they differ from the robots' map."""
+    mm, out = scenario.road_mismatch, []
+    if mm.new_nodes:
+        out.append(plt.Line2D([], [], color=UNMAPPED_COLOR, ls=UNMAPPED_STYLE, label="road missing from the map"))
+    if mm.blocked:
+        out.append(plt.Line2D([], [], ls="", marker="x", ms=6, mew=1.4, color=BLOCKED_COLOR, label="blocked road node"))
+    return out
 
 
 def _log10(a: np.ndarray) -> np.ndarray:
@@ -112,12 +132,14 @@ def plot_scenario(scenario: Scenario, path: Optional[str] = None, show_target: b
     handles = _legend_handles() + [
         plt.Line2D([], [], color=ROAD_COLOR, label="road graph edge"),
         plt.Line2D([], [], ls="", marker="o", ms=5, mfc=NODE_FACE, mec=NODE_EDGE, mew=0.6, label="UGV graph node"),
-    ]
+    ] + _mismatch_handles(scenario)
     if show_target:
         handles.append(plt.Line2D([], [], marker="*", ls="", color=TARGET_COLOR, mec="k", ms=12, label="target"))
     ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
     m = scenario.meta
-    ax.set_title(f"{scenario.name}: {scenario.graphs[RobotType.UGV].n_nodes} road nodes, "
+    mm = scenario.road_mismatch
+    differ = f" ({len(mm.new_nodes)} missing, {len(mm.blocked)} blocked)" if mm else ""
+    ax.set_title(f"{scenario.name}: {scenario.graphs[RobotType.UGV].n_nodes} mapped road nodes{differ}, "
                  f"{m.get('road_length_m', 0) / 1e3:.0f} km roads, "
                  f"{scenario.graphs[RobotType.UAV].n_nodes} UAV nodes")
     fig.tight_layout()
@@ -284,6 +306,13 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
     y -= 0.04
     side.plot(0.05, y, "o", ms=5, mfc=NODE_FACE, mec=NODE_EDGE, mew=0.6, clip_on=False)
     side.text(bar_x, y, "UGV graph node", fontsize=9, va="center")
+    for h in _mismatch_handles(scenario):
+        y -= 0.04
+        if h.get_marker() == "x":
+            side.plot(0.05, y, "x", ms=6, mew=1.4, color=BLOCKED_COLOR, clip_on=False)
+        else:
+            side.plot([0.01, 0.09], [y, y], color=UNMAPPED_COLOR, lw=1.2, ls=UNMAPPED_STYLE)
+        side.text(bar_x, y, h.get_label(), fontsize=9, va="center")
     for terr in (Terrain.VEGETATION, Terrain.URBAN):
         y -= 0.04
         side.add_patch(Rectangle((0.01, y - 0.013), 0.08, 0.026, facecolor=TERRAIN_COLORS[terr], edgecolor="#888",

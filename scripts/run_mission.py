@@ -109,7 +109,9 @@ def main() -> None:
            "mission": {"seed": seed, "target_seed": target_seed, "animate": animate, "gif_speedup": gif_speedup}}
     dump_resolved(out / f"{stem}_config.yaml", run, cfg, sim_cfg, base)
     plot_scenario(sc, str(out / f"{sc.name}_map.png"))
-    print(f"scenario {sc.name}: {sc.graphs[RobotType.UGV].n_nodes} road nodes, "
+    mm = sc.road_mismatch
+    differ = f" ({len(mm.new_nodes)} more missing from it, {len(mm.blocked)} blocked)" if mm else ""
+    print(f"scenario {sc.name}: {sc.graphs[RobotType.UGV].n_nodes} mapped road nodes{differ}, "
           f"{sc.meta['road_length_m'] / 1e3:.0f} km road, target {sc.target_xy} ({sc.target_layer.name})")
 
     for team in teams:

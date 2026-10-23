@@ -22,7 +22,7 @@ from typing import Optional
 
 import numpy as np
 
-from marsupial_search.core import MissionSetup, RobotType
+from marsupial_search.core import MissionSetup, RobotState
 
 from .common import dist
 from .dock_booking import BookingUav, Sortie
@@ -36,10 +36,13 @@ class GreedyTourUav(BookingUav):
         super().reset(robot_id, setup)
         self.planner = SortiePlanner(setup, setup.robots[self.ugv], self.spec, self.cfg)
 
+    def _map_changed(self, s: RobotState, now: float) -> None:
+        self.planner.set_road(self.road)
+
     def plan_sortie(self, start, t_start: float, energy: float, now: float) -> Optional[Sortie]:
         p, P, cfg = self.plan, self.planner, self.cfg
         e, v = self.spec.energy, self.spec.speed
-        road = self.setup.graphs[RobotType.UGV]
+        road = self.road
         nodes, arr, base = np.asarray(p["nodes"], int), np.asarray(p["arrive"], float), p["cur"]
         first = p["pin"] - base + 1  # land after the last promised take-off
         idx = np.arange(first, len(nodes))

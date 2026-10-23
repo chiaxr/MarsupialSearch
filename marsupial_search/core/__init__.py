@@ -5,7 +5,7 @@ Nothing in this package (or :mod:`marsupial_search.controllers`) may import :mod
 
 from .belief import BeliefMap
 from .controller import MissionController
-from .graph import TraversabilityGraph
+from .graph import GraphKnowledge, TraversabilityGraph
 from .grid import GridSpec
 from .messages import (
     Command,
@@ -27,6 +27,7 @@ from .messages import (
     RobotState,
     SensorSpec,
     Transmit,
+    TraversabilityUpdate,
     Undock,
 )
 from .decentralized import DecentralizedTeam, RobotController, RobotControllerFactory

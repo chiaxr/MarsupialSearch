@@ -1,4 +1,4 @@
-"""Scenario container: map, graphs, prior, fleet and (hidden) ground-truth target."""
+"""Scenario container: map, graphs, prior, fleet, (hidden) ground-truth target and road-map mismatches."""
 
 from __future__ import annotations
 
@@ -16,6 +16,24 @@ from marsupial_search.core import (
     RobotType,
     TraversabilityGraph,
 )
+
+
+@dataclass(frozen=True)
+class MapMismatch:
+    """Where the true road network differs from the prior map ``Scenario.graphs[UGV]`` (the one the
+    robots are given). Hidden from controllers: they find it with their sensors."""
+
+    blocked: tuple[int, ...] = ()  # prior road nodes that cannot be traversed
+    # road nodes missing from the prior map: index (from its n_nodes on) -> position
+    new_nodes: dict[int, tuple[float, float]] = field(default_factory=dict)
+    new_edges: tuple[tuple[int, int], ...] = ()  # their edges
+
+    def __bool__(self) -> bool:
+        return bool(self.blocked or self.new_nodes)
+
+    def apply(self, prior: TraversabilityGraph, blocked: bool = True) -> TraversabilityGraph:
+        """The true road graph (``blocked=False``: with the missing roads, but every node passable)."""
+        return prior.with_changes(self.blocked if blocked else (), self.new_nodes, self.new_edges)
 
 
 @dataclass(frozen=True)
@@ -39,6 +57,11 @@ class Scenario:
     target_xy: tuple[float, float]  # ground truth, never shown to controllers
     target_layer: Layer
     meta: dict = field(default_factory=dict)
+    road_mismatch: MapMismatch = field(default_factory=MapMismatch)
+
+    def true_road(self, blocked: bool = True) -> TraversabilityGraph:
+        """The road network as it really is (see :meth:`MapMismatch.apply`)."""
+        return self.road_mismatch.apply(self.graphs[RobotType.UGV], blocked)
 
     def mission_setup(self, dt: float) -> MissionSetup:
         return MissionSetup(

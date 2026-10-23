@@ -1,0 +1,29 @@
+# The small map, searching for a car, with a road map that is wrong in places: about 10 % of
+# the road nodes are missing from the map the robots are given, and 5 % of the mapped ones are
+# blocked. The robots find out by looking; UAVs report what they find to the UGV.
+# python scripts/compare.py     --config configs/small_car_mismatch.yaml
+# python scripts/run_mission.py --config configs/small_car_mismatch.yaml   # one mission per team
+teams:
+  - joint_planner
+  - {ugv0: ugv_timed_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+out: outputs/small_car_mismatch
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: car       # car | building | hiker
+  road_unmapped_fraction: 0.1
+  road_blocked_fraction: 0.05
+
+sim:
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+  gif_speedup: 30          # small missions last minutes: play the GIF at 30x real time
+
+compare:
+  maps: [0, 1, 2, 3, 4]
+  targets: 2
+  estimator: cv
+  workers: 10

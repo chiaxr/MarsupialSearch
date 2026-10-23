@@ -12,6 +12,9 @@ UGV cannot drive on). Construction order:
    relative-neighbourhood graph (plus some Gabriel edges for loops).
 5. Merge near-duplicate nodes, subdivide long edges, keep the largest component,
    and rasterise the roads; every remaining non-urban cell is VEGETATION.
+6. Optionally, a prior road map that differs from the true network (``MapMismatch``):
+   stretches of road missing from the map (``road_unmapped_fraction``) and road nodes that
+   cannot be traversed (``road_blocked_fraction``). The robots are given the prior map.
 
 The UGV graph is the road network; the UAV graph is an 8-connected grid over the
 whole map.
@@ -31,7 +34,9 @@ imagery, and normalises the summed masks. Here:
 
 The ground-truth target is placed uniformly at random on the *true* label cells
 (not the degraded prior), restricted to cells a UGV can get within sensor range of
-(otherwise the mission could never terminate).
+(otherwise the mission could never terminate). With a road-map mismatch, that is from a
+mapped road the UGV can reach from its start without blocked nodes, so a mission can end
+without the team finding any missing road.
 """
 
 from __future__ import annotations
@@ -57,7 +62,7 @@ from marsupial_search.core import (
     TraversabilityGraph,
 )
 
-from .scenario import RobotInit, Scenario
+from .scenario import MapMismatch, RobotInit, Scenario
 
 
 @dataclass
@@ -96,6 +101,9 @@ class ScenarioConfig:
     highway_wiggle_m: float = 150.0
     road_merge_m: float = 20.0
     road_node_spacing_m: Optional[float] = None  # long road edges are split into nodes this far apart (None: the UGV sensor range)
+    # road-map mismatch: the robots are given a prior road map that differs from the true network
+    road_unmapped_fraction: float = 0.0  # share of road nodes missing from the map (whole stretches of road)
+    road_blocked_fraction: float = 0.0  # share of mapped road nodes that cannot be traversed
     # UAV grid
     uav_grid_spacing_m: Optional[float] = None  # None: √2 · the UAV sensor range, the widest square grid whose footprints leave no gaps
     # prior
@@ -335,6 +343,11 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         keep = terrain[r, c] != int(Terrain.URBAN)
         terrain[r[keep], c[keep]] = int(Terrain.ROAD)
 
+    # 6. the road map the robots get (its own random stream: the rest of the map is unchanged)
+    full_road = road_graph
+    road_graph, mismatch = _map_mismatch(full_road, cfg, np.random.default_rng([cfg.seed, 2]))
+    reachable = road_graph.with_changes(blocked=mismatch.blocked)  # what a UGV can drive without the missing roads
+
     uav_graph = _grid_graph(cfg.size_m, uav_grid_spacing(cfg))
 
     # Layers, prior, target -------------------------------------------------
@@ -348,7 +361,7 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         labels = cfg.prior_labels or SEMANTIC_LABELS[cfg.target_object]
         truth = np.zeros(grid.shape, dtype=bool)
         for lab in labels:
-            truth |= label_mask(lab, grid, terrain, road_graph, cfg.fleet.ugv_sensor_range)
+            truth |= label_mask(lab, grid, terrain, full_road, cfg.fleet.ugv_sensor_range)
         if not truth.any():
             raise ValueError(f"no cells carry any of the labels {labels} on this map")
         prior = _semantic_prior(grid, truth, cfg, rng)
@@ -359,13 +372,13 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     else:
         raise ValueError(f"unknown prior_model {cfg.prior_model!r}")
 
-    confirm_mask = _confirmable_mask(grid, road_graph, cfg.fleet.ugv_sensor_range)
+    robots, init = _make_fleet(cfg, reachable, terrain, grid, rng)
+
+    confirm_mask = _confirmable_mask(grid, reachable, cfg.fleet.ugv_sensor_range, init["ugv0"].node)
     if not (target_dist * confirm_mask).any():
         raise ValueError("no cell is both a plausible target location and within UGV sensor range of a road")
     trng = np.random.default_rng(cfg.seed + 1 if cfg.target_seed is None else cfg.target_seed)
     target_xy, target_layer = sample_target(grid, target_dist, layer_fractions, confirm_mask, trng)
-
-    robots, init = _make_fleet(cfg, road_graph, terrain, grid, rng)
 
     meta = {
         "config": cfg,
@@ -373,7 +386,9 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         "confirmable_prior_mass": float(prior[confirm_mask].sum()),
         "target_distribution": target_dist,  # what the hidden target is drawn from (x confirmable)
         "label_mask": truth,  # true semantic label cells (semantic prior only)
-        "road_length_m": float(road_graph.lengths.sum()),
+        "road_length_m": float(full_road.lengths.sum()),
+        "road_unmapped_nodes": len(mismatch.new_nodes),
+        "road_blocked_nodes": len(mismatch.blocked),
         "cities": [{k: v for k, v in c.items() if k != "nodes"} for c in cities],
         "terrain_fractions": {t.name.lower(): float((terrain == int(t)).mean()) for t in Terrain},
     }
@@ -390,6 +405,7 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         target_xy=target_xy,
         target_layer=target_layer,
         meta=meta,
+        road_mismatch=mismatch,
     )
 
 
@@ -458,6 +474,73 @@ def _finalize_roads(roads: _RoadBuilder, cfg: ScenarioConfig) -> TraversabilityG
     return TraversabilityGraph(pos, edges, name="road")
 
 
+def _road_chains(road: TraversabilityGraph) -> list[tuple[list[int], bool]]:
+    """Stretches of road between junctions: (inner nodes, dead end), where a dead end's last inner
+    node is the leaf it ends at. Only stretches with an inner node."""
+    deg = np.diff(road.csr.indptr)
+    chains, seen = [], set()
+    for end in np.flatnonzero(deg > 2):
+        for nb, _ in road.neighbors(int(end)):
+            prev, cur, inner = int(end), nb, []
+            while deg[cur] == 2 and cur != end:
+                inner.append(cur)
+                prev, cur = cur, next(n for n, _ in road.neighbors(cur) if n != prev)
+            dead = bool(deg[cur] == 1)
+            if dead:
+                inner.append(cur)
+            if inner and frozenset(inner) not in seen:
+                seen.add(frozenset(inner))
+                chains.append((inner, dead))
+    return chains
+
+
+def _map_mismatch(road: TraversabilityGraph, cfg: ScenarioConfig, rng) -> tuple[TraversabilityGraph, MapMismatch]:
+    """Split the true road network into the prior map the robots get and its mismatch with the world.
+
+    Unmapped: whole stretches of road between junctions (or out to a dead end) are left off the
+    map, but never one that the map needs to stay connected. Blocked: random mapped nodes whose
+    loss leaves the map connected, so a blockage forces a detour but every other mapped node
+    stays reachable. Mapped nodes keep their order; the unmapped ones get the indices after them."""
+    n = road.n_nodes
+    hidden = np.zeros(n, dtype=bool)
+    target = int(round(cfg.road_unmapped_fraction * n))
+    if target > 0:
+        chains = _road_chains(road)
+        for k in rng.permutation(len(chains)):
+            if hidden.sum() >= target:
+                break
+            inner, dead = chains[k]
+            if hidden[inner].any():
+                continue
+            hidden[inner] = True
+            if not dead and road.with_changes(blocked=np.flatnonzero(hidden)).n_components() > 1 + hidden.sum():
+                hidden[inner] = False  # it was the only road between two parts of the map
+    mapped = np.flatnonzero(~hidden)
+    n_blocked = int(round(cfg.road_blocked_fraction * len(mapped)))
+    if not hidden.any() and n_blocked == 0:
+        return road, MapMismatch()
+    order = np.concatenate([mapped, np.flatnonzero(hidden)])
+    index = np.empty(n, dtype=int)
+    index[order] = np.arange(n)
+    e = index[road.edges]
+    prior = TraversabilityGraph(road.positions[mapped], e[(e < len(mapped)).all(axis=1)], name=road.name)
+    full = TraversabilityGraph(road.positions[order], e).csr
+    open_ = np.ones(n, dtype=bool)
+    for b in rng.permutation(prior.n_nodes) if n_blocked else []:
+        if open_.sum() <= n - n_blocked:
+            break
+        open_[b] = False
+        m = open_[:prior.n_nodes]
+        if connected_components(prior.csr[m][:, m], directed=False)[0] > 1 \
+                or connected_components(full[open_][:, open_], directed=False)[0] > 1:
+            open_[b] = True  # the only way past it, on the map or on the ground
+    return prior, MapMismatch(
+        blocked=tuple(int(b) for b in np.flatnonzero(~open_)),
+        new_nodes={int(index[h]): tuple(map(float, road.positions[h])) for h in np.flatnonzero(hidden)},
+        new_edges=tuple((int(a), int(b)) for a, b in np.sort(e[(e >= len(mapped)).any(axis=1)], axis=1)),
+    )
+
+
 def _grid_graph(size_m: tuple[float, float], spacing: float) -> TraversabilityGraph:
     W, H = size_m
 
@@ -522,10 +605,15 @@ def _gaussian_mixture_prior(grid: GridSpec, terrain: np.ndarray, cfg: ScenarioCo
     return prior / prior.sum()
 
 
-def _confirmable_mask(grid: GridSpec, road: TraversabilityGraph, sensor_range: float) -> np.ndarray:
-    """Cells whose centre a UGV driving the road network can get within sensor range of."""
-    pts = [road.positions]
-    for a, b in road.edges:
+def _confirmable_mask(grid: GridSpec, road: TraversabilityGraph, sensor_range: float,
+                      start: Optional[int] = None) -> np.ndarray:
+    """Cells whose centre a UGV driving the road network (from ``start``, if given) can get in sensor range of."""
+    keep = ~road.blocked
+    if start is not None:
+        _, comp = connected_components(road.csr, directed=False)
+        keep &= comp == comp[start]
+    pts = [road.positions[keep]]
+    for a, b in road.edges[keep[road.edges[:, 0]]]:
         pts.append(_sample_segment(road.positions[a], road.positions[b], 10.0)[1:-1])
     tree = cKDTree(np.concatenate(pts))
     X, Y = grid.cell_centers()
@@ -545,9 +633,9 @@ def sample_target(grid, dist, layer_fractions, confirm_mask, rng) -> tuple[tuple
 
 def _make_fleet(cfg: ScenarioConfig, road: TraversabilityGraph, terrain, grid, rng):
     f = cfg.fleet
-    # Depot: a random non-urban road node.
+    # Depot: a random non-urban road node that is not blocked.
     r, c = _cells_of(grid, road.positions)
-    rural = np.flatnonzero(terrain[r, c] != int(Terrain.URBAN))
+    rural = np.flatnonzero((terrain[r, c] != int(Terrain.URBAN)) & ~road.blocked)
     depot = int(rng.choice(rural)) if len(rural) else 0
     ugv_sensor = SensorSpec(range_m=f.ugv_sensor_range, visible_layers=(Layer.SHARED, Layer.GROUND))
     uav_sensor = SensorSpec(range_m=f.uav_sensor_range, visible_layers=(Layer.SHARED, Layer.AERIAL))

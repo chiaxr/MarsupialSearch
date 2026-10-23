@@ -51,8 +51,12 @@ flight**.
    accepted booking is never moved by a later one.
 5. **Flight and landing.** The UAV takes off when the UGV holds for it, flies its tour (cutting it
    short if its energy margin requires), and docks when the UGV announces it is holding there for
-   it. It then swaps belief maps with the UGV (`sync`), so the next tour includes what the other
-   UAV reported.
+   it. Once its tour is done, it flies straight to a UGV that holds for it, wherever that is.
+   In flight it reports in its status where and when its tour ends and the energy it can spend
+   after that (`free`), so a late UGV can meet it elsewhere (see the recovery below). Out of
+   radio contact, it waits at its landing node (with no radio at all, it tries to land once the
+   UGV is due). It then swaps belief maps with the UGV (`sync`), so the next tour includes what
+   the other UAV reported.
 
 With `swap_while_moving: false` the UGV also holds at a landing stop until the swap is done.
 
@@ -69,6 +73,16 @@ route is re-planned on the current belief every 60 s.
 - *Sightings:* the UGV detours at once if no UAV still to land would wait past its hover
   slack (60 s), and otherwise straight after the pin.
 - *A missing UAV:* the UGV drops a landing 120 s after the UAV's slack runs out.
+- *Recovery (a landing the UGV can't make):* when the UAV can no longer afford to wait for the
+  UGV at its landing node (from the energy and tour end it reports, or as booked), when that node
+  turns out to be blocked, or when after a re-route the UGV would get there more than
+  `recover_gain_s` (60 s) late, the UGV moves the landing to where it best meets the UAV:
+  any node of its route between the stops around it, or of the shortest way to the landing node
+  (it then skips the route in between). The best meeting lands the UAV soonest with the least
+  waiting by the UGV, among those the UAV can afford to fly to. The take-off follows to the first
+  node the UGV reaches once the battery is swapped. A UAV out of touch (no status for
+  `uav_stale_s`, 10 s) is only met within radio range of the end of its tour, where it waits, so it
+  hears the UGV arrive.
 
 ### `uav_greedy_tour`
 
@@ -120,6 +134,34 @@ plans better, by optimising one plan for the whole team over a horizon of severa
 It replaced `greedy_belief` (perfect information, one leg of look-ahead); that baseline's last
 numbers are in [Results](README.md#34-results).
 
+## Road-map mismatch
+
+With a [road-map mismatch](README.md#16-road-map-mismatch), the road map the controllers are
+given is wrong in places: some nodes are blocked, and some roads are missing from it. Each
+controller keeps a `GraphKnowledge` (the prior map plus what has been found) and plans on its
+current map, never on the true one. `common.bypass` takes a route round blocked nodes.
+
+- **Reporting (dock booking).** Each robot adds what its own sensor finds to its map. A UAV puts
+  the changes it knows and the UGV does not yet (as of the UGV's last `plan`) in its `"status"`
+  (`"map"`), every step until the UGV's plan shows them, so a report made out of radio range
+  gets through once the UAV is back in range (at the latest when it lands). The UGV puts every
+  change it knows in its `plan`, which also tells the UAVs where any newly found nodes on its
+  route are.
+- **`ugv_timed_route`.** A road found missing is used from the next re-plan of the route. If the
+  route runs into a blocked node, the UGV goes round it at once: the shortest way back to the
+  first node of the route after it that keeps the next landing within the hover slack of the
+  UAVs still to land (with none to come, that keeps the route no longer than planned). Its
+  landings stay where they are, put back to when the UGV now gets there (which uses up that much
+  of the UAV's slack: later re-routes have only the rest to spend), and the take-offs move back
+  to the first node the UGV reaches once the battery is swapped. A landing on a blocked node,
+  or one the UGV now reaches too late, goes to where the UGV best meets that UAV (the recovery
+  above); a UAV on its way flies to the new landing node once it hears the plan.
+- **`uav_greedy_tour`.** Plans its tours on the UGV's route, which may now use roads found
+  missing; its own finds only change where the UGV goes.
+- **`joint_planner`.** Sees every robot's finds at once. A blocked node on the route triggers a
+  re-plan, warm-started from the current plan taken round the blocked node; a road found missing
+  is used from the next scheduled re-plan.
+
 ## Adding an algorithm
 
 **A UAV heuristic** that uses dock booking: subclass `BookingUav` and implement `plan_sortie`
@@ -130,7 +172,8 @@ the UGV's sweep times and the chain tour.
 
 1. Implement a `RobotController` (one robot) or a `MissionController` (the whole team) in
    `marsupial_search/controllers/<name>.py`, importing only from `marsupial_search.core`.
-   `BeliefMap` and `TraversabilityGraph` provide belief fusion and path search, and
+   `BeliefMap` and `TraversabilityGraph` provide belief fusion and path search,
+   `GraphKnowledge` keeps the road map up to date from `obs.map_updates`, and
    `Transmit` / `obs.messages(topic)` handle communication.
 2. Register it in `marsupial_search/controllers/__init__.py`, optionally with a config
    dataclass so its parameters can be set from YAML (`controller_params`):

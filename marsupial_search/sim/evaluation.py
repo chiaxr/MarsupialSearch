@@ -24,8 +24,6 @@ from __future__ import annotations
 import dataclasses
 
 import numpy as np
-from scipy.spatial import cKDTree
-
 from marsupial_search.core import N_LAYERS, RobotMode, RobotType
 
 from .scenario import Scenario
@@ -77,10 +75,9 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
             found = np.minimum(found, contact[rid])
     end = result.time_s
     T = np.empty((N_LAYERS,) + grid.shape)
-    road = scenario.graphs[RobotType.UGV]
+    road = scenario.true_road()  # the UGV drives the roads as they are, not as mapped
     X, Y = grid.cell_centers()
-    _, cell_node = cKDTree(road.positions).query(np.stack([X.ravel(), Y.ravel()], 1))
-    cell_node = cell_node.reshape(grid.shape)
+    cell_node = road.nearest_nodes(np.stack([X.ravel(), Y.ravel()], 1)).reshape(grid.shape)
     traj, speed = result.trajectories[ugv], scenario.robots[ugv].speed
     dist_cache: dict[int, np.ndarray] = {}
     for layer in range(N_LAYERS):

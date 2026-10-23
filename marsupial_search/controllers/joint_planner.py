@@ -37,10 +37,12 @@ Search
     tours, or rejected. The number of iterations is fixed, so runs are reproducible.
 
 Re-planning
-    Every ``replan_s``, after every dock event and abort, and on a new sighting. Dock
-    manoeuvres in progress are kept; everything else may change, including the tour and
-    landing of a UAV in flight. After a sighting the route starts with the pursuit path, and
-    dock events go after it unless a UAV could not otherwise land.
+    Every ``replan_s``, after every dock event and abort, on a new sighting, and when a robot
+    finds a blocked node on the route. Dock manoeuvres in progress are kept; everything else
+    may change, including the tour and landing of a UAV in flight. After a sighting the route
+    starts with the pursuit path, and dock events go after it unless a UAV could not otherwise
+    land. It plans on the road map as the robots have found it so far (roads missing from it
+    are used from the next re-plan), never on the true one.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from marsupial_search.core import (
     EventType,
     FollowPath,
     GoToPoint,
+    GraphKnowledge,
     Hold,
     MissionController,
     MissionSetup,
@@ -68,7 +71,7 @@ from marsupial_search.core import (
     Undock,
 )
 
-from .common import dist, pursuit_path
+from .common import bypass, dist, pursuit_path
 from .dock_booking import LAND, TAKEOFF, DockBookingConfig, slot_spacing
 from .sortie_planner import SortiePlanner
 
@@ -176,13 +179,14 @@ class JointPlannerController(MissionController):
         self.setup, self.ugv = setup, ugvs[0]
         self.uavs = setup.robots_of(RobotType.UAV)
         self.ugv_spec = setup.robots[self.ugv]
-        self.road, self.air_graph = setup.graphs[RobotType.UGV], setup.graphs[RobotType.UAV]
+        self.roads = GraphKnowledge(setup.graphs[RobotType.UGV])  # the road map and the changes found to it
+        self.road, self.air_graph = self.roads.graph, setup.graphs[RobotType.UAV]
         self.belief = BeliefMap(setup.grid, setup.prior, setup.layer_fractions)
         self.road_visited = np.zeros(self.road.n_nodes, dtype=bool)
         uav_spec = setup.robots[self.uavs[0]] if self.uavs else self.ugv_spec
         self.P = SortiePlanner(setup, self.ugv_spec, uav_spec, self.cfg)
         self.n_cells = setup.grid.rows * setup.grid.cols
-        self.near_road = np.array([self.road.nearest_node(p) for p in self.air_graph.positions], dtype=int)
+        self.near_road = self.road.nearest_nodes(self.air_graph.positions)  # road node nearest each UAV-grid node
         a = self.air_graph.positions
         self.grid_step = float(np.min(np.hypot(*(a[1:] - a[0]).T))) if len(a) > 1 else 1.0
         self._dist_cache: dict[int, np.ndarray] = {}
@@ -211,6 +215,10 @@ class JointPlannerController(MissionController):
         S, now = obs.robots, obs.time
         for upd in obs.belief_updates:
             self.belief.apply(upd)
+        for upd in obs.map_updates:
+            self.roads.add(upd.blocked, upd.new_nodes, upd.new_edges)
+        if self.road is not self.roads.graph:
+            self._map_changed()
         g = S[self.ugv]
         self.road_visited[list(g.nodes_reached) + ([g.node] if g.node is not None else [])] = True
         if self.sent is not None:
@@ -232,6 +240,17 @@ class JointPlannerController(MissionController):
             self._fly(u, S, cmds)
         return cmds
 
+    def _map_changed(self) -> None:
+        """Plan on the road map as now known: at once if the route runs into a blocked node, else
+        (new roads) from the next re-plan."""
+        self.road = self.roads.graph
+        self.P.set_road(self.road)
+        self.road_visited = np.pad(self.road_visited, (0, self.road.n_nodes - len(self.road_visited)))
+        self.near_road = self.road.nearest_nodes(self.air_graph.positions)
+        self._dist_cache.clear()
+        ahead = self.plan.route[self.cur:]
+        self.replan_now |= not all(self.road.has_edge(a, b) for a, b in zip(ahead, ahead[1:]))
+
     def _next_event(self) -> Optional[tuple[int, str, int]]:
         return self.events[self.ev_ptr] if self.ev_ptr < len(self.events) else None
 
@@ -249,7 +268,7 @@ class JointPlannerController(MissionController):
                 self.held[ev.robot_id] = ev.time + (d.dock_duration_s if ev.type == EventType.DOCK_STARTED
                                                     else d.undock_duration_s)
             elif ev.type in (EventType.DOCK_ABORTED, EventType.UNDOCK_ABORTED, EventType.DEPLETED,
-                             EventType.COMMAND_REJECTED):
+                             EventType.COMMAND_REJECTED, EventType.PATH_BLOCKED):
                 self.held.pop(ev.robot_id, None)
                 self.replan_now = True
 
@@ -379,8 +398,9 @@ class JointPlannerController(MissionController):
         self.waiting: set[str] = set()  # UAVs whose open sortie's tour is done
 
     def _advance(self, ctx: _Context) -> Optional[JointPlan]:
-        """The current plan from now: the route from the UGV's position, without the dock
-        events and tour nodes already done. None if the robots are not where it has them."""
+        """The current plan from now: the route from the UGV's position (round any node found
+        blocked since), without the dock events and tour nodes already done. None if the robots
+        are not where it has them, or a dock event was on a blocked node."""
         old, cur = self.plan, self.cur
         if not old.route or old.route[cur:cur + len(ctx.prefix)] != ctx.prefix:
             return None
@@ -397,10 +417,19 @@ class JointPlannerController(MissionController):
             visits.append(Visit(v.uav, None if land_done else v.land - cur, None if v.off is None else v.off - cur,
                                 list(v.tour)))
         plan = JointPlan(list(old.route[cur:]), visits, first)
+        if self.roads:
+            plan.route, index = bypass(self.road, plan.route, [i for i, _, _ in plan.events()])
+            for v in plan.visits:
+                v.land, v.off = (None if i is None else int(index[i]) for i in (v.land, v.off))
+                if -1 in (v.land, v.off):
+                    return None
         return plan if self._consistent(ctx, plan) else None
 
     def _consistent(self, ctx: _Context, plan: JointPlan) -> bool:
-        """The plan's dock state matches the robots, and its dock events are in route order."""
+        """The plan's dock state matches the robots, its dock events are in route order, and its
+        route can still be driven on the road map as now known."""
+        if self.roads and not all(a == b or self.road.has_edge(a, b) for a, b in zip(plan.route, plan.route[1:])):
+            return False  # it ends where bypass could not go on
         docked = [v.uav for v in plan.visits if v.land is None]
         if docked != list(ctx.docked) or (docked and plan.visits[0].land is not None):
             return False

@@ -41,6 +41,8 @@ controller_params:
     route_replan_s: 60.0           # re-plan the unpromised part of the route this often
     route_resend_s: 5.0            # re-broadcast an unchanged route this often
     max_late_s: 120.0              # past a UAV's landing time and slack: drop its landing
+    uav_stale_s: 10.0              # no status from a UAV for this long: out of touch (recovery meets it within radio range)
+    recover_gain_s: 60.0           # after a re-route: move a late landing if that lands the UAV this much sooner
   uav_greedy_tour:
     # shared search settings
     uav_reserve_fraction: 0.1      # energy kept in hand at landing
@@ -110,6 +112,9 @@ scenario:
   highway_wiggle_m: 150.0            # highway curvature amplitude
   road_merge_m: 20.0                 # road nodes closer than this are merged
   road_node_spacing_m: null          # long road edges are split into nodes this far apart (null: the UGV sensor range)
+  # road-map mismatch (README §1.6): the robots are given a road map that differs from the roads
+  road_unmapped_fraction: 0.0        # share of road nodes missing from the map (whole stretches of road)
+  road_blocked_fraction: 0.0         # share of mapped road nodes that cannot be traversed
   # UAV grid
   uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the UAV sensor range, the widest gap-free grid)
   # prior (README §1.5)

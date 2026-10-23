@@ -18,6 +18,20 @@ Sightings
     The UGV drives past a sighting when the detour delays its next stops by no more than the
     hover slack of every UAV still to land; until then it re-checks at every node, and
     otherwise goes straight after the pin.
+Road-map changes
+    Found by the UGV or reported by a UAV. New roads are used from the next re-plan. If the
+    route runs into a blocked node, it goes round it at once: by the shortest way back to the
+    first node of the route after it that keeps the next landing within the hover slack of the
+    UAVs still to land (with none to come, that keeps the route no longer than planned). The
+    landings stay at their nodes, put back to when the UGV now gets there; the take-offs move
+    back to the first node the UGV reaches once the battery is swapped.
+Recovery
+    A landing the UAV can no longer afford to wait for, one on a blocked node, and (after a
+    re-route) one the UGV now gets to more than ``recover_gain_s`` late, moves to where the UGV
+    best meets the UAV: a node of the route between the stops around it, or of the shortest
+    way there (skipping the route in between). The UAV flies there from where its tour ends,
+    as it reports in its status (or as booked). A UAV out of touch (no status for
+    ``uav_stale_s``) is only met within radio range of that point, so it hears the UGV there.
 """
 
 from __future__ import annotations
@@ -39,7 +53,7 @@ from marsupial_search.core import (
     Transmit,
 )
 
-from .common import dist, pursuit_path
+from .common import bypass, dist, pursuit_path
 from .dock_booking import BOOK, LAND, SYNC, TAKEOFF, Booking, BookingRobot, DockBookingConfig, slot_spacing
 from .sortie_planner import SortiePlanner
 
@@ -50,6 +64,8 @@ class UgvTimedRouteConfig(DockBookingConfig):
     route_replan_s: float = 60.0  # re-plan the unpromised part of the route this often
     route_resend_s: float = 5.0  # re-broadcast an unchanged route this often
     max_late_s: float = 120.0  # beyond its landing time and slack: the UGV gives up on a UAV
+    uav_stale_s: float = 10.0  # a UAV's status older than this: it is out of touch (recovery meets it within radio range)
+    recover_gain_s: float = 60.0  # after a re-route: move a late landing if that lands the UAV this much sooner
 
 
 class TimedRouteUgv(BookingRobot):
@@ -65,7 +81,6 @@ class TimedRouteUgv(BookingRobot):
         self.uavs = setup.robots_of(RobotType.UAV)
         self.planner = (SortiePlanner(setup, self.spec, setup.robots[self.uavs[0]], self.cfg) if self.uavs
                         else None)
-        self.road = self.graph
         self.nodes: list[int] = []  # the route; an index into it is a route index
         self.cur = 0  # route index the UGV is at, or last passed
         self.target = 0  # route index the current FollowPath ends at
@@ -155,7 +170,7 @@ class TimedRouteUgv(BookingRobot):
             m = P.searchable_mass(self.belief)
             for n in self.nodes[self.cur:]:  # what the route will sweep anyway
                 P.sweep(m, P.F_road, n, P.ugv_layers, P.p_ugv)
-            cand = ~self.road_visited
+            cand = ~self.road_visited[:self.road.n_nodes]
             cand[self.nodes[self.cur:]] = False
             claim = np.full(P.air.n_nodes, np.inf)
             for b in self.bookings.values():
@@ -182,6 +197,196 @@ class TimedRouteUgv(BookingRobot):
         self.last_replan = now
         self._extend(now, s, replan=True)
 
+    # ------------------------------------------------------------- road map
+    def _map_changed(self, s: RobotState, now: float) -> None:
+        """Re-route at once if the route runs into a blocked node; new roads wait for the next re-plan."""
+        if self.planner is None:
+            return
+        self.planner.set_road(self.road)
+        ahead = self.nodes[self.cur:]
+        if not all(self.road.has_edge(a, b) for a, b in zip(ahead, ahead[1:])):
+            self._reroute(s, now)
+
+    def _reroute(self, s: RobotState, now: float) -> None:
+        """Go round the blocked nodes on the route (``bypass``), delaying the landings still to
+        come by no more than the hover slack those UAVs have left. The landings stay at their
+        nodes, except one on a blocked node: it goes to wherever the UAV is best met
+        (``_check_landings``), as does one the UGV now gets to too late. The take-offs follow
+        (``_pull_takeoffs``)."""
+        at_node = s.node is not None and s.node == self.nodes[self.cur]
+        head = min(self.cur if at_node else self.cur + 1, len(self.nodes) - 1)  # the node it is at, or driving to
+        ahead = [i - head for i, sts in self.stops.items() if i > head and any(st["kind"] == LAND for st in sts)]
+        arr = self._times(s, now)
+        spare = min((st["ready"] + st["slack"] - arr[i] for i, sts in self.stops.items() if i > head
+                     for st in sts if st["kind"] == LAND), default=0.0)  # the UGV may come this much later
+        tail, index = bypass(self.road, self.nodes[head:], ahead, max(spare, 0.0) * self.spec.speed)
+        index = np.concatenate([np.arange(head), head + np.where(index >= 0, index, -head - 1)])
+        before = np.maximum.accumulate(index)  # the new index of the last kept old index up to each one
+        self.nodes = self.nodes[:head] + tail
+        stops = {}
+        for i, sts in sorted(self.stops.items()):
+            stops.setdefault(int(before[i]), []).extend(sts)
+        self.stops = stops
+        takeoffs = {st["uav"]: i for i, sts in self.stops.items() for st in sts if st["kind"] == TAKEOFF}
+        for b in self.bookings.values():  # their landings keep their nodes (unless blocked), but may come later
+            b["moved"] = index[b["land_idx"]] < 0
+            b["land_idx"], b["off_idx"] = int(before[b["land_idx"]]), takeoffs[b["uav"]]
+            b["land_node"] = self.nodes[b["land_idx"]]
+        if self.pursuit == "planned":
+            self.pursuit_end = int(index[self.pursuit_end]) if self.pursuit_end < len(index) else -1
+            if self.pursuit_end < 0:
+                self.pursuit = "none"  # plan it again
+        self.version += 1
+        self.revision += 1
+        self.target, self.sent_path = head, None
+        self._check_landings(s, now, retime=True)
+        self._pull_takeoffs(s, now)
+        self._extend(now, s)
+
+    # ------------------------------------------------------------- recovery
+    def _free(self, b: dict, now: float) -> tuple[tuple[float, float], float, float, bool]:
+        """Where and when the UAV of booking ``b`` is free to land, the energy it can spend after
+        that (flying on, hovering, landing with its reserve), and whether it is in touch: from
+        its status if fresh, else as booked."""
+        p = self.peers.get(b["uav"])
+        fresh = p is not None and now - p["t"] <= self.cfg.uav_stale_s
+        x, y, t, spare = p["free"] if fresh and p.get("free") is not None else b["free"]
+        return (x, y), t, spare, fresh
+
+    def _meet(self, u: str, free, pos: np.ndarray, arr: np.ndarray):
+        """Meeting UAV ``u`` (free at ``free`` = (xy, t)) at road positions ``pos``, where the UGV
+        arrives at ``arr``: landing times, the UAV's energy for it, and a score (landing time
+        plus the UGV's wait)."""
+        uav = self.setup.robots[u]
+        e = uav.energy
+        d = np.hypot(*(pos - free[0]).T)
+        ta = free[1] + d / uav.speed
+        tm = np.maximum(arr, ta)
+        return tm, e.energy_per_m * d + e.idle_power * (tm - free[1]), tm + np.maximum(ta - arr, 0.0)
+
+    def _check_landings(self, s: RobotState, now: float, retime: bool = False) -> None:
+        """Recovery: a landing the UAV can no longer afford to wait for (or moved off a blocked
+        node) goes to where the UGV can best meet that UAV: a node of the route between the
+        stops around it, or of the shortest way to the landing node (the UGV then skips the
+        route in between). The UAV flies there from where its tour ends. A UAV out of touch is
+        only met within radio range of that point, so it hears the UGV there. ``retime`` (after
+        a re-route): also move a landing the UGV now gets to late if that lands the UAV
+        ``recover_gain_s`` sooner, and otherwise put it back to when the UGV gets there."""
+        if not self.bookings:
+            return
+        at_node = s.node is not None and s.node == self.nodes[self.cur]
+        head = self.cur if at_node else self.cur + 1
+        pos, link = self.road.positions, self._link_range()
+        arr = self._times(s, now)
+        for u, b in list(self.bookings.items()):
+            j0, moved = b["land_idx"], b.pop("moved", False)
+            land = next(st for st in self.stops[j0] if st["kind"] == LAND and st["uav"] == u)
+            if "started" in land or j0 < head:
+                continue
+            xy, t, spare, fresh = self._free(b, now)
+            free = (np.asarray(xy), t)
+            tm0, c0, score0 = self._meet(u, free, pos[[self.nodes[j0]]], arr[[j0]])
+            late = retime and tm0[0] - t > self.cfg.recover_gain_s  # the UAV would wait this long for the UGV
+            if not moved and c0[0] <= spare and not late:
+                if retime and tm0[0] > b["t_land"]:
+                    self._set_landing(b, land, j0, float(tm0[0]), spare - c0[0])
+                continue
+            others = [i for i, sts in self.stops.items() for st in sts if st["uav"] != u]
+            lo = max([head] + [i + 1 for i in others if i < j0] + [j0 for i in others if i == j0])
+            hi = min([b["off_idx"]] + [i for i in others if i > j0]) - 1
+            # Candidates: the route from lo to hi, and the shortest way from the last fixed index to j0.
+            cand = [(np.arange(lo, hi + 1), np.asarray(self.nodes[lo:hi + 1]), arr[lo:hi + 1], None)]
+            a = max(lo - 1, head)
+            if a < j0:
+                path, length = self.road.shortest_path(self.nodes[a], self.nodes[j0])
+                if path and length < self.road.path_length(self.nodes[a:j0 + 1]) - 1.0:
+                    dep = arr[a + 1] - dist(pos[self.nodes[a]], pos[self.nodes[a + 1]]) / self.spec.speed
+                    legs = np.hypot(*np.diff(pos[path], axis=0).T)
+                    t_path = dep + np.concatenate([[0.0], np.cumsum(legs)]) / self.spec.speed
+                    k = np.arange(len(path))[a + np.arange(len(path)) >= lo]
+                    cand.append((a + k, np.asarray(path)[k], t_path[k], path))
+            best = None  # (infeasible, score or energy, ...)
+            for idx, nodes, t_arr, path in cand:
+                ok = ~self.road.blocked[nodes]
+                if not fresh:  # out of touch: where it will hear the UGV (with no radio: only at its landing node)
+                    ok &= np.hypot(*(pos[nodes] - free[0]).T) <= link if link is not None else nodes == self.nodes[j0]
+                if not ok.any():
+                    continue
+                tm, c, score = self._meet(u, free, pos[nodes[ok]], t_arr[ok])
+                feas = c <= spare
+                i = int(np.argmin(np.where(feas, score, np.inf))) if feas.any() else int(np.argmin(c))
+                key = (not feas[i], score[i] if feas[i] else c[i])
+                if best is None or key < best[0]:
+                    best = (key, int(idx[ok][i]), float(tm[i]), float(c[i]), path)
+            if c0[0] <= spare:  # affordable: only for a landing that much sooner
+                better = best is not None and not best[0][0] and best[0][1] < score0[0] - self.cfg.recover_gain_s
+            else:
+                better = best is not None and best[3] < c0[0] - 1.0
+            if not (moved and best is not None or better):
+                if retime and tm0[0] > b["t_land"]:
+                    self._set_landing(b, land, j0, float(tm0[0]), spare - c0[0])
+                continue
+            _, j, tm, c, path = best
+            self.stops[j0].remove(land)
+            if path is not None:  # take the shortest way to the landing node
+                shift = a + len(path) - 1 - j0
+                self.nodes[a:j0 + 1] = [int(n) for n in path]
+                self.stops = {(i + shift if i >= j0 else i): sts for i, sts in self.stops.items() if sts}
+                for bb in self.bookings.values():
+                    bb["land_idx"] += shift if bb["land_idx"] >= j0 else 0
+                    bb["off_idx"] += shift if bb["off_idx"] >= j0 else 0
+                if self.pursuit == "planned" and self.pursuit_end > a:
+                    if self.pursuit_end > j0:
+                        self.pursuit_end += shift
+                    else:
+                        self.pursuit = "none"  # its path was skipped: plan it again
+                self.target, self.sent_path = head, None
+            self.stops.setdefault(j, []).append(land)
+            self._set_landing(b, land, j, tm, spare - c)
+            self._pull_takeoffs(s, now)
+            arr = self._times(s, now)
+
+    def _pull_takeoffs(self, s: RobotState, now: float) -> None:
+        """Move each take-off still to come back to the first route node after the stops before
+        it that the UGV reaches once that UAV's battery is swapped (after a detour or an earlier
+        landing, it may be far later than it needs to be)."""
+        at_node = s.node is not None and s.node == self.nodes[self.cur]
+        head = self.cur if at_node else self.cur + 1
+        arr = self._times(s, now)
+        for i in sorted(i for i, sts in self.stops.items() if sts and sts[0]["kind"] == TAKEOFF):
+            st = self.stops[i][0]
+            if "started" in st or i <= head:
+                continue
+            lo = max([head] + [k + 1 for k, sts in self.stops.items() if sts and k < i])
+            sooner = [k for k in range(lo, i) if arr[k] >= st["ready"]]
+            if not sooner:
+                continue
+            self.stops[i].pop(0)
+            self.stops.setdefault(sooner[0], []).insert(0, st)
+            if st["uav"] in self.bookings:
+                self.bookings[st["uav"]]["off_idx"] = sooner[0]
+            self.version += 1
+            self.revision += 1
+            arr = self._times(s, now)
+
+    def _set_landing(self, b: dict, land: dict, j: int, t_land: float, spare: float) -> None:
+        """Land UAV ``b["uav"]`` at route index ``j`` at ``t_land``, with ``spare`` energy left for waiting."""
+        dock = self.setup.docking
+        b["land_idx"], b["land_node"], b["t_land"] = j, self.nodes[j], t_land
+        b["slack"] = land["slack"] = max(spare, 0.0) / self.setup.robots[b["uav"]].energy.idle_power
+        land["ready"] = t_land
+        b["t_ready"] = t_land + dock.dock_duration_s + dock.swap_duration_s
+        for st in self.stops[b["off_idx"]]:
+            if st["kind"] == TAKEOFF and st["uav"] == b["uav"]:
+                st["ready"] = b["t_ready"]
+        self.last_land = max(self.last_land, t_land)
+        self.version += 1
+        self.revision += 1
+
+    def _link_range(self) -> Optional[float]:
+        r = self.setup.radio_range_m
+        return None if r is None else min(r[RobotType.UGV], r[RobotType.UAV])
+
     # ------------------------------------------------------------- bookings
     def _accept(self, b: Booking, s: RobotState, now: float) -> bool:
         if b.version != self.version or b.uav in self.bookings or b.uav in self.lost:
@@ -199,7 +404,9 @@ class TimedRouteUgv(BookingRobot):
         self.stops.setdefault(off, []).append({"kind": TAKEOFF, "uav": b.uav, "ready": ready})
         self.bookings[b.uav] = {"uav": b.uav, "plan_id": b.plan_id, "land_idx": b.land_idx,
                                 "land_node": self.nodes[b.land_idx], "t_land": b.t_land, "off_idx": off,
-                                "t_ready": ready, "slack": b.slack_s, "tour": b.tour}
+                                "t_ready": ready, "slack": b.slack_s, "tour": b.tour,
+                                "free": (*self.road.positions[self.nodes[b.land_idx]], b.t_land,
+                                         b.slack_s * self.setup.robots[b.uav].energy.idle_power)}
         self.last_land = b.t_land if self.last_land is None else max(self.last_land, b.t_land)
         self.version += 1
         self.revision += 1
@@ -228,11 +435,13 @@ class TimedRouteUgv(BookingRobot):
         self._track(s, now)
         self._handle_events(obs, now)
         self._handle_messages(obs, s, now, cmds)
+        self._check_map(s, now)
         for rid, p in self.peers.items():
             if p["type"] == RobotType.UAV.value and p["mode"] == RobotMode.DEPLETED.value and rid not in self.lost:
                 self.lost.add(rid)
                 self._drop(rid)
         self._give_up_late(s, now)
+        self._check_landings(s, now)
         if now - self.last_replan >= self.cfg.route_replan_s:
             self._replan_tail(now, s)
         else:

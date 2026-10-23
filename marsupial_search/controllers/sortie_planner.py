@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from marsupial_search.core import BeliefMap, MissionSetup, RobotSpec, RobotType
+from marsupial_search.core import BeliefMap, MissionSetup, RobotSpec, RobotType, TraversabilityGraph
 
 from .common import SearchConfig, dist, footprint_matrix
 
@@ -38,15 +38,20 @@ class SortiePlanner:
 
     def __init__(self, setup: MissionSetup, ugv: RobotSpec, uav: RobotSpec, cfg: SortieConfig):
         self.setup, self.ugv, self.uav, self.cfg = setup, ugv, uav, cfg
-        self.road = setup.graphs[RobotType.UGV]
         self.air = setup.graphs[RobotType.UAV]
-        self.F_road = footprint_matrix(setup.grid, self.road, ugv.sensor.range_m)
+        self._road_cells: dict[int, np.ndarray] = {}
+        self.set_road(setup.graphs[RobotType.UGV])
         self.F_air = footprint_matrix(setup.grid, self.air, uav.sensor.range_m)
         self.ugv_layers = [int(l) for l in ugv.sensor.visible_layers]
         self.air_layers = [int(l) for l in uav.sensor.visible_layers]
         self.common_layers = [l for l in self.air_layers if l in self.ugv_layers]  # seen by either robot
         self.own_layers = [l for l in self.air_layers if l not in self.ugv_layers]  # seen only from the air
         self.p_ugv, self.p_air = ugv.sensor.p_detect, uav.sensor.p_detect
+
+    def set_road(self, road: TraversabilityGraph) -> None:
+        """Plan on this road map (the prior map, updated with the mismatches found)."""
+        self.road = road
+        self.F_road = footprint_matrix(self.setup.grid, road, self.ugv.sensor.range_m, self._road_cells)
 
     # ------------------------------------------------------------- energy model
     def energy_budget(self, energy: float) -> float:

@@ -138,6 +138,25 @@ class LocalBeliefUpdate:
     detection_xy: Optional[tuple[float, float]] = None
 
 
+@dataclass(frozen=True)
+class TraversabilityUpdate:
+    """Mismatches between a graph in :class:`MissionSetup` (the prior map) and the world, found
+    by one robot's sensor (only those it had not found before).
+
+    ``blocked`` are prior nodes that cannot be traversed. ``new_nodes`` (index -> position, indices
+    from the prior graph's ``n_nodes`` on) are nodes missing from the prior map, with
+    ``new_edges``: each new node's edges, and the position of a new node at their far end even
+    if it is out of sensor range. :class:`~marsupial_search.core.graph.GraphKnowledge` keeps track of them.
+    """
+
+    robot_id: str
+    time: float
+    graph: RobotType  # whose graph: MissionSetup.graphs[graph]
+    blocked: tuple[int, ...] = ()
+    new_nodes: dict[int, tuple[float, float]] = field(default_factory=dict)
+    new_edges: tuple[tuple[int, int], ...] = ()
+
+
 class EventType(str, Enum):
     DOCK_STARTED = "dock_started"
     DOCKED = "docked"
@@ -146,6 +165,7 @@ class EventType(str, Enum):
     UNDOCKED = "undocked"
     UNDOCK_ABORTED = "undock_aborted"
     COMMAND_REJECTED = "command_rejected"
+    PATH_BLOCKED = "path_blocked"  # the next node of a FollowPath cannot be traversed: the robot waits before it
     DEPLETED = "depleted"
     TARGET_SIGHTED = "target_sighted"  # detected by a robot that cannot end the mission
     TARGET_FOUND = "target_found"  # mission success
@@ -182,6 +202,7 @@ class Observation:
     events: list[Event] = field(default_factory=list)
     mission_complete: bool = False
     radio: dict[str, list[RadioMessage]] = field(default_factory=dict)  # inbox per receiving robot
+    map_updates: list[TraversabilityUpdate] = field(default_factory=list)
 
     def inbox(self, robot_id: str, topic: Optional[str] = None) -> list[RadioMessage]:
         msgs = self.radio.get(robot_id, [])
@@ -197,6 +218,7 @@ class Observation:
             events=[e for e in self.events if robot_id in (e.robot_id, e.other_id)],
             inbox=list(self.radio.get(robot_id, [])),
             mission_complete=self.mission_complete,
+            map_updates=[u for u in self.map_updates if u.robot_id == robot_id],
         )
 
 
@@ -204,9 +226,9 @@ class Observation:
 class RobotObservation:
     """One robot's local view, the input of a decentralised :class:`RobotController`.
 
-    It holds only the robot's own state, its own sensor updates, events involving it
-    (e.g. a dock abort on its dock), and the radio messages it received. Anything
-    about other robots (positions, plans, what they have searched) must arrive by radio.
+    It holds only the robot's own state, its own sensor updates (belief and map), events
+    involving it (e.g. a dock abort on its dock), and the radio messages it received. Anything
+    about other robots (positions, plans, what they have searched or found) must arrive by radio.
     """
 
     time: float
@@ -216,6 +238,7 @@ class RobotObservation:
     events: list[Event]
     inbox: list[RadioMessage]
     mission_complete: bool = False
+    map_updates: list[TraversabilityUpdate] = field(default_factory=list)
 
     def messages(self, topic: Optional[str] = None) -> list[RadioMessage]:
         return self.inbox if topic is None else [m for m in self.inbox if m.topic == topic]

@@ -3,13 +3,20 @@
 Per step (``dt`` seconds), in order:
 
 1. apply controller commands (invalid ones are rejected with an event);
-2. move active robots along their commanded path/point at their nominal speed;
+2. move active robots along their commanded path/point at their nominal speed (a UGV
+   stops before a road node that is blocked in reality);
 3. carry docked UAVs with their host UGV;
 4. start requested dock/undock manoeuvres (host UGV must not have moved this step);
 5. advance manoeuvres in progress, aborting any whose host UGV moved;
 6. drain energy and swap the batteries of docked UAVs, marking robots that run out as DEPLETED;
-7. sense: emit a :class:`LocalBeliefUpdate` per sensing robot and check the target;
+7. sense: emit a :class:`LocalBeliefUpdate` per sensing robot and check the target, and a
+   :class:`TraversabilityUpdate` per robot that sees road-map mismatches it had not seen;
 8. radio: queue this step's ``Transmit`` commands and deliver messages that are due.
+
+Robots are given the prior road map (``Scenario.graphs``); the UGV drives on the true one
+(``Scenario.true_road()``). A FollowPath may use any edge of either. A UGV whose next node is
+blocked stops at the node before it (``PATH_BLOCKED``), finds it blocked, and waits there with
+the rest of its path pending until it is given a new command.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from marsupial_search.core import (
     N_LAYERS,
@@ -44,6 +52,7 @@ from marsupial_search.core import (
     Terrain,
     Transmit,
     TraversabilityGraph,
+    TraversabilityUpdate,
     Undock,
 )
 
@@ -73,9 +82,11 @@ class SimConfig:
 
 
 class _SimRobot:
-    def __init__(self, spec: RobotSpec, graph: TraversabilityGraph):
+    def __init__(self, spec: RobotSpec, graph: TraversabilityGraph, passable: Optional[TraversabilityGraph] = None):
         self.spec = spec
-        self.graph = graph
+        self.graph = graph  # every node and edge a path may name
+        self.passable = passable  # the edges that can really be driven (None: all of graph's)
+        self.blocked_by: Optional[int] = None  # the node it stopped in front of this step
         self.energy = spec.energy.capacity
         self.pos = np.zeros(2)
         self.mode = RobotMode.ACTIVE
@@ -106,10 +117,16 @@ class _SimRobot:
     def move(self, dt: float) -> None:
         self.moved = 0.0
         self.nodes_reached = []
+        self.blocked_by = None
         budget = self.spec.speed * dt
         while budget > _EPS and (self.path or self.goal_point is not None):
             if self.path:
-                target = self.graph.positions[self.path[0]]
+                nxt = self.path[0]
+                if self.passable is not None and self.at_node is not None and nxt != self.at_node \
+                        and not self.passable.has_edge(self.at_node, nxt):
+                    self.blocked_by = nxt  # wait here, the rest of the path pending
+                    break
+                target = self.graph.positions[nxt]
             else:
                 target = self.goal_point
             delta = target - self.pos
@@ -171,7 +188,8 @@ class MissionResult:
             key = f"coverage_{t.name.lower()}"
             if key in self.log:
                 out[key] = float(self.log[key][-1])
-        for k in ("sorties", "dock_aborts", "undock_aborts", "rejected", *_RADIO_STAT_KEYS):
+        for k in ("sorties", "dock_aborts", "undock_aborts", "rejected", "path_blocked", "map_changes_found",
+                  *_RADIO_STAT_KEYS):
             out[k] = sum(s[k] for s in self.robot_stats.values())
         senders = [s for s in self.robot_stats.values() if s["radio_sent"]]
         out["radio_payload_min_bytes"] = min((s["radio_payload_min_bytes"] for s in senders), default=float("nan"))
@@ -229,9 +247,21 @@ class Simulator:
         self.target_cell = sc.grid.world_to_cell(*sc.target_xy)
         self._target_center = np.array(sc.grid.cell_center(*self.target_cell)) if cfg.target else np.full(2, np.inf)
 
+        mm = sc.road_mismatch
+        road = sc.true_road(blocked=False) if mm else None
         self.robots: dict[str, _SimRobot] = {}
         for rid, spec in sc.robots.items():
-            self.robots[rid] = _SimRobot(spec, sc.graphs[spec.robot_type])
+            if spec.robot_type == RobotType.UGV and mm:
+                self.robots[rid] = _SimRobot(spec, road, sc.true_road())
+            else:
+                self.robots[rid] = _SimRobot(spec, sc.graphs[spec.robot_type])
+        # Road-map mismatches the robots can see: what each has seen, or found by running into it.
+        self._road, self._n_prior = road, sc.graphs[RobotType.UGV].n_nodes
+        self._mismatch_ids = np.array(sorted(mm.blocked) + sorted(mm.new_nodes), dtype=int)
+        self._mismatch_tree = cKDTree(road.positions[self._mismatch_ids]) if mm else None
+        self._blocked = set(mm.blocked)
+        self._mismatch_seen: dict[str, set[int]] = {rid: set() for rid in self.robots}
+        self._bumped: dict[str, set[int]] = {rid: set() for rid in self.robots}
         for rid, init in sc.init.items():
             r = self.robots[rid]
             if init.node is not None:
@@ -267,15 +297,17 @@ class Simulator:
         self._next_log = 0.0
         self._next_snapshot = 0.0
         self._stats = {
-            rid: {"type": r.spec.robot_type.value, "sorties": 0, "dock_aborts": 0, "undock_aborts": 0, "rejected": 0}
+            rid: {"type": r.spec.robot_type.value, "sorties": 0, "dock_aborts": 0, "undock_aborts": 0, "rejected": 0,
+                  "path_blocked": 0, "map_changes_found": 0}
             for rid, r in self.robots.items()
         }
 
         for r in self.robots.values():
             r.moved, r.nodes_reached = 0.0, ([r.at_node] if r.at_node is not None else [])
         updates = self._sense()
+        map_updates = self._sense_map()
         self._record()
-        return self._observation(updates)
+        return self._observation(updates, map_updates=map_updates)
 
     # ------------------------------------------------------------------- loop
     def run(
@@ -325,10 +357,15 @@ class Simulator:
 
         for r in self.robots.values():
             r.started_this_step = False
+            stuck_on = r.blocked_by
             if r.mode == RobotMode.ACTIVE:
                 r.move(dt)
             else:
-                r.moved, r.nodes_reached = 0.0, []
+                r.moved, r.nodes_reached, r.blocked_by = 0.0, [], None
+            if r.blocked_by is not None and r.blocked_by != stuck_on:
+                self._stats[r.rid]["path_blocked"] += 1
+                self._bumped[r.rid].add(r.blocked_by)
+                self._emit(EventType.PATH_BLOCKED, r.rid, detail=f"node {r.blocked_by} is blocked")
         for r in self.robots.values():
             if r.host is not None and r.mode in (RobotMode.DOCKED, RobotMode.DOCKING, RobotMode.UNDOCKING):
                 r.pos = self.robots[r.host].pos.copy()
@@ -343,6 +380,7 @@ class Simulator:
 
         self.time += dt
         updates = self._sense()
+        map_updates = self._sense_map()
         inbox = self._radio(sent_time, dt)
         self._record()
         if not self.done:
@@ -352,7 +390,7 @@ class Simulator:
                 self._finish("ugv_depleted")
             elif self.time >= self.config.max_time_s - _EPS:
                 self._finish("timeout")
-        return self._observation(updates, inbox)
+        return self._observation(updates, inbox, map_updates)
 
     # --------------------------------------------------------------- commands
     def _emit(self, etype: EventType, rid: str, other: Optional[str] = None, detail: str = "") -> None:
@@ -544,6 +582,29 @@ class Simulator:
             updates.append(upd)
         return updates
 
+    def _sense_map(self) -> list[TraversabilityUpdate]:
+        """Road-map mismatches each active robot sees (or ran into) for the first time: blocked nodes,
+        and nodes missing from the map with their edges."""
+        if self._mismatch_tree is None:
+            return []
+        out = []
+        for r in self.robots.values():
+            if r.mode != RobotMode.ACTIVE:
+                continue
+            near = self._mismatch_ids[self._mismatch_tree.query_ball_point(r.pos, r.spec.sensor.range_m)]
+            new = (set(near.tolist()) | self._bumped[r.rid]) - self._mismatch_seen[r.rid]
+            self._bumped[r.rid].clear()
+            if not new:
+                continue
+            self._mismatch_seen[r.rid] |= new
+            self._stats[r.rid]["map_changes_found"] += len(new)
+            added = sorted(new - self._blocked)
+            edges = sorted({(min(n, m), max(n, m)) for n in added for m, _ in self._road.neighbors(n)})
+            nodes = {m: tuple(map(float, self._road.positions[m])) for e in edges for m in e if m >= self._n_prior}
+            out.append(TraversabilityUpdate(r.rid, self.time, RobotType.UGV, tuple(sorted(new & self._blocked)),
+                                            nodes, tuple(edges)))
+        return out
+
     # ------------------------------------------------------------ bookkeeping
     def _finish(self, outcome: str) -> None:
         if not self.done:
@@ -576,8 +637,8 @@ class Simulator:
             self._reject(rid, why)
         return self.radio.collect(self.time, alive)
 
-    def _observation(self, updates: list[LocalBeliefUpdate],
-                     inbox: Optional[dict[str, list[RadioMessage]]] = None) -> Observation:
+    def _observation(self, updates: list[LocalBeliefUpdate], inbox: Optional[dict[str, list[RadioMessage]]] = None,
+                     map_updates: Optional[list[TraversabilityUpdate]] = None) -> Observation:
         states = {}
         noise = self.config.energy_noise_std
         for rid, r in self.robots.items():
@@ -605,7 +666,7 @@ class Simulator:
                 else max(r.swap_left, 0.0) if r.mode == RobotMode.DOCKED else 0.0,
             )
         return Observation(self.time, states, updates, list(self._step_events), mission_complete=self.done,
-                           radio=inbox or {})
+                           radio=inbox or {}, map_updates=map_updates or [])
 
     def result(self, controller_name: str = "") -> MissionResult:
         stats = {}

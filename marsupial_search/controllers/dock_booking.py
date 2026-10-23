@@ -14,7 +14,12 @@ Messages
         changes and every ``route_resend_s``, ``"plan"``: the route from the current index,
         its arrival times, the *pin* (last route index with a promised stop: the route is
         fixed up to here), the queue of accepted bookings with their tours, the take-off
-        stop of each docked UAV, and the UAVs it has written off.
+        stop of each docked UAV, the UAVs it has written off and the road-map changes it knows
+        (``"map"``: blocked nodes, and nodes and edges missing from the prior map).
+        A UAV adds ``"map"``: the road-map changes it knows and the UGV's last plan did not,
+        so it reports what it finds until the UGV has it; and in flight ``"free"``: where and
+        when its tour ends and the energy it can spend after that, so a UGV running late can
+        meet it elsewhere (``ugv_timed_route``).
     ``"book"`` (UAV → UGV): a :class:`Booking`, re-sent until it shows up in the queue.
         The UGV accepts a booking planned on its current route ``version`` that lands after
         the pin; accepting bumps the version, so bookings planned on the old route are
@@ -41,6 +46,7 @@ from marsupial_search.core import (
     Command,
     Dock,
     GoToPoint,
+    GraphKnowledge,
     Hold,
     MissionSetup,
     RobotController,
@@ -129,7 +135,9 @@ class BookingRobot(RobotController):
         self.type = self.spec.robot_type
         self.graph = setup.graphs[self.type]
         self.belief = BeliefMap(setup.grid, setup.prior, setup.layer_fractions)
-        self.road_visited = np.zeros(setup.graphs[RobotType.UGV].n_nodes, dtype=bool)
+        self.roads = GraphKnowledge(setup.graphs[RobotType.UGV])  # the road map and the changes found to it
+        self.road = self.roads.graph  # the current road map
+        self.road_visited = np.zeros(self.road.n_nodes, dtype=bool)
         self.peers: dict[str, dict[str, Any]] = {}
         self.started = False
         self._new_visited: list[int] = []
@@ -147,9 +155,11 @@ class BookingRobot(RobotController):
         for upd in obs.belief_updates:
             self.belief.apply(upd)
             self._new_updates.append(upd)
+        for upd in obs.map_updates:
+            self.roads.add(upd.blocked, upd.new_nodes, upd.new_edges)
         if self.type == RobotType.UGV:
             reached = list(s.nodes_reached) + ([s.node] if s.node is not None else [])
-            self.road_visited[reached] = True
+            self._mark_visited(reached)
             self._new_visited += reached
         for msg in obs.messages(STATUS):
             self._ingest(msg.sender, msg.payload, msg.sent_time)
@@ -158,6 +168,9 @@ class BookingRobot(RobotController):
         status = {"type": self.type.value, "pos": s.position, "mode": s.mode.value, "energy": s.energy,
                   "energy_fraction": s.energy_fraction, "visited": self._new_visited, "updates": self._new_updates,
                   "sighting": self.belief.detection_xy, "done": self._done, **self._status_extra(s, now)}
+        report = self._map_report()
+        if report is not None:
+            status["map"] = report
         self._new_visited, self._new_updates = [], []
         cmds.append(Transmit(STATUS, status))
         return cmds
@@ -166,8 +179,10 @@ class BookingRobot(RobotController):
         self.peers[sender] = {**p, "t": t}
         for upd in p["updates"]:
             self.belief.apply(upd)
+        if "map" in p:
+            self.roads.add(**p["map"])
         if p["type"] == RobotType.UGV.value:
-            self.road_visited[p["visited"]] = True
+            self._mark_visited(p["visited"])
         if p["sighting"] is not None and self.belief.detection_xy is None:
             self.belief.detection_xy = tuple(p["sighting"])
 
@@ -176,6 +191,26 @@ class BookingRobot(RobotController):
         np.minimum(self.belief.mass, payload["mass"], out=self.belief.mass)
         if payload["sighting"] is not None and self.belief.detection_xy is None:
             self.belief.detection_xy = tuple(payload["sighting"])
+
+    def _mark_visited(self, nodes: list[int]) -> None:
+        if nodes and max(nodes) >= len(self.road_visited):
+            self.road_visited = np.pad(self.road_visited, (0, max(nodes) + 1 - len(self.road_visited)))
+        self.road_visited[nodes] = True
+
+    def _check_map(self, s: RobotState, now: float) -> None:
+        """Once the road map has changed: plan on the new one (``_map_changed``)."""
+        if self.road is self.roads.graph:
+            return
+        self.road = self.roads.graph
+        if self.road.n_nodes > len(self.road_visited):
+            self.road_visited = np.pad(self.road_visited, (0, self.road.n_nodes - len(self.road_visited)))
+        self._map_changed(s, now)
+
+    def _map_changed(self, s: RobotState, now: float) -> None: ...
+
+    def _map_report(self) -> Optional[dict]:
+        """Road-map changes to put in the status (None: nothing to report)."""
+        return None
 
     def _start(self, s: RobotState) -> None: ...
 
@@ -214,6 +249,7 @@ class BookingUav(BookingRobot):
         self.next_dock_try = 0.0
         self.dock_tries = 0
         self.t0 = 0.0
+        self.ugv_roads = GraphKnowledge(setup.graphs[RobotType.UGV])  # the road-map changes the UGV's plan had
 
     @abstractmethod
     def plan_sortie(self, start, t_start: float, energy: float, now: float) -> Optional[Sortie]:
@@ -232,9 +268,24 @@ class BookingUav(BookingRobot):
         super()._ingest(sender, p, t)
         if sender == self.ugv and "plan" in p:
             self.plan = {**p["plan"], "t": t}
+            if "map" in p["plan"]:
+                self.roads.add(**p["plan"]["map"])
+                self.ugv_roads.add(**p["plan"]["map"])
+
+    def _map_report(self) -> Optional[dict]:
+        news = self.roads.changes(exclude=self.ugv_roads)
+        return news if any(news.values()) else None
 
     def _status_extra(self, s: RobotState, now: float) -> dict:
-        return {"home": self.ugv, "phase": self.phase}
+        out = {"home": self.ugv, "phase": self.phase}
+        if self.phase == "sortie" and self.waypoints:  # when and where its tour ends, and the energy left to meet the UGV
+            e, v = self.spec.energy, self.spec.speed
+            pts = [s.position] + self.waypoints
+            length = sum(dist(a, b) for a, b in zip(pts, pts[1:]))
+            spare = s.energy - e.travel_cost(length, v) - e.hover_cost(self.setup.docking.dock_duration_s) \
+                - self.cfg.uav_reserve_fraction * e.capacity
+            out["free"] = (*self.waypoints[-1], now + length / v, spare)
+        return out
 
     # ---------------------------------------------------------------- step
     def _step(self, s: RobotState, now: float, obs: RobotObservation, cmds: list) -> None:
@@ -242,6 +293,7 @@ class BookingUav(BookingRobot):
             self.phase = "lost"
         if self.phase == "lost":
             return
+        self._check_map(s, now)
         gs = self.peers.get(self.ugv)
         self._done = gs is not None and gs["done"]
         self._check_booking(now)
@@ -276,6 +328,8 @@ class BookingUav(BookingRobot):
             elif self.plan["version"] != self.pending.version:
                 self.pending = None
         elif self.booking is not None and mine is not None and mine["plan_id"] == self.booking["plan_id"]:
+            if self.phase == "sortie" and mine["land_node"] != self.booking["land_node"]:  # moved off a blocked node
+                self.waypoints[-1] = tuple(self.road.positions[mine["land_node"]])
             self.booking = mine  # the UGV may have re-timed it (a detour)
         elif self.booking is not None and mine is None and self.phase == "sortie":
             self.booking, self.phase = None, "airborne"  # the UGV gave up on it: book again
@@ -291,7 +345,7 @@ class BookingUav(BookingRobot):
         self.phase = "sortie"
         self.tour = list(booking["tour"])
         air = self.setup.graphs[RobotType.UAV]
-        k = tuple(self.setup.graphs[RobotType.UGV].positions[booking["land_node"]])
+        k = tuple(self.road.positions[booking["land_node"]])
         self.waypoints = [tuple(air.positions[n]) for n in self.tour] + [k]
 
     def _book(self, start, t_start: float, energy: float, now: float) -> None:
@@ -330,7 +384,7 @@ class BookingUav(BookingRobot):
                 if t_off - now <= self.cfg.plan_lead_s + self.setup.docking.undock_duration_s:
                     swapped = t_off - self.setup.docking.undock_duration_s >= now + s.mode_time_remaining
                     energy = self.spec.energy.capacity if swapped else s.energy
-                    pos = tuple(self.setup.graphs[RobotType.UGV].positions[p["nodes"][local]])
+                    pos = tuple(self.road.positions[p["nodes"][local]])
                     self._book(pos, t_off, energy, now)
         # The UGV holds at the take-off stop until this UAV has left, so a status a few seconds old is enough.
         h = gs.get("holding") if gs is not None and now - gs["t"] <= self.cfg.partner_stale_s else None
@@ -367,17 +421,19 @@ class BookingUav(BookingRobot):
         while len(self.waypoints) > 1 and dist(s.position, self.waypoints[0]) < 0.5:
             self.waypoints.pop(0)
             self.tour.pop(0)
-        target = self.waypoints[0]
+        fresh = gs is not None and now - gs["t"] <= self.cfg.partner_stale_s
+        h = gs.get("holding") if fresh else None
+        waiting = h is not None and h["uav"] == self.rid and h["kind"] == LAND  # the UGV holds for this UAV
+        # Tour done and the UGV waits for it: straight to the UGV, wherever it is.
+        target = tuple(gs["pos"]) if waiting and len(self.waypoints) == 1 else self.waypoints[0]
         if dist(s.position, target) >= 0.5:
             if s.goal_point is None or dist(s.goal_point, target) > 0.5:
                 cmds.append(GoToPoint(target))
             return
-        # At the landing node: land once the UGV holds there for this UAV (or, unheard, is due).
-        fresh = gs is not None and now - gs["t"] <= self.cfg.partner_stale_s
-        h = gs.get("holding") if fresh else None
-        here = h is not None and h["uav"] == self.rid and h["kind"] == LAND \
-            and dist(gs["pos"], s.position) <= 0.5 * self.setup.docking.dock_tolerance_m
-        due = not fresh and now >= b["t_land"] + 2 * self.setup.dt  # out of touch: try once the UGV is due
+        # At the landing node: land once the UGV holds there for this UAV (or, with no radio, is due).
+        # With a radio, a UAV out of touch waits: the UGV meets it within radio range (ugv_timed_route).
+        here = waiting and dist(gs["pos"], s.position) <= 0.5 * self.setup.docking.dock_tolerance_m
+        due = self.setup.radio_range_m is None and now >= b["t_land"] + 2 * self.setup.dt
         if (here or due) and now >= self.next_dock_try:
             cmds.append(Dock(self.ugv))
             self.phase = "landing"

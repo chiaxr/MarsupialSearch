@@ -23,6 +23,7 @@ Reproduce with `python scripts/run_mission.py --config configs/small_car.yaml --
   - [1.3 Visibility layers](#13-visibility-layers-urban-needs-both-robot-types)
   - [1.4 Radio channel](#14-radio-channel)
   - [1.5 Environments](#15-environments)
+  - [1.6 Road-map mismatch](#16-road-map-mismatch)
 - [2. Controllers](#2-controllers) (algorithm details in [controllers.md](controllers.md))
   - [2.1 Controller interface](#21-controller-interface-the-deployment-boundary)
   - [2.2 Radio messages](#22-radio-messages)
@@ -55,7 +56,7 @@ marsupial_search/
   controllers/   portable: policies and the oracle (depend only on marsupial_search.core + numpy/scipy)
   sim/           research only: scenario generator, simulator, evaluation
   viz/           research only: matplotlib plots / GIF
-configs/         YAML experiment files (example.yaml documents the format)
+configs/         YAML experiment files (example.yaml documents the format; small_car_mismatch.yaml: a wrong road map)
 scripts/
   run_mission.py one mission + plots + GIF
   compare.py     teams x map seeds x target seeds -> CSV + summary + plot
@@ -104,13 +105,13 @@ is depleted, or at the 6 h limit.
 | Aspect | Model |
 |---|---|
 | Time | fixed step `dt` (default 1 s) |
-| UGV motion | along road-graph edges only. A path must start at the current node, a neighbouring node, or an endpoint of the edge being driven. Vegetation has no roads. |
+| UGV motion | along road-graph edges only. A path must start at the current node, a neighbouring node, or an endpoint of the edge being driven. Vegetation has no roads. With a [road-map mismatch](#16-road-map-mismatch), it drives the true roads and stops before a blocked node. |
 | UAV motion | free: straight lines between UAV-grid nodes or to any point |
 | Energy | `idle_power·dt + energy_per_m·distance`, drawn whenever the robot is not docked (UAV hover included). A robot at 0 energy is `DEPLETED` for good. Optional noise on the energy estimate. |
 | Docking | UAV within `dock_tolerance_m` of the UGV, which has not moved this step and has its dock free. Landing takes `dock_duration_s`; the dock **aborts** if the UGV moves during it. One UAV at a time. |
 | Docked | UAV rides with the UGV and draws no power. Its battery is swapped for a full one in `swap_duration_s`, while the UGV drives or (with `swap_while_moving: false`) only while it stands still. A docked UAV's `mode_time_remaining` is what is left of its swap. |
 | Undocking | take-off takes `undock_duration_s`; it **aborts** if the UGV moves during it, and is rejected while the swap is in progress |
-| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities |
+| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Road-map mismatches in range come as a `TraversabilityUpdate`. |
 | Termination | `TARGET_FOUND` when the target is inside the sensor range of a robot whose type is in `SimConfig.terminate_on` (default: UGV only; perfect, distance-only test). Other robots report `TARGET_SIGHTED`. Other outcomes: `ugv_depleted` (`stop_when_ugv_depleted`, on by default), `all_depleted`, `controller_done`, `timeout`. |
 
 ### 1.3 Visibility layers ("urban needs both robot types")
@@ -203,6 +204,47 @@ but imperfect: a target can sit in a missed label, and spurious labels attract w
 `resample_target(scenario, rng)` draws new targets the same way. The old Gaussian-mixture
 prior is still available with `prior_model="gaussian_mixture"`.
 
+### 1.6 Road-map mismatch
+
+The road map the robots are given (`MissionSetup.graphs[UGV]`, the *prior* map) can differ
+from the true roads (`Scenario.road_mismatch`, a `MapMismatch`), in two ways:
+
+| `ScenarioConfig` field | default | the true roads |
+|---|---|---|
+| `road_unmapped_fraction` | 0 | about this share of road nodes is missing from the map: whole stretches of road between junctions, or out to a dead end |
+| `road_blocked_fraction` | 0 | this share of mapped road nodes cannot be traversed |
+
+Both are off by default, and the [results](#34-results) are without them;
+`configs/small_car_mismatch.yaml` turns them on (10 % missing, 5 % blocked). They are drawn
+from their own random stream, so the rest of a map seed's map is unchanged, but the UGV's start
+can differ (it must be a mapped node that is not blocked, and the mapped nodes are re-indexed).
+
+* **Mismatches never cut the network.** A stretch of road is left off the map only if the map
+  stays connected without it, and a node is blocked only if both the map and the true roads
+  stay connected without it. A blockage forces a detour; every other road node stays reachable.
+* **The target is always reachable.** It is placed within UGV sensor range of a *mapped*
+  road the UGV can reach from its start without passing a blocked node, so a mission can end
+  without the team ever finding a missing road.
+* **Robots find mismatches by looking.** A robot's sensor finds a blocked node or a missing
+  road node once it is in range (UGV 55 m, UAV 60 m; road nodes are at most 55 m apart, so the
+  UGV sees a blocked node from the node before it). Each robot gets a `TraversabilityUpdate` the
+  first time it sees each one: the blocked nodes, and the missing nodes with their edges and
+  the position of the node at each edge's far end. Missing nodes keep their true indices, which
+  come after the prior map's; `GraphKnowledge` (`marsupial_search/core/graph.py`) keeps a prior
+  map plus what has been found, and gives the current map as a `TraversabilityGraph` (blocked
+  nodes keep their index but have no edges, and node queries skip them).
+* **Driving into a blockage.** A `FollowPath` may use any edge of the map or of the true roads.
+  A UGV whose next node is blocked stops at the node before it with a `PATH_BLOCKED` event (it
+  then knows the node is blocked even if it is out of sensor range) and waits there, the rest
+  of its path pending, until it gets a new command.
+
+Missing roads still show as road in the terrain (and so in the semantic prior): satellite
+imagery sees a road that the road map lacks. `robot_stats` and the run summary count
+`map_changes_found` (per robot, each mismatch once) and `path_blocked`. In plots, roads missing
+from the map are dashed blue and blocked nodes are red crosses.
+
+How the controllers use what they find is in [controllers.md](controllers.md#road-map-mismatch).
+
 ## 2. Controllers
 
 ### 2.1 Controller interface (the deployment boundary)
@@ -222,8 +264,8 @@ class MissionController:                # centralised: the whole team at once
 ```
 
 * **Policies** (`RobotController`) are the normal case. A `RobotObservation` holds only what
-  one robot knows by itself: its own `RobotState`, its own sensor updates, events involving
-  it, and its radio `inbox`. Other robots' positions, plans, visited nodes and sightings must
+  one robot knows by itself: its own `RobotState`, its own sensor updates (belief and road
+  map), events involving it, and its radio `inbox`. Other robots' positions, plans, visited nodes and sightings must
   arrive by radio. In simulation, `DecentralizedTeam` runs one isolated controller per robot
   (each with its own deep copy of the `MissionSetup`) and stops stepping robots that are
   depleted. On hardware, each robot runs its `RobotController` directly.
@@ -238,8 +280,9 @@ The data passed across the boundary:
   sensor), docking parameters and `radio_range_m` (so controllers can plan to stay connected).
 * `Observation` (every step): `RobotState` per robot (position, mode, energy
   estimate, current or last graph node, nodes reached this step, remaining path,
-  dock relationships), the `LocalBeliefUpdate`s from each sensing robot, and
-  events (docked, dock aborted, depleted, target sighted/found, command rejected, …).
+  dock relationships), the `LocalBeliefUpdate`s from each sensing robot, the
+  `TraversabilityUpdate`s of [road-map mismatches](#16-road-map-mismatch) found, and
+  events (docked, dock aborted, depleted, target sighted/found, command rejected, path blocked, …).
 * `Command`: `FollowPath(nodes)`, `GoToPoint(xy)` (free-motion robots only),
   `Hold()`, `Dock(ugv_id)`, `Undock()`, `Transmit(topic, payload, to=None)`. A robot
   can be given a list of commands, e.g. a motion command plus radio messages.
