@@ -1,0 +1,33 @@
+# The small map with a wrong road map (as small_car_mismatch.yaml), and UAVs with different roles
+# and sensors. uav0 flies low (20 m sensor) and stays docked until the UGV calls it: to make room
+# for uav1's landings, or to scout a blocked node the UGV runs into (controllers.md, uav_near_scout).
+# uav1 flies high (50 m sensor) and searches the wider area on sorties it books itself (uav_far_scout).
+# python scripts/compare.py     --config configs/small_car_scout.yaml
+# python scripts/run_mission.py --config configs/small_car_scout.yaml   # one mission per team
+teams:
+  - {ugv0: ugv_timed_route, uav0: uav_near_scout, uav1: uav_far_scout}
+  - {ugv0: ugv_timed_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}  # the same sensors, both on sorties
+  - joint_planner
+out: outputs/small_car_scout
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: car       # car | building | hiker
+  road_unmapped_fraction: 0.1
+  road_blocked_fraction: 0.05
+  fleet:
+    uav_sensor_ranges: {uav0: 20, uav1: 50}  # the UAV grid follows the smaller one (28 m spacing)
+
+sim:
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+  gif_speedup: 30          # small missions last minutes: play the GIF at 30x real time
+
+compare:
+  maps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  targets: 2
+  estimator: cv
+  workers: 10

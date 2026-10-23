@@ -56,7 +56,8 @@ marsupial_search/
   controllers/   portable: policies and the oracle (depend only on marsupial_search.core + numpy/scipy)
   sim/           research only: scenario generator, simulator, evaluation
   viz/           research only: matplotlib plots / GIF
-configs/         YAML experiment files (example.yaml documents the format; small_car_mismatch.yaml: a wrong road map)
+configs/         YAML experiment files (example.yaml documents the format; small_car_mismatch.yaml: a wrong road map;
+                 small_car_scout.yaml: a near and a far scout)
 scripts/
   run_mission.py one mission + plots + GIF
   compare.py     teams x map seeds x target seeds -> CSV + summary + plot
@@ -78,7 +79,7 @@ any scenario without exactly one UGV.
 |---|---|---|
 | start | a random non-urban road node | `uav0` docked on the UGV; `uav1` hovering over it |
 | motion | road graph only, 5 m/s; road nodes at most 55 m apart (the sensor range) | free, 10 m/s, between nodes of an 85 m UAV grid (√2 × the sensor range: the widest square grid whose footprints leave no gaps) or to any point |
-| sensor | 55 m disk; ground and shared layers | 60 m disk; aerial and shared layers |
+| sensor | 55 m disk; ground and shared layers | 60 m disk; aerial and shared layers (per UAV: `fleet.uav_sensor_ranges`, e.g. `{uav0: 20, uav1: 50}` for a low and a high UAV; the UAV grid then follows the smaller) |
 | energy | 250 000 units; 2.0 /s + 1.0 /m | 2000 units; 1.0 /s (hovering included) + 0.04 /m, so 1.4 /s at full speed |
 | endurance | about 10 h of driving (`small` base: 17 000 units, about 40 min) | about 24 min flying (14 km), 33 min hovering |
 
@@ -332,6 +333,8 @@ and print its kind (centralised or decentralised).
 |---|---|---|---|
 | `ugv_timed_route` | policy | UGV | commits to a timed road route; UAVs book landings on it |
 | `uav_greedy_tour` | policy | UAV | books the next landing slot on that route and flies a greedy tour to it |
+| `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing or to scout a blocked node |
+| `uav_far_scout` | policy | UAV | flies high, searching the wider area on sorties it books itself (for now as `uav_greedy_tour`) |
 | `joint_planner` | centralised **oracle** | the whole team | plans the UGV route, the dock schedule and both UAVs' tours jointly, over a horizon, with perfect information |
 
 The two policies share the dock through a booking protocol (`dock_booking.py`): the UGV commits to

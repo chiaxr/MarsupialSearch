@@ -48,6 +48,13 @@ class SortiePlanner:
         self.own_layers = [l for l in self.air_layers if l not in self.ugv_layers]  # seen only from the air
         self.p_ugv, self.p_air = ugv.sensor.p_detect, uav.sensor.p_detect
 
+    def for_uav(self, uav: RobotSpec) -> "SortiePlanner":
+        """This planner for another UAV (its own sensor footprints and energy model); itself if the
+        UAV has the same specs."""
+        if uav.speed == self.uav.speed and uav.energy == self.uav.energy and uav.sensor == self.uav.sensor:
+            return self
+        return SortiePlanner(self.setup, self.ugv, uav, self.cfg)
+
     def set_road(self, road: TraversabilityGraph) -> None:
         """Plan on this road map (the prior map, updated with the mismatches found)."""
         self.road = road

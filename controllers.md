@@ -7,6 +7,8 @@ how they are combined into teams, are in the [README](README.md#2-controllers).
 |---|---|---|---|---|
 | `ugv_timed_route` | policy | UGV | commits to a timed road route; UAVs book landings on it | `ugv_timed_route.py` |
 | `uav_greedy_tour` | policy | UAV | books the next landing slot on that route and flies a greedy tour to it | `uav_greedy_tour.py` |
+| `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing or to scout a blocked node | `uav_near_scout.py` |
+| `uav_far_scout` | policy | UAV | flies high, searching the wider area on sorties it books itself (for now as `uav_greedy_tour`) | `uav_far_scout.py` |
 | `joint_planner` | centralised **oracle** | the whole team | plans the UGV route, the dock schedule and both UAVs' tours jointly, over a horizon, with perfect information | `joint_planner.py` |
 
 Shared building blocks: `common.py` (search settings, sensor footprints, pursuit paths),
@@ -60,6 +62,30 @@ flight**.
 
 With `swap_while_moving: false` the UGV also holds at a landing stop until the swap is done.
 
+**Standby UAVs.** A UAV whose status says `standby` (`uav_near_scout`) does not book sorties of its
+own: it stays on the dock until the UGV *calls* it, with a take-off stop marked as a call in the
+plan (`calls`). The UGV calls it in two cases:
+
+- *To make room.* Another UAV is about to land while it is on the dock (the dock takes one UAV):
+  its take-off goes right before that landing, timed to end just as the other UAV lands. It leaves
+  whether or not its own landing is booked.
+- *To search what a blockage cuts off.* The UGV's route runs into a blocked node within
+  `call_radius_m` (250 m) of the UGV. The road nodes it *cuts off* are those within `call_reach_m`
+  (500 m) of the UGV by road on the map before, that are now `call_gain_m` (200 m) further away by
+  road, or out of reach. The UGV calls the standby UAV (if its battery is swapped) only if the
+  belief that UAV can see round them (the UGV's footprint at each) is at least `call_min_belief`
+  (0.005), round nodes out of reach counting `pocket_weight` (2) times. Belief already searched by
+  any robot is gone from the UGV's map, so ground that has been looked at calls nobody. The call
+  lists the cut-off nodes; the UAV takes off where the UGV is, once it has booked its landing (a
+  call it has not booked within `call_timeout_s`, 15 s, is withdrawn). The generated maps keep the
+  roads connected round blocked nodes, so there a blockage only makes the way longer.
+
+A called UAV books its landing wherever the dock is free, not only after the pin: the plan lists
+the route indices each UAV is on the dock (`busy`). The UGV adds no take-off after that landing.
+The other UAVs keep booking after the pin, and once their battery swap is done (`free_from`);
+they don't book while a standby UAV is in the air without a landing. With a standby UAV, the
+landing slots are shared by the other UAVs only.
+
 `BookingUav` implements the UAV side (booking, take-off, flight, landing, sync). A UAV policy
 subclasses it and implements one method, `plan_sortie`, which picks the landing and the tour.
 
@@ -101,7 +127,46 @@ route is re-planned on the current belief every 60 s.
    before the UGV's route.
 3. **Out of touch:** it flies to where it last heard the UGV and books again.
 
-It assumes both UAVs have its specs (`slot_spacing`).
+It assumes both UAVs have its speed and battery (`slot_spacing`); their sensors may differ.
+
+### `uav_near_scout` and `uav_far_scout`
+
+A pair of roles for a low and a high UAV: give the near scout the smaller sensor
+(`fleet.uav_sensor_ranges`, e.g. `{uav0: 20, uav1: 50}`). With the near scout mostly on the dock,
+the team searches with the UGV and one UAV most of the time.
+
+**`uav_far_scout`** flies high and searches the wider area on sorties it books itself, taking
+every landing slot. It plans as `uav_greedy_tour`, on the belief weighed to complement the UGV and
+the near scout. The UGV's route here is the stretch it drives during one full sortie.
+
+| option | what it does | default | effect (near + far scout team, `cv`, paired by map) |
+|---|---|---|---|
+| `near_route_m`, `near_route_weight` | belief near the UGV's route counts less: 0.25 on it, rising to full at 300 m (the UGV sweeps it, and the near scout searches there while the far scout is on the dock) | on, 300 m | −13.5 ± 8.0 min on 30 large maps with road mismatches (faster on 19); −1.5 ± 1.4 min on 10 small ones |
+| `recon_weight`, `recon_from_s`, `recon_to_s` | once a blocked node is known, each road node on the UGV's route 2–30 min ahead that no robot has looked at is worth that many average footprints of belief | off | +0.7 ± 9.0 min (10 large maps), none on small |
+| `confirm_scale_s` | belief counts τ / (τ + d), d the UGV's drive from its route to confirm a sighting there | off | +1.2 ± 12.1 min (10 large maps), none on small |
+
+With all three on, the gain drops to −6.1 ± 8.0 min (30 large maps). New scores for picking the
+next tour node go in `uav_far_scout.py` (`_tour_mass`).
+
+**`uav_near_scout`** is a standby UAV (see dock booking above) that flies low, next to the UGV:
+
+1. **Making room.** It lands at the first route index where the dock is free (after the other
+   UAV has left it) and that it can reach. Its tour is the `uav_greedy_tour` chain tour, on
+   UAV-grid nodes within `nearby_m` (300 m) of the UGV's route from its take-off to its landing.
+2. **Called to a blockage.** It first syncs its belief with the UGV's, so it knows everything
+   any robot has searched. Its tour is the chain tour on UAV-grid nodes within `scout_radius_m`
+   (75 m) of the cut-off road nodes, picking each next node by the belief left in its footprint,
+   so nothing already searched. It lands at the first route index, from `scout_min_s` (60 s) on,
+   by which that tour sweeps `cover_fraction` (90 %) of what the longest one it may fly
+   (`scout_max_s`, 600 s) would: as soon as it has covered them.
+3. **Tracing roads** (`trace_roads`). Called to a blockage, it follows any road it finds that is
+   missing from the map: it flies to the far end of each new road node it sees (within
+   `trace_radius_m`, 200 m, of the blocked node), dropping tour nodes from the end as needed to
+   land on time with its reserve.
+
+Either way, it lands only where the dock is free, and early enough that its battery is swapped
+before the other UAV's next landing.
+   It reports what it finds like any UAV, so the UGV uses those roads from its next re-plan.
 
 ## Oracle: `joint_planner`
 

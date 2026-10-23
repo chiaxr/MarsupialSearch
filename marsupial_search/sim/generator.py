@@ -67,16 +67,25 @@ from marsupial_search.core import (
 from .scenario import MapMismatch, RobotInit, Scenario
 
 
+UAV_IDS = ("uav0", "uav1")
+
+
 @dataclass
 class FleetConfig:
     """The marsupial team: one UGV (``ugv0``) and two UAVs that share its dock. ``uav0``
-    starts docked on the UGV; ``uav1`` starts airborne, hovering over it."""
+    starts docked on the UGV; ``uav1`` starts airborne, hovering over it. The UAVs share a
+    speed and battery; ``uav_sensor_ranges`` gives a UAV its own sensor range (e.g. a UAV
+    flying lower sees a smaller footprint)."""
     ugv_speed: float = 5.0
     ugv_energy: EnergySpec = field(default_factory=lambda: EnergySpec(capacity=250_000, idle_power=2.0, energy_per_m=1.0))
     ugv_sensor_range: float = 55.0
     uav_speed: float = 10.0
     uav_energy: EnergySpec = field(default_factory=lambda: EnergySpec(capacity=2_000, idle_power=1.0, energy_per_m=0.04))
     uav_sensor_range: float = 60.0
+    uav_sensor_ranges: dict[str, float] = field(default_factory=dict)  # per UAV (uav0, uav1): overrides uav_sensor_range
+
+    def uav_range(self, rid: str) -> float:
+        return self.uav_sensor_ranges.get(rid, self.uav_sensor_range)
 
 
 @dataclass
@@ -107,7 +116,7 @@ class ScenarioConfig:
     road_unmapped_fraction: float = 0.0  # share of road nodes missing from the map (whole stretches of road)
     road_blocked_fraction: float = 0.0  # share of mapped road nodes that cannot be traversed
     # UAV grid
-    uav_grid_spacing_m: Optional[float] = None  # None: √2 · the UAV sensor range, the widest square grid whose footprints leave no gaps
+    uav_grid_spacing_m: Optional[float] = None  # None: √2 · the smallest UAV sensor range, the widest square grid whose footprints leave no gaps
     # prior
     prior_model: str = "semantic"  # "semantic" (LMPath-style) | "gaussian_mixture"
     target_object: str = "car"  # key into SEMANTIC_LABELS
@@ -190,6 +199,9 @@ class _RoadBuilder:
 
 def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     cfg = cfg or ScenarioConfig()
+    unknown = set(cfg.fleet.uav_sensor_ranges) - set(UAV_IDS)
+    if unknown:
+        raise ValueError(f"fleet.uav_sensor_ranges: no UAV {sorted(unknown)}; the UAVs are {list(UAV_IDS)}")
     rng = np.random.default_rng(cfg.seed)
     W, H = cfg.size_m
     grid = GridSpec(origin=(0.0, 0.0), resolution=cfg.cell_m, shape=(int(round(H / cfg.cell_m)), int(round(W / cfg.cell_m))))
@@ -433,8 +445,8 @@ def road_node_spacing(cfg: ScenarioConfig) -> float:
 
 
 def uav_grid_spacing(cfg: ScenarioConfig) -> float:
-    """UAV grid spacing: the footprints of a square grid's nodes just cover the plane."""
-    return cfg.uav_grid_spacing_m or np.sqrt(2.0) * cfg.fleet.uav_sensor_range
+    """UAV grid spacing: the footprints of a square grid's nodes just cover the plane (for every UAV)."""
+    return cfg.uav_grid_spacing_m or np.sqrt(2.0) * min(cfg.fleet.uav_range(rid) for rid in UAV_IDS)
 
 
 def _finalize_roads(roads: _RoadBuilder, cfg: ScenarioConfig) -> TraversabilityGraph:
@@ -656,9 +668,9 @@ def _make_fleet(cfg: ScenarioConfig, road: TraversabilityGraph, terrain, grid, r
     rural = np.flatnonzero((terrain[r, c] != int(Terrain.URBAN)) & ~road.blocked)
     depot = int(rng.choice(rural)) if len(rural) else 0
     ugv_sensor = SensorSpec(range_m=f.ugv_sensor_range, visible_layers=(Layer.SHARED, Layer.GROUND))
-    uav_sensor = SensorSpec(range_m=f.uav_sensor_range, visible_layers=(Layer.SHARED, Layer.AERIAL))
     robots = {"ugv0": RobotSpec("ugv0", RobotType.UGV, f.ugv_speed, f.ugv_energy, ugv_sensor)}
-    for rid in ("uav0", "uav1"):
+    for rid in UAV_IDS:
+        uav_sensor = SensorSpec(range_m=f.uav_range(rid), visible_layers=(Layer.SHARED, Layer.AERIAL))
         robots[rid] = RobotSpec(rid, RobotType.UAV, f.uav_speed, f.uav_energy, uav_sensor)
     init = {"ugv0": RobotInit(node=depot), "uav0": RobotInit(docked_on="ugv0"),
             "uav1": RobotInit(position=tuple(road.positions[depot]))}  # the dock takes one UAV at a time

@@ -277,3 +277,19 @@ def test_out_of_touch_uavs_are_met_instead_of_landing_blind():
         .run(make_team(DEFAULT_TEAM))
     s = res.summary()
     assert res.outcome == "found" and s["rejected"] == 0 and s["depleted"] == 0 and s["sorties"] >= 2
+
+
+def test_a_landing_whose_take_off_a_re_route_put_at_the_same_node_can_still_move():
+    # A re-route can put a take-off on its landing's index (the route between them skipped). The
+    # UGV is there, and the landing node turns out blocked: the only place to meet is that index.
+    ugv, s = _ugv_on(range(6), 1000.0)
+    b = _book(ugv, s, 3, float(ugv._times(s, 0.0)[3]), slack_s=60.0)
+    off = next(st for st in ugv.stops[b["off_idx"]] if st["kind"] == "takeoff")
+    ugv.stops[b["off_idx"]].remove(off)
+    ugv.stops[3].append(off)
+    b["off_idx"], ugv.cur, b["moved"] = 3, 3, True
+    from marsupial_search.core import RobotMode, RobotState
+    pos = tuple(ugv.road.positions[3])
+    s = RobotState("ugv0", RobotType.UGV, pos, RobotMode.ACTIVE, 1e5, 1e5, False, 3, 3, (), (), None)
+    ugv._check_landings(s, 30.0)  # used to fail on an empty range of meeting points
+    assert b["land_idx"] == 3

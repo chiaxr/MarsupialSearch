@@ -28,6 +28,15 @@ Messages
         (element-wise minimum) and returns the fused map, so the next tour is planned on
         what every UAV has reported.
 
+Standby UAVs
+    A UAV whose status says ``"standby"`` (``uav_near_scout``) stays on the dock until the UGV calls
+    it: a take-off stop listed in the plan's ``"calls"`` (``"for"``: the UAV it makes room for;
+    ``"xy"``: a blocked node to scout). It books its landing wherever the dock is free (the
+    plan's ``"busy"``: the route index ranges each UAV is on the dock), and the UGV adds no
+    take-off after it. The other UAVs book after the pin and from ``"free_from"`` (when a
+    standby UAV on the dock can leave it), and share the landing slots (``"standby"`` lists
+    the standby UAVs).
+
 :class:`BookingUav` is the UAV side of the protocol: booking, take-off, flight, landing and
 sync. A UAV policy subclasses it and implements :meth:`BookingUav.plan_sortie`, which picks
 the landing and the tour flown on the way to it.
@@ -228,6 +237,7 @@ class BookingUav(BookingRobot):
     holds for it, flies the booked tour and lands in turn. Subclasses choose the sortie."""
 
     config_cls = BookingUavConfig
+    standby = False  # True: stays on the dock until the UGV calls it (see the module docstring)
 
     def reset(self, robot_id: str, setup: MissionSetup) -> None:
         super().reset(robot_id, setup)
@@ -278,6 +288,8 @@ class BookingUav(BookingRobot):
 
     def _status_extra(self, s: RobotState, now: float) -> dict:
         out = {"home": self.ugv, "phase": self.phase}
+        if self.standby:
+            out["standby"] = True
         if self.phase == "sortie" and self.waypoints:  # when and where its tour ends, and the energy left to meet the UGV
             e, v = self.spec.energy, self.spec.speed
             pts = [s.position] + self.waypoints
@@ -358,8 +370,16 @@ class BookingUav(BookingRobot):
                                sortie.e_land, sortie.slack_s, sortie.tour)
 
     def _slot(self, p: dict) -> float:
-        n = max(self.n_uav - len(p["lost"]), 1)
+        n = max(self.n_uav - len(set(p["lost"]) | set(p["standby"])), 1)  # the UAVs that book sorties take turns
         return slot_spacing(self.setup, self.cfg, n)
+
+    def _takeoff(self, p: dict) -> Optional[tuple[int, float]]:
+        """This UAV's next take-off stop in the UGV's plan ``p``: (route index, ready), or None."""
+        return p["takeoffs"].get(self.rid)
+
+    def _may_undock(self) -> bool:
+        """Take off now that the UGV holds for this UAV's take-off (and its battery is swapped)?"""
+        return True
 
     # --------------------------------------------------------------- docked
     def _step_docked(self, s: RobotState, now: float, obs: RobotObservation, gs: Optional[dict],
@@ -375,12 +395,12 @@ class BookingUav(BookingRobot):
         p = self.plan
         if p is None or now - p["t"] > self.cfg.partner_stale_s:
             return
-        off = p["takeoffs"].get(self.rid)
+        off = self._takeoff(p)
         if off is not None and self.pending is None and self.booking is None and self.synced:
             idx, ready = off
             local = idx - p["cur"]
             if 0 <= local < len(p["arrive"]):
-                t_off = max(p["arrive"][local], ready, now) + self.setup.docking.undock_duration_s
+                t_off = max(p["arrive"][local], ready, now + s.mode_time_remaining) + self.setup.docking.undock_duration_s
                 if t_off - now <= self.cfg.plan_lead_s + self.setup.docking.undock_duration_s:
                     swapped = t_off - self.setup.docking.undock_duration_s >= now + s.mode_time_remaining
                     energy = self.spec.energy.capacity if swapped else s.energy
@@ -389,7 +409,7 @@ class BookingUav(BookingRobot):
         # The UGV holds at the take-off stop until this UAV has left, so a status a few seconds old is enough.
         h = gs.get("holding") if gs is not None and now - gs["t"] <= self.cfg.partner_stale_s else None
         if h is not None and h["uav"] == self.rid and h["kind"] == TAKEOFF and s.mode == RobotMode.DOCKED \
-                and s.mode_time_remaining <= 0:  # swap done
+                and s.mode_time_remaining <= 0 and self._may_undock():  # swap done
             cmds.append(Undock())
         if self.pending is not None:
             cmds.append(Transmit(BOOK, self.pending, to=(self.ugv,)))

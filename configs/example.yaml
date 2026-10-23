@@ -17,6 +17,9 @@ teams:
   - ugv0: ugv_timed_route
     uav0: uav_greedy_tour  # starts docked on the UGV
     uav1: uav_greedy_tour  # starts hovering over it
+  # - ugv0: ugv_timed_route
+  #   uav0: uav_near_scout   # flies low, stays docked until the UGV calls it (see small_car_scout.yaml)
+  #   uav1: uav_far_scout    # flies high, books its own sorties
 
 # Per policy or controller: overrides of its config dataclass (marsupial_search/controllers).
 # They apply to every robot that runs that policy. All three controllers accept the shared
@@ -43,6 +46,13 @@ controller_params:
     max_late_s: 120.0              # past a UAV's landing time and slack: drop its landing
     uav_stale_s: 10.0              # no status from a UAV for this long: out of touch (recovery meets it within radio range)
     recover_gain_s: 60.0           # after a re-route: move a late landing if that lands the UAV this much sooner
+    # standby UAVs (uav_near_scout)
+    call_radius_m: 250.0           # the route runs into a blocked node this close: maybe call a standby UAV to scout it
+    call_reach_m: 500.0            # cut off: road nodes this far from the UGV by road (before the blockage) ...
+    call_gain_m: 200.0             # ... that the blockage puts this much further away by road (or out of reach)
+    call_min_belief: 0.005         # call the standby UAV if the belief it can see round them is at least this
+    pocket_weight: 2.0             # belief round nodes the blockage puts out of reach counts this many times
+    call_timeout_s: 15.0           # a called standby UAV that has not booked its landing by then stays docked
   uav_greedy_tour:
     # shared search settings
     uav_reserve_fraction: 0.1      # energy kept in hand at landing
@@ -62,6 +72,57 @@ controller_params:
     plan_lead_s: 45.0              # book the next sortie this long before take-off (default: 30.0)
     abort_reserve_fraction: 0.05   # in flight: skip the rest of the tour below this energy margin
     dock_retry_s: 3.0              # wait after a rejected or aborted landing
+  uav_far_scout:                   # flies high: uav_greedy_tour's keys, plus how it weighs belief
+    # shared search settings
+    uav_reserve_fraction: 0.1      # energy kept in hand at landing
+    hover_margin_s: 30.0           # extra hover budgeted at the landing
+    belief_radius_m: 1500.0        # unused
+    belief_distance_offset_m: 100.0  # the next tour node scores belief in footprint / (distance + offset)
+    pursue_sightings: true         # unused
+    relocation_radius_m: 800.0     # unused
+    fill_tours: true               # true: use the whole energy budget; false: keep the best-rate part of the tour
+    rendezvous_slack_s: 60.0       # spare hover kept at the landing, so the UGV can divert to a sighting
+    # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UGV's
+    slot_s: 0.0                    # spacing of booked landings (0: automatic)
+    stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    # UAV side of the booking
+    partner_stale_s: 10.0          # the UGV's status or route older than this: do not plan or land on it
+    sync_resend_s: 5.0             # a docked UAV re-sends its belief until the UGV returns the fused map
+    plan_lead_s: 30.0              # book the next sortie this long before take-off
+    abort_reserve_fraction: 0.05   # in flight: skip the rest of the tour below this energy margin
+    dock_retry_s: 3.0              # wait after a rejected or aborted landing
+    # weighing the belief its tours score (0: off)
+    near_route_m: 300.0            # belief this close to the UGV's route during a sortie counts less ...
+    near_route_weight: 0.25        # ... this much on the route, rising to full at near_route_m
+    recon_weight: 0.0              # once a blocked node is found: an unseen road node ahead is worth this many footprints (no gain found) ...
+    recon_from_s: 120.0            # ... on the UGV's route from this long after take-off ...
+    recon_to_s: 1800.0             # ... to this long
+    confirm_scale_s: 0.0           # τ: belief counts τ / (τ + the UGV's drive to confirm a sighting there) (no gain found)
+  uav_near_scout:                  # the UAV side of the booking, as uav_greedy_tour, plus its calls
+    # shared search settings
+    uav_reserve_fraction: 0.1      # energy kept in hand at landing
+    hover_margin_s: 30.0           # extra hover budgeted at the landing
+    belief_radius_m: 1500.0        # unused
+    belief_distance_offset_m: 100.0  # the next tour node scores belief in footprint / (distance + offset)
+    pursue_sightings: true         # unused
+    relocation_radius_m: 800.0     # unused
+    fill_tours: true               # true: use the whole energy budget; false: keep the best-rate part of the tour
+    rendezvous_slack_s: 60.0       # spare hover kept at the landing, so the UGV can divert to a sighting
+    slot_s: 0.0                    # unused (it lands where the dock is free)
+    stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    partner_stale_s: 10.0          # the UGV's status or route older than this: do not plan or land on it
+    sync_resend_s: 5.0             # a docked UAV re-sends its belief until the UGV returns the fused map
+    plan_lead_s: 30.0              # book a sortie this long before the take-off it is called for
+    abort_reserve_fraction: 0.05   # in flight: skip the rest of the tour below this energy margin
+    dock_retry_s: 3.0              # wait after a rejected or aborted landing
+    # its calls
+    scout_radius_m: 75.0           # called to a blockage: search UAV-grid nodes this close to the road nodes it cuts off
+    scout_min_s: 60.0              # called to a blockage: fly at least this long ...
+    scout_max_s: 600.0             # ... and land once it has covered the cut-off roads (within this), if the dock allows
+    cover_fraction: 0.9            # covered: its tour sweeps this share of the belief the longest one would
+    trace_roads: true              # called to a blockage: follow the roads it finds missing from the map ...
+    trace_radius_m: 200.0          # ... within this radius of the blocked node
+    nearby_m: 300.0                # making room: search UAV-grid nodes this close to the UGV's route until it lands back
   joint_planner:
     # shared search settings
     uav_reserve_fraction: 0.1      # energy every sortie must land with
@@ -116,7 +177,7 @@ scenario:
   road_unmapped_fraction: 0.0        # share of road nodes missing from the map (whole stretches of road)
   road_blocked_fraction: 0.0         # share of mapped road nodes that cannot be traversed
   # UAV grid
-  uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the UAV sensor range, the widest gap-free grid)
+  uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the smallest UAV sensor range, the widest gap-free grid)
   # prior (README §1.5)
   prior_model: semantic              # semantic (LMPath proxy) | gaussian_mixture
   target_object: hiker               # car | building | hiker (default: car)
@@ -136,6 +197,7 @@ scenario:
     uav_speed: 10.0                  # m/s
     uav_energy: {capacity: 2000, idle_power: 1.0, energy_per_m: 0.04}
     uav_sensor_range: 60.0           # m; sees the aerial and shared layers
+    uav_sensor_ranges: {}            # per UAV, overriding uav_sensor_range, e.g. {uav0: 20, uav1: 50} (a UAV flying lower sees less)
   # dock
   docking:
     dock_duration_s: 30.0            # landing; the UGV must stand still

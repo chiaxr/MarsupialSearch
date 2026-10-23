@@ -40,39 +40,71 @@ class GreedyTourUav(BookingUav):
         self.planner.set_road(self.road)
 
     def plan_sortie(self, start, t_start: float, energy: float, now: float) -> Optional[Sortie]:
-        p, P, cfg = self.plan, self.planner, self.cfg
+        p, P = self.plan, self.planner
         e, v = self.spec.energy, self.spec.speed
-        road = self.road
         nodes, arr, base = np.asarray(p["nodes"], int), np.asarray(p["arrive"], float), p["cur"]
         first = p["pin"] - base + 1  # land after the last promised take-off
         idx = np.arange(first, len(nodes))
         idx = idx[arr[idx] > t_start]
+        if p["free_from"] is not None:  # a standby UAV on the dock: once it can leave
+            idx = idx[arr[idx] >= p["free_from"]]
         if not len(idx):
             return None
         budget = P.energy_budget(energy)
         flight = max(budget, 0.0) / (e.idle_power + e.energy_per_m * v)
         last = p["last_land"] if p["last_land"] is not None else now
         target = min(last + self._slot(p), t_start + flight)
+        reach = self._reach(start, t_start, budget)
+        later = [i for i in idx if arr[i] >= target]
+        order = ([later[0]] if later else []) + [i for i in idx[::-1] if not later or i < later[0]]
+        pick = next((i for i in order if reach(i) >= 0), int(idx[0]))  # none reachable: the earliest
+        return self._sortie(int(pick), start, t_start, energy, now)
+
+    def _reach(self, start, t_start: float, budget: float):
+        """Per local route index: the longest tour that lands there in time (-1: out of reach)."""
+        p, P, v = self.plan, self.planner, self.spec.speed
+        nodes, arr = np.asarray(p["nodes"], int), np.asarray(p["arrive"], float)
 
         def reach(i):
             tau = arr[i] - t_start
             L = min(P.max_tour_length(budget, tau), v * tau)
-            return L if L >= dist(start, road.positions[nodes[i]]) else -1.0
+            return L if L >= dist(start, self.road.positions[nodes[i]]) else -1.0
+        return reach
 
-        later = [i for i in idx if arr[i] >= target]
-        order = ([later[0]] if later else []) + [i for i in idx[::-1] if not later or i < later[0]]
-        pick = next((i for i in order if reach(i) >= 0), int(idx[0]))  # none reachable: the earliest
+    def _tour(self, pick: int, start, t_start: float, energy: float, now: float,
+              claim: Optional[np.ndarray] = None):
+        """The chain tour to local route index ``pick`` (``SortiePlanner.chain_tour``: rate, nodes,
+        length, value; None if out of reach), skipping the tours other UAVs have booked (and the
+        UAV-grid nodes ``claim`` marks -inf)."""
+        p, P = self.plan, self.planner
+        nodes, arr = np.asarray(p["nodes"], int), np.asarray(p["arrive"], float)
         tau = arr[pick] - t_start
-        L_max = reach(pick)
-        k = tuple(road.positions[nodes[pick]])
-        claim = np.full(P.air.n_nodes, np.inf)
+        L_max = self._reach(start, t_start, P.energy_budget(energy))(pick)
+        if L_max < 0:
+            return None
+        claim = np.full(P.air.n_nodes, np.inf) if claim is None else claim.copy()
         for b in p["queue"]:
             if b["uav"] != self.rid and b["t_land"] > now:
                 claim[list(b["tour"])] = -np.inf
         future = arr >= t_start
         t_ugv = P.ugv_sweep_times(nodes[future], arr[future] - t_start)
-        tour = P.chain_tour(P.searchable_mass(self.belief), t_ugv, tuple(start), k, L_max, tau, 0.0, claim, t_start) \
-            if L_max >= 0 else None
+        k = tuple(self.road.positions[nodes[pick]])
+        m = self._tour_mass(P.searchable_mass(self.belief), t_start)
+        return P.chain_tour(m, t_ugv, tuple(start), k, L_max, tau, 0.0, claim, t_start)
+
+    def _tour_mass(self, m: np.ndarray, t_start: float) -> np.ndarray:
+        """The belief per (layer, cell) a tour from ``t_start`` scores (a subclass may weigh it)."""
+        return m
+
+    def _sortie(self, pick: int, start, t_start: float, energy: float, now: float,
+                claim: Optional[np.ndarray] = None, tour=None) -> Sortie:
+        """The sortie to local route index ``pick`` with ``tour`` (default: ``_tour``)."""
+        p, cfg = self.plan, self.cfg
+        e = self.spec.energy
+        nodes, arr, base = np.asarray(p["nodes"], int), np.asarray(p["arrive"], float), p["cur"]
+        tau = arr[pick] - t_start
+        k = tuple(self.road.positions[nodes[pick]])
+        tour = self._tour(pick, start, t_start, energy, now, claim) if tour is None else tour
         nodes_t, length = (list(tour[1]), tour[2]) if tour is not None else ([], dist(start, k))
         dock_s = self.setup.docking.dock_duration_s
         e_land = energy - e.energy_per_m * length - e.idle_power * (tau + dock_s)

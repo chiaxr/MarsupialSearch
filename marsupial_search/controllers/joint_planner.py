@@ -135,7 +135,7 @@ class _Context:
     air: dict[str, tuple[float, tuple, float]]  # UAV in the air: (free from, position, energy)
     m0: np.ndarray  # searchable belief, (layers, cells)
     candidates: np.ndarray  # road nodes not yet visited
-    air_value: Optional[np.ndarray] = None  # belief each UAV-grid node would sweep (for insertions)
+    air_value: dict[str, np.ndarray] = field(default_factory=dict)  # per UAV: belief each UAV-grid node would sweep (for insertions)
 
 
 @dataclass
@@ -185,6 +185,7 @@ class JointPlannerController(MissionController):
         self.road_visited = np.zeros(self.road.n_nodes, dtype=bool)
         uav_spec = setup.robots[self.uavs[0]] if self.uavs else self.ugv_spec
         self.P = SortiePlanner(setup, self.ugv_spec, uav_spec, self.cfg)
+        self.PU = {u: self.P.for_uav(setup.robots[u]) for u in self.uavs}  # each UAV's own sensor footprints
         self.n_cells = setup.grid.rows * setup.grid.cols
         self.near_road = self.road.nearest_nodes(self.air_graph.positions)  # road node nearest each UAV-grid node
         a = self.air_graph.positions
@@ -244,7 +245,8 @@ class JointPlannerController(MissionController):
         """Plan on the road map as now known: at once if the route runs into a blocked node, else
         (new roads) from the next re-plan."""
         self.road = self.roads.graph
-        self.P.set_road(self.road)
+        for P in {id(P): P for P in [self.P, *self.PU.values()]}.values():
+            P.set_road(self.road)
         self.road_visited = np.pad(self.road_visited, (0, self.road.n_nodes - len(self.road_visited)))
         self.near_road = self.road.nearest_nodes(self.air_graph.positions)
         self._dist_cache.clear()
@@ -543,7 +545,8 @@ class JointPlannerController(MissionController):
             nodes, t = np.asarray(s.tour, dtype=int), s.node_t
             found = t + lam * self._confirm_delay(R, arrive, nodes, t) if lam > 0 else t
             keep = found <= h_end
-            looks.append((P.F_air, nodes[keep], t[keep], found[keep], P.air_layers, P.p_air))
+            Pu = self.PU[s.uav]
+            looks.append((Pu.F_air, nodes[keep], t[keep], found[keep], Pu.air_layers, Pu.p_air))
         keys, order_t, w, p = [], [], [], []
         for F, nodes, t, found, layers, pd in looks:
             if not len(nodes):
@@ -660,7 +663,7 @@ class JointPlannerController(MissionController):
         """The latest a sortie can land, searching all the way (``energy_budget`` keeps the reserve)."""
         spec = self.setup.robots[s.uav]
         e = spec.energy
-        return s.t_start + max(self.P.energy_budget(s.e_start), 0.0) / (e.idle_power + e.energy_per_m * spec.speed)
+        return s.t_start + max(self.PU[s.uav].energy_budget(s.e_start), 0.0) / (e.idle_power + e.energy_per_m * spec.speed)
 
     def _ready(self, ctx: _Context, plan: JointPlan, ev: _Eval, k: int) -> Optional[tuple[float, float]]:
         """(time, energy) from which the UAV of visit ``k`` can take off: once its battery is swapped."""
@@ -684,7 +687,7 @@ class JointPlannerController(MissionController):
         spec = self.setup.robots[v.uav]
         e = spec.energy
         stay = d.dock_duration_s + d.swap_duration_s + d.undock_duration_s + 2 * cfg.stop_margin_s
-        flight = max(self.P.energy_budget(e_ready - e.idle_power * d.undock_duration_s), 0.0) \
+        flight = max(self.PU[v.uav].energy_budget(e_ready - e.idle_power * d.undock_duration_s), 0.0) \
             / (e.idle_power + e.energy_per_m * spec.speed)
         t_land = ev.arrive[land_idx]
         t_off = min(max(t_ready, t_land + stay - flight), t_land)
@@ -735,7 +738,7 @@ class JointPlannerController(MissionController):
     def _pick_landing(self, ctx: _Context, plan: JointPlan, arr: np.ndarray, s: _Sortie, lo: int, target: float):
         """Landing index and tour for sortie ``s``: the first index at or after ``target`` it can
         reach, else the latest earlier one (as ``uav_greedy_tour`` picks)."""
-        P, spec = self.P, self.setup.robots[s.uav]
+        P, spec = self.PU[s.uav], self.setup.robots[s.uav]
         e, v = spec.energy, spec.speed
         budget = P.energy_budget(s.e_start)
         idx = np.arange(max(lo, 0), len(plan.route))
@@ -758,7 +761,7 @@ class JointPlannerController(MissionController):
                t_meet: Optional[float] = None) -> list[int]:
         """A chain tour for sortie ``s`` to ``land_idx``, ending by ``t_meet`` (default: when the UGV
         gets there), skipping the plan's other tours."""
-        P, spec = self.P, self.setup.robots[s.uav]
+        P, spec = self.PU[s.uav], self.setup.robots[s.uav]
         tau = (arr[land_idx] if t_meet is None else t_meet) - s.t_start
         if tau <= 0:
             return []
@@ -865,9 +868,10 @@ class JointPlannerController(MissionController):
         pts = np.vstack([np.asarray(s.start, float)[None], self.air_graph.positions[tour].reshape(-1, 2),
                          self.road.positions[plan.route[s.land_idx]][None]])
         cand = np.asarray(self.air_graph.nodes_within(pts[rng.integers(len(pts))], self.cfg.insert_radius_m), int)
-        if ctx.air_value is None:
-            ctx.air_value = np.asarray(self.P.F_air @ ctx.m0[self.P.air_layers].sum(0)).ravel()
-        val = ctx.air_value[cand] if len(cand) else np.zeros(0)
+        if s.uav not in ctx.air_value:
+            Pu = self.PU[s.uav]
+            ctx.air_value[s.uav] = np.asarray(Pu.F_air @ ctx.m0[Pu.air_layers].sum(0)).ravel()
+        val = ctx.air_value[s.uav][cand] if len(cand) else np.zeros(0)
         if val.sum() <= 0:
             return False
         node = int(cand[rng.choice(len(cand), p=val / val.sum())])
