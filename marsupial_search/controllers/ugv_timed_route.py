@@ -424,9 +424,12 @@ class TimedRouteUgv(BookingRobot):
         arr = self._times(s, now)
         takeoffs = {st["uav"]: (i, st["ready"]) for i, sts in self.stops.items() for st in sts
                     if st["kind"] == TAKEOFF}
-        return {"version": self.version, "cur": self.cur, "nodes": self.nodes[self.cur:],
-                "arrive": arr[self.cur:].tolist(), "pin": self._pin(), "last_land": self.last_land,
-                "queue": list(self.bookings.values()), "takeoffs": takeoffs, "lost": sorted(self.lost)}
+        out = {"version": self.version, "cur": self.cur, "nodes": self.nodes[self.cur:],
+               "arrive": arr[self.cur:].tolist(), "pin": self._pin(), "last_land": self.last_land,
+               "queue": list(self.bookings.values()), "takeoffs": takeoffs, "lost": sorted(self.lost)}
+        if self.roads:  # every road-map change it knows: the route may use roads the UAVs have not seen
+            out["map"] = self.roads.changes()
+        return out
 
     # ---------------------------------------------------------------- step
     def _step(self, s: RobotState, now: float, obs: RobotObservation, cmds: list) -> None:

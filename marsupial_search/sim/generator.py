@@ -36,7 +36,9 @@ The ground-truth target is placed uniformly at random on the *true* label cells
 (not the degraded prior), restricted to cells a UGV can get within sensor range of
 (otherwise the mission could never terminate). With a road-map mismatch, that is from a
 mapped road the UGV can reach from its start without blocked nodes, so a mission can end
-without the team finding any missing road.
+without the team finding any missing road. The prior (either model) is built from the road
+map the robots are given: roads missing from it look like vegetation, there and in the
+terrain the robots get (``Scenario.map_terrain``), though the target may be on one.
 """
 
 from __future__ import annotations
@@ -155,6 +157,12 @@ def _sample_segment(p: np.ndarray, q: np.ndarray, step: float) -> np.ndarray:
     n = max(int(np.ceil(np.linalg.norm(q - p) / step)), 1)
     t = np.linspace(0.0, 1.0, n + 1)[:, None]
     return p[None] * (1 - t) + q[None] * t
+
+
+def _road_cells(grid: GridSpec, road: TraversabilityGraph, step: float) -> tuple[np.ndarray, np.ndarray]:
+    """Row and column indices of the grid cells the edges of ``road`` pass through."""
+    pts = [_sample_segment(road.positions[a], road.positions[b], step) for a, b in road.edges]
+    return _cells_of(grid, np.concatenate(pts)) if pts else (np.zeros(0, int), np.zeros(0, int))
 
 
 def _cells_of(grid: GridSpec, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -337,16 +345,21 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     road_graph = _finalize_roads(roads, cfg)
 
     # Rasterise roads outside towns; everything else non-urban stays VEGETATION.
-    for (a_, b_) in road_graph.edges:
-        pts = _sample_segment(road_graph.positions[a_], road_graph.positions[b_], cfg.cell_m / 4)
-        r, c = _cells_of(grid, pts)
-        keep = terrain[r, c] != int(Terrain.URBAN)
-        terrain[r[keep], c[keep]] = int(Terrain.ROAD)
+    r, c = _road_cells(grid, road_graph, cfg.cell_m / 4)
+    keep = terrain[r, c] != int(Terrain.URBAN)
+    terrain[r[keep], c[keep]] = int(Terrain.ROAD)
 
     # 6. the road map the robots get (its own random stream: the rest of the map is unchanged)
     full_road = road_graph
     road_graph, mismatch = _map_mismatch(full_road, cfg, np.random.default_rng([cfg.seed, 2]))
     reachable = road_graph.with_changes(blocked=mismatch.blocked)  # what a UGV can drive without the missing roads
+    # The terrain as the robots know it, and the prior is built from: roads missing from the map look like vegetation.
+    map_terrain = terrain
+    if mismatch.new_nodes:
+        mapped = np.zeros(grid.shape, dtype=bool)
+        mapped[_road_cells(grid, road_graph, cfg.cell_m / 4)] = True
+        map_terrain = terrain.copy()
+        map_terrain[(terrain == int(Terrain.ROAD)) & ~mapped] = int(Terrain.VEGETATION)
 
     uav_graph = _grid_graph(cfg.size_m, uav_grid_spacing(cfg))
 
@@ -359,15 +372,19 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
 
     if cfg.prior_model == "semantic":
         labels = cfg.prior_labels or SEMANTIC_LABELS[cfg.target_object]
-        truth = np.zeros(grid.shape, dtype=bool)
-        for lab in labels:
-            truth |= label_mask(lab, grid, terrain, full_road, cfg.fleet.ugv_sensor_range)
+
+        def labelled(terrain_, road_):
+            return np.logical_or.reduce([label_mask(lab, grid, terrain_, road_, cfg.fleet.ugv_sensor_range)
+                                         for lab in labels])
+
+        truth = labelled(terrain, full_road)
         if not truth.any():
             raise ValueError(f"no cells carry any of the labels {labels} on this map")
-        prior = _semantic_prior(grid, truth, cfg, rng)
+        known = labelled(map_terrain, road_graph) if map_terrain is not terrain else truth  # from the road map
+        prior = _semantic_prior(grid, known, cfg, rng)
         target_dist = truth.astype(float)  # uniform over true label cells
     elif cfg.prior_model == "gaussian_mixture":
-        prior = _gaussian_mixture_prior(grid, terrain, cfg, rng)
+        prior = _gaussian_mixture_prior(grid, map_terrain, cfg, rng)
         truth, target_dist = None, prior
     else:
         raise ValueError(f"unknown prior_model {cfg.prior_model!r}")
@@ -406,6 +423,7 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         target_layer=target_layer,
         meta=meta,
         road_mismatch=mismatch,
+        map_terrain=None if map_terrain is terrain else map_terrain,
     )
 
 

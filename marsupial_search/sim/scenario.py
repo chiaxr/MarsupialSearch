@@ -58,6 +58,8 @@ class Scenario:
     target_layer: Layer
     meta: dict = field(default_factory=dict)
     road_mismatch: MapMismatch = field(default_factory=MapMismatch)
+    # The terrain as the robots know it (None: ``terrain``): roads missing from the map are vegetation.
+    map_terrain: Optional[np.ndarray] = None
 
     def true_road(self, blocked: bool = True) -> TraversabilityGraph:
         """The road network as it really is (see :meth:`MapMismatch.apply`)."""
@@ -66,7 +68,7 @@ class Scenario:
     def mission_setup(self, dt: float) -> MissionSetup:
         return MissionSetup(
             grid=self.grid,
-            terrain=self.terrain.copy(),
+            terrain=(self.terrain if self.map_terrain is None else self.map_terrain).copy(),
             layer_fractions=self.layer_fractions.copy(),
             prior=self.prior.copy(),
             graphs=self.graphs,

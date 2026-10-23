@@ -238,8 +238,10 @@ can differ (it must be a mapped node that is not blocked, and the mapped nodes a
   then knows the node is blocked even if it is out of sensor range) and waits there, the rest
   of its path pending, until it gets a new command.
 
-Missing roads still show as road in the terrain (and so in the semantic prior): satellite
-imagery sees a road that the road map lacks. `robot_stats` and the run summary count
+The prior is built from the road map the robots are given: roads missing from it look like
+vegetation, there and in the terrain the robots get (`MissionSetup.terrain`; the true terrain,
+`Scenario.terrain`, is what the simulator and plots use). The target may still be on a missing
+road, within UGV sensor range of a mapped one. `robot_stats` and the run summary count
 `map_changes_found` (per robot, each mismatch once) and `path_blocked`. In plots, roads missing
 from the map are dashed blue and blocked nodes are red crosses.
 

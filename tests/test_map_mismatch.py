@@ -9,7 +9,7 @@ from scipy.sparse.csgraph import connected_components
 from conftest import make_line_scenario
 from marsupial_search.controllers import DEFAULT_TEAM, make_team
 from marsupial_search.controllers.common import bypass
-from marsupial_search.core import EventType, FollowPath, GraphKnowledge, RobotType, TraversabilityGraph
+from marsupial_search.core import EventType, FollowPath, GraphKnowledge, RobotType, Terrain, TraversabilityGraph
 from marsupial_search.sim import MapMismatch, SimConfig, Simulator, generate_scenario, resample_target
 from marsupial_search.sim.scenario_bases import small
 
@@ -75,9 +75,24 @@ def test_generated_mismatch_keeps_every_road_reachable_and_the_target_confirmabl
     assert Simulator(sc).setup.graphs[RobotType.UGV] is prior
 
 
+@pytest.mark.parametrize("seed", [0, 3])
+def test_the_prior_and_the_robots_terrain_leave_out_missing_roads(seed):
+    # No segmentation errors or blur: a car's prior is the road label plus the uniform background.
+    cfg = dataclasses.replace(small(seed), target_object="car", road_unmapped_fraction=0.1,
+                              prior_segmentation_error=0.0, prior_mask_blur_m=0.0)
+    sc = generate_scenario(cfg)
+    road = int(Terrain.ROAD)
+    missing = (sc.terrain == road) & (sc.map_terrain != road)  # road cells only on missing roads
+    assert missing.any() and (sc.map_terrain[sc.terrain != road] == sc.terrain[sc.terrain != road]).all()
+    assert not (Simulator(sc).setup.terrain[missing] == road).any()
+    background = sc.prior.min()
+    assert np.allclose(sc.prior[missing], background) and (sc.prior[sc.map_terrain == road] > 2 * background).all()
+
+
 def test_no_mismatch_by_default():
     sc = generate_scenario(small(0))
     assert not sc.road_mismatch and sc.true_road().n_nodes == sc.graphs[RobotType.UGV].n_nodes
+    assert sc.map_terrain is None and Simulator(sc).setup.terrain.tolist() == sc.terrain.tolist()
 
 
 def _mismatch_line():
@@ -127,18 +142,26 @@ def mismatch_scenario():
     return generate_scenario(dataclasses.replace(small(5), road_unmapped_fraction=0.1, road_blocked_fraction=0.05))
 
 
-def test_uavs_report_what_they_find_to_the_ugv(mismatch_scenario):
+def test_uavs_and_the_ugv_share_what_they_find(mismatch_scenario):
     team = make_team(DEFAULT_TEAM)
     found: dict[str, set] = {"ugv": set(), "uav": set()}
+    ugv_found_at: dict[int, float] = {}
 
     def watch(sim, obs):
         for u in obs.map_updates:
             found["ugv" if u.robot_id == "ugv0" else "uav"].update(u.blocked)
+            if u.robot_id == "ugv0":
+                ugv_found_at.update({b: u.time for b in u.blocked})
 
     res = Simulator(mismatch_scenario, SimConfig()).run(team, callback=watch)
     assert res.outcome == "found"
     only_uav = found["uav"] - found["ugv"]
-    assert only_uav and only_uav <= team.robots["ugv0"].roads.blocked
+    assert only_uav and only_uav <= team.robots["ugv0"].roads.blocked  # reported to the UGV
+    # The UGV's plan carries what it knows, so the UAVs plan on it (and stop reporting what it has).
+    known = {b for b, t in ugv_found_at.items() if t < res.time_s - 10.0}
+    assert known
+    for uav in ("uav0", "uav1"):
+        assert known <= team.robots[uav].roads.blocked and known <= team.robots[uav].ugv_roads.blocked
 
 
 @pytest.mark.parametrize("team", ["joint_planner", "decentralised"])
@@ -245,10 +268,10 @@ def test_a_uav_flies_straight_to_a_ugv_that_waits_for_it():
 
 
 def test_out_of_touch_uavs_are_met_instead_of_landing_blind():
-    # small map 3, target 2 with a 300 m radio: the UGV's detours made its landings far later than
-    # booked while a UAV was out of touch; it used to try landing blind, again and again.
-    cfg = dataclasses.replace(small(3), target_object="car", road_unmapped_fraction=0.1, road_blocked_fraction=0.05)
-    sc = resample_target(generate_scenario(cfg), np.random.default_rng(2))
+    # small map 0 with a 300 m radio: the UGV moves the landings of UAVs out of touch (detours
+    # make it late). A UAV out of touch used to try landing blind, again and again.
+    cfg = dataclasses.replace(small(0), target_object="car", road_unmapped_fraction=0.1, road_blocked_fraction=0.05)
+    sc = generate_scenario(cfg)
     from marsupial_search.sim.radio import RadioConfig
     res = Simulator(sc, SimConfig(radio=RadioConfig(range_m={t: 300.0 for t in RobotType}))) \
         .run(make_team(DEFAULT_TEAM))
