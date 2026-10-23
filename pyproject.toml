@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marsupial_search"
+version = "0.1.0"
+description = "Marsupial search: one UGV carrying UAVs that share its dock"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+sim = ["matplotlib", "pillow", "pyyaml"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["marsupial_search*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

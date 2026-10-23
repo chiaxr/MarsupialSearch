@@ -1,0 +1,24 @@
+# The small map, searching for a car: the oracle against the default team (README results).
+# python scripts/compare.py     --config configs/small_car.yaml
+# python scripts/run_mission.py --config configs/small_car.yaml   # one mission per team
+teams:
+  - joint_planner
+  - {ugv0: ugv_timed_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+out: outputs/small_car
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: car       # car | building | hiker
+
+sim:
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+
+compare:
+  maps: [0, 1, 2, 3, 4]
+  targets: 2
+  estimator: cv
+  workers: 10

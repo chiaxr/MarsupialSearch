@@ -1,0 +1,23 @@
+# The small map, searching for a hiker near the roads.
+# python scripts/compare.py     --config configs/small_hiker.yaml
+# python scripts/run_mission.py --config configs/small_hiker.yaml   # one mission per team
+teams:
+  - joint_planner
+  - {ugv0: ugv_timed_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+out: outputs/small_hiker
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: hiker
+
+sim:
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+
+compare:
+  maps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  targets: 2
+  workers: 8

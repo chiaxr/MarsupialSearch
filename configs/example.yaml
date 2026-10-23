@@ -1,0 +1,174 @@
+# Experiment file for scripts/run_mission.py and scripts/compare.py (--config).
+#
+# A reference: it sets every configurable key, at its default unless marked "default: ...".
+# Every key is optional, so a real experiment file only lists what it changes (see
+# small_hiker.yaml). Precedence: the base scenario and the code defaults < this file <
+# explicit command-line flags. Show every key with its value after applying a file:
+#   python -m marsupial_search.sim.config_io --config configs/example.yaml
+#
+# The top-level settings are shared by both scripts; `mission:` and `compare:` hold each
+# script's own settings.
+
+# What runs, in both scripts: run_mission.py runs each team once on the same map and
+# target; compare.py compares them over many maps and targets. A team is a centralised
+# controller's name, or a policy per robot (policy names start with the robot type).
+teams:
+  - joint_planner          # centralised oracle: plans for the whole team (controllers.md)
+  - ugv0: ugv_timed_route
+    uav0: uav_greedy_tour  # starts docked on the UGV
+    uav1: uav_greedy_tour  # starts hovering over it
+
+# Per policy or controller: overrides of its config dataclass (marsupial_search/controllers).
+# They apply to every robot that runs that policy. All three controllers accept the shared
+# search and dock settings, but not all of them use every one: those marked "unused" have
+# no effect on that controller.
+controller_params:
+  ugv_timed_route:
+    # shared search settings
+    uav_reserve_fraction: 0.1      # UAV energy kept in hand at landing; sets the landing spacing
+    hover_margin_s: 30.0           # unused
+    belief_radius_m: 1500.0        # the next road node is chosen within this radius
+    belief_distance_offset_m: 100.0  # a node scores belief in footprint / (distance + offset)
+    pursue_sightings: true         # drive over to confirm UAV sightings
+    relocation_radius_m: 800.0     # roads covered: drive to the most UAV belief within this radius
+    fill_tours: true               # unused
+    rendezvous_slack_s: 60.0       # unused
+    # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UAVs'
+    slot_s: 0.0                    # spacing of booked landings (0: automatic, see controllers.md)
+    stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    # UGV route
+    route_horizon_s: 0.0           # keep the route planned this far ahead (0: one slot per UAV, plus one, plus a full sortie)
+    route_replan_s: 60.0           # re-plan the unpromised part of the route this often
+    route_resend_s: 5.0            # re-broadcast an unchanged route this often
+    max_late_s: 120.0              # past a UAV's landing time and slack: drop its landing
+  uav_greedy_tour:
+    # shared search settings
+    uav_reserve_fraction: 0.1      # energy kept in hand at landing
+    hover_margin_s: 30.0           # extra hover budgeted at the landing
+    belief_radius_m: 1500.0        # unused
+    belief_distance_offset_m: 100.0  # the next tour node scores belief in footprint / (distance + offset)
+    pursue_sightings: true         # unused
+    relocation_radius_m: 800.0     # unused
+    fill_tours: true               # true: use the whole energy budget; false: keep the best-rate part of the tour
+    rendezvous_slack_s: 60.0       # spare hover kept at the landing, so the UGV can divert to a sighting
+    # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UGV's
+    slot_s: 0.0                    # spacing of booked landings (0: automatic)
+    stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    # UAV side of the booking
+    partner_stale_s: 10.0          # the UGV's status or route older than this: do not plan or land on it
+    sync_resend_s: 5.0             # a docked UAV re-sends its belief until the UGV returns the fused map
+    plan_lead_s: 45.0              # book the next sortie this long before take-off (default: 30.0)
+    abort_reserve_fraction: 0.05   # in flight: skip the rest of the tour below this energy margin
+    dock_retry_s: 3.0              # wait after a rejected or aborted landing
+  joint_planner:
+    # shared search settings
+    uav_reserve_fraction: 0.1      # energy every sortie must land with
+    hover_margin_s: 30.0           # extra hover budgeted at each landing
+    belief_radius_m: 1500.0        # greedy starting routes: next road node within this radius
+    belief_distance_offset_m: 100.0  # greedy starts: belief in footprint / (distance + offset)
+    pursue_sightings: true         # route the UGV to confirm UAV sightings
+    relocation_radius_m: 800.0     # greedy starts: roads covered, drive to the most UAV belief within this radius
+    fill_tours: true               # greedy starts: use each sortie's whole energy budget
+    rendezvous_slack_s: 60.0       # spare hover budgeted at each landing
+    slot_s: 0.0                    # unused
+    stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    # joint search
+    horizon_s: 2700.0              # the plan is scored this far ahead
+    replan_s: 120.0                # re-plan at least this often (and after every dock event)
+    iterations: 1000               # search iterations per re-plan
+    anneal_t0: 0.002               # initial annealing temperature, as a fraction of the starting plan's value
+    sighting_delay_weight: 1.0     # λ: a UAV look counts at t + λ · (the UGV's drive to confirm it)
+    insert_radius_m: 400.0         # tour insertions pick UAV-grid nodes this close to the tour
+    seed: 0                        # the search's random numbers
+
+out: outputs/example       # output folder (default: outputs/ for run_mission.py, outputs/compare_<base>[_<object>] for compare.py)
+
+# The map, prior, fleet and dock: a base scenario (marsupial_search/sim/scenario_bases.py),
+# then any ScenarioConfig field (marsupial_search/sim/generator.py) on top of it. Nested
+# sections are partial overrides. The values below are those of the `large` base.
+scenario:
+  base: large              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  name: large              # map name in output files (the base sets it)
+  size_m: [5000.0, 5000.0] # map width and height
+  cell_m: 25.0             # grid cell size (belief map, terrain)
+  # towns
+  n_urban: 3               # number of towns
+  urban_half_size_m: [300.0, 600.0]  # each town's half-width and half-height are drawn from this range
+  urban_street_spacing_m: 100.0      # street grid block size
+  urban_street_drop_prob: 0.08       # share of street segments left out
+  urban_aerial_fraction: 0.5         # share of an urban cell's probability seen only from the air (the rest: only from the ground)
+  # roadless regions: vegetation that only highways cross
+  roadless_fraction: 0.3             # share of the map
+  roadless_smoothing_m: 250.0        # spatial scale of the regions
+  roadless_urban_buffer_m: 150.0     # regions keep this far from towns
+  # roads: highways join the towns; rural roads join rural junctions
+  n_rural_nodes: 70                  # rural junctions (road density)
+  rural_min_spacing_m: 250.0         # minimum distance between rural junctions
+  rural_max_edge_m: 1200.0           # longest rural road between two junctions
+  rural_gabriel_extra_prob: 0.3      # chance of an extra (Gabriel-graph) road that closes a loop
+  highway_point_spacing_m: 100.0     # highway polyline point spacing
+  highway_wiggle_m: 150.0            # highway curvature amplitude
+  road_merge_m: 20.0                 # road nodes closer than this are merged
+  road_node_spacing_m: null          # long road edges are split into nodes this far apart (null: the UGV sensor range)
+  # UAV grid
+  uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the UAV sensor range, the widest gap-free grid)
+  # prior (README §1.5)
+  prior_model: semantic              # semantic (LMPath proxy) | gaussian_mixture
+  target_object: hiker               # car | building | hiker (default: car)
+  prior_labels: null                 # label names that override target_object's (road, urban, vegetation, road_near_vegetation, vegetation_near_road_node)
+  prior_segmentation_error: 0.1      # share of label area mislabelled (half missed, half spurious)
+  prior_error_blob_m: 75.0           # spatial scale of the mislabelling
+  prior_mask_blur_m: 25.0            # blur of the label masks
+  prior_background_weight: 0.02      # share of probability spread uniformly
+  n_prior_modes: 4                   # gaussian_mixture only: number of modes
+  prior_sigma_m: [300.0, 900.0]      # gaussian_mixture only: mode widths are drawn from this range
+  prior_uniform_weight: 0.05         # gaussian_mixture only: share spread uniformly
+  # fleet: always ugv0, uav0 and uav1 (energy: idle_power per s while not docked, plus energy_per_m)
+  fleet:
+    ugv_speed: 5.0                   # m/s
+    ugv_energy: {capacity: 250000, idle_power: 2.0, energy_per_m: 1.0}
+    ugv_sensor_range: 55.0           # m; sees the ground and shared layers
+    uav_speed: 10.0                  # m/s
+    uav_energy: {capacity: 2000, idle_power: 1.0, energy_per_m: 0.04}
+    uav_sensor_range: 60.0           # m; sees the aerial and shared layers
+  # dock
+  docking:
+    dock_duration_s: 30.0            # landing; the UGV must stand still
+    undock_duration_s: 15.0          # take-off; the UGV must stand still
+    swap_duration_s: 240.0           # battery swap after landing (default: 120.0)
+    swap_while_moving: true          # false: the swap only progresses while the UGV stands still
+    dock_tolerance_m: 3.0            # how close the UAV must be to start landing
+
+# Any SimConfig field (marsupial_search/sim/simulator.py), including the radio channel.
+sim:
+  dt: 1.0                  # time step [s]
+  max_time_s: 21600.0      # time limit (6 h)
+  terminate_on: [ugv]      # robot types whose sensor range on the target ends the mission (others only sight it)
+  energy_noise_std: 0.0    # noise on the energy estimates controllers see, as a fraction of capacity
+  log_interval_s: 10.0     # how often the coverage and searched-probability curves are recorded
+  belief_snapshot_interval_s: null   # belief snapshots for the GIF (null: chosen by run_mission.py when animating)
+  stop_when_controller_done: true    # end the run when the controllers report nothing left to search
+  stop_when_ugv_depleted: true       # end the run when the UGV runs flat
+  target: true             # false: a target-free run (used by the cv estimator)
+  seed: 0                  # simulator random numbers (radio loss, energy noise); the map seed is mission.seed / compare.maps
+  radio:
+    enabled: true          # false: no radio at all
+    simulate_channel: true # false: ideal channel, every message goes through
+    range_m: {ugv: 2000.0, uav: 1500.0}  # a link needs distance <= min(sender's, receiver's) range (default uav: 2000.0)
+    latency_s: 0.0         # extra delay; messages arrive in the next step at the earliest
+    drop_prob: 0.05        # independent loss per message and recipient (default: 0.0)
+    max_bytes_per_s: null  # per-sender bandwidth budget (null: unlimited)
+    max_payload_bytes: null  # larger payloads are rejected (null: no limit)
+
+# --- run_mission.py only ------------------------------------------------------
+mission:
+  seed: 0                  # map seed
+  target_seed: 7           # resample the hidden target (null: the map's own target) (default: null)
+  animate: true            # write a GIF per team
+
+# --- compare.py only ----------------------------------------------------------
+compare:
+  maps: [0, 1, 2]          # map seeds (default: [0, 1, 2, 3, 4])
+  targets: 2               # missions per team and map (default: 2 for cv, 10 for plain)
+  estimator: cv            # cv: a target-free run + a few missions per team and map | plain (README §3.3)
+  workers: 8               # parallel processes (default: 4)
