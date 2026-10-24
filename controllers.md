@@ -72,6 +72,41 @@ flight**.
    landing, it swaps belief maps with the UGV (`sync`), so the next tour includes what the other
    UAV reported.
 
+One sortie of UAV A, with UAV B booking at the same time. Open arrows are the `"status"` each robot
+broadcasts every step (the UGV's carries its `plan`), filled ones are messages to one robot
+(`"book"`, re-sent until it shows up in the queue, and `"sync"`); "takes off" and "docks" are the
+UAV's own commands. A refused booking gets no reply: the UAV sees the plan's version change and
+plans again.
+
+```mermaid
+sequenceDiagram
+    participant A as UAV A (docked)
+    participant U as UGV
+    participant B as UAV B
+
+    U-)A: plan, version v: route, arrival times, pin, queue
+    U-)B: plan, version v
+    Note over A: shortly before its take-off, plans a sortie:<br/>a landing after the pin, a tour on the way
+    A->>U: book (planned on v): landing index and time, slack, tour
+    B->>U: book (planned on v)
+    Note over U: accepts A's: adds a landing stop and,<br/>after the swap, a take-off stop, version v+1
+    U-)A: plan v+1: A's booking in the queue
+    U-)B: plan v+1: B's booking not in it
+    Note over B: planned on an old version: re-plans on v+1
+    Note over U: at A's take-off stop, A's swap done
+    U-)A: holding for A's take-off
+    A->>U: takes off
+    Note over A: flies its tour, no radio needed,<br/>reports where and when it ends (free)
+    opt the UGV runs late (a detour, a blockage)
+        U-)A: plan: landing moved to where it best meets A
+    end
+    Note over U: at A's landing stop
+    U-)A: holding for A's landing
+    A->>U: docks (the battery swap starts)
+    A->>U: sync: its belief map
+    U->>A: fused belief map
+```
+
 With `swap_while_moving: false` the UGV also holds at a landing stop until the swap is done.
 
 **Relaying** (`relay`, on by default). Each robot passes on the other robots' latest `"status"`
