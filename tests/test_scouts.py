@@ -69,7 +69,7 @@ def test_a_standby_uav_leaves_the_dock_just_before_another_uav_lands():
     lead = ugv.setup.docking.undock_duration_s + ugv.cfg.stop_margin_s
     assert off["ready"] == pytest.approx(t_land - lead)  # not as soon as the UGV gets there
     p = ugv._plan_payload(s, 0.0)
-    assert p["calls"] == {"uav0": {"for": "uav1", "xy": None, "near": None}} and p["takeoffs"]["uav0"][0] == 10
+    assert p["calls"] == {"uav0": {"for": "uav1", "xy": None, "near": None, "deliver": None}} and p["takeoffs"]["uav0"][0] == 10
     o = ugv.bookings["uav1"]["off_idx"]
     assert p["busy"] == [(0, 10), (10, o)] and p["standby"] == ["uav0"]  # route indices each UAV is on the dock
     # uav0 lands where the dock is free: not while uav1 is on it, and it stays (no take-off).
@@ -220,3 +220,82 @@ def test_the_far_scout_checks_the_road_ahead_once_blockages_are_known():
     extra = (uav._tour_mass(m, 0.0) - m).sum(0)
     bumped = {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))) for c in np.flatnonzero(extra)}
     assert bumped == set(range(7, 11))
+
+
+# ----------------------------------------------------------------- the messenger
+def _stranded(radio_m=300.0):
+    """The UGV with ``uav1`` booked to land at node 10, out of touch and short of energy: the UGV
+    gets there 200 s after the UAV, which can wait only 10 s."""
+    ugv, s = _ugv(radio_m)
+    ugv.stops.clear()
+    t10 = float(ugv._times(s, 0.0)[10])
+    assert _book(ugv, s, "uav1", 10, t10 - 200.0, slack_s=10.0)
+    return ugv, s
+
+
+def test_the_ugv_sends_its_standby_uav_to_a_uav_it_can_no_longer_meet_in_time():
+    ugv, s = _stranded()
+    ugv._check_landings(s, 1.0)
+    call = next(st for st in ugv.stops[0] if st["uav"] == "uav0" and st["kind"] == TAKEOFF)
+    assert call["deliver"] == "uav1" and call["xy"] == tuple(ugv.road.positions[10]) and call["call"] is None
+    assert ugv.messengers["uav1"]["by"] == "uav0" and ugv.messengers["uav1"]["t"] > 1.0
+    assert ugv._plan_payload(s, 1.0)["calls"]["uav0"]["deliver"] == "uav1"
+    # Its call withdrawn (it never booked a landing): not again for that landing.
+    ugv.stops[0] = [st for st in ugv.stops[0] if st.get("deliver") != "uav1"]
+    ugv._check_messengers(s)
+    assert "uav1" not in ugv.messengers and ("uav1", 1) in ugv.messenger_failed
+    assert not ugv._send_messenger(s, 2.0, "uav1", ugv.road.positions[10], 0, ugv._times(s, 2.0))
+
+
+def test_no_messenger_without_a_standby_uav_on_the_dock_or_without_relaying():
+    ugv, s = _stranded()
+    ugv.cfg.relay = False
+    ugv._check_landings(s, 1.0)
+    assert not ugv.messengers
+    ugv, s = _stranded()
+    s = dataclasses.replace(s, docked_uav=None)
+    ugv._check_landings(s, 1.0)
+    assert not ugv.messengers
+
+
+def _messenger(plan):
+    sim = Simulator(make_line_scenario(n_uav=2), SimConfig(radio=RadioConfig(range_m={t: 300.0 for t in RobotType})))
+    uav = NearScoutUav()
+    uav.reset("uav0", sim.setup)
+    uav.plan, uav.phase = plan, "docked"
+    return uav
+
+
+def _plan(arrive_from=10.0):
+    return {"version": 0, "cur": 0, "nodes": list(range(20)), "arrive": [arrive_from + 10.0 * i for i in range(20)],
+            "pin": 0, "busy": [], "queue": [], "takeoffs": {"uav0": (0, 0.0)}, "free_from": None, "last_land": None,
+            "lost": [], "standby": ["uav0"], "calls": {}}
+
+
+def test_a_messenger_flies_to_where_the_other_uav_waits_and_lands_after():
+    xy = (325.0, 800.0)  # 300 m off the road above node 6
+    uav = _messenger(_plan())
+    uav.call = {"for": None, "xy": xy, "near": None, "deliver": "uav1"}
+    sortie = uav.plan_sortie((0.0, 500.0), 5.0, 2000.0, 0.0)
+    air = uav.planner.air.positions
+    assert len(sortie.tour) == 1 and np.hypot(*(air[sortie.tour[0]] - xy)) == pytest.approx(np.hypot(*(air - xy).T).min())
+    # The dock taken for longer than it can fly: it does not go.
+    uav = _messenger(_plan(arrive_from=1e5))
+    uav.call = {"for": None, "xy": xy, "near": None, "deliver": "uav1"}
+    assert uav.plan_sortie((0.0, 500.0), 5.0, 2000.0, 0.0) is None
+
+
+def test_a_messenger_waits_there_until_it_hears_the_other_uav():
+    from marsupial_search.core import Hold
+    uav = _messenger(_plan())
+    point, land = (325.0, 800.0), (500.0, 500.0)
+    uav.phase, uav.t0 = "sortie", 10.0
+    uav.task, uav.booking, uav.waypoints, uav.tour = {"deliver": "uav1"}, {"t_land": 1000.0}, [point, land], [7]
+    s = RobotState("uav0", RobotType.UAV, point, RobotMode.ACTIVE, 1500.0, 2000.0, True, None, None, (), (), None)
+    cmds = []
+    assert uav._wait_to_deliver(s, 100.0, cmds) and cmds == [Hold()]
+    uav.relay.heard("uav1", {}, 101.0)  # in radio range: relaying hands over the UGV's plan
+    assert not uav._wait_to_deliver(s, 101.0, []) and uav.delivered
+    # Not heard, but it must leave now to land on time.
+    uav.delivered, uav.relay.neighbours = False, {}
+    assert not uav._wait_to_deliver(s, 1000.0 - 30.0, []) and uav.delivered

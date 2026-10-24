@@ -32,4 +32,5 @@ from .messages import (
 )
 from .decentralized import DecentralizedTeam, RobotController, RobotControllerFactory
 from .radio import PayloadCodec, PickleCodec
+from .relay import Relay
 from .types import N_LAYERS, Layer, RobotMode, RobotType, Terrain

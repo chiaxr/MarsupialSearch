@@ -44,9 +44,12 @@ Road planner (``road_planner``)
     policy with ``"ctp"``.
 Standby UAVs
     A UAV on standby (``uav_near_scout``) leaves the dock only when called: just before another UAV
-    lands while it is on the dock, and when the route runs into a blocked node within
+    lands while it is on the dock, when the route runs into a blocked node within
     ``call_radius_m`` that cuts off nearby road nodes with belief left round them, to search
-    them (``_cut_off``). It lands wherever the dock is free and stays (see ``dock_booking``).
+    them (``_cut_off``), and (``messenger``) as a messenger to a UAV out of touch that can no
+    longer be met in time where it waits: it flies there, relaying tells that UAV the UGV's plan,
+    and the UGV plans to meet it as if in touch from then. It lands wherever the dock is free and
+    stays (see ``dock_booking``).
 """
 
 from __future__ import annotations
@@ -71,7 +74,7 @@ from marsupial_search.core import (
 )
 
 from .common import bypass, dist, pursuit_path
-from .ctp import BlockageModel, CtpPlanner
+from .ctp import BlockageModel, CtpPlanner, clear_probabilities
 from .dock_booking import BOOK, LAND, SYNC, TAKEOFF, Booking, BookingRobot, DockBookingConfig, slot_spacing
 from .sortie_planner import SortiePlanner
 
@@ -90,6 +93,7 @@ class UgvTimedRouteConfig(DockBookingConfig):
     call_min_belief: float = 0.005  # call the standby UAV if the belief it can see around them is at least this
     pocket_weight: float = 2.0  # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: float = 15.0  # a standby UAV called to a blocked node that has not booked its landing by then stays docked
+    messenger: bool = True  # a UAV out of touch can no longer be met in time: send the standby UAV to tell it where (with relay)
     road_planner: str = "optimistic"  # optimistic: shortest paths on the map as known | ctp: Canadian Traveller's Problem
     ctp_samples: int = 16  # ctp: blockage scenarios per decision
     ctp_search_legs: bool = False  # ctp: also the ways between the search route's nodes (else: detours, pursuits, moved landings)
@@ -142,10 +146,14 @@ class TimedRouteUgv(BookingRobot):
         self.standby: set[str] = set()  # UAVs that stay on the dock until called (they say so in their status)
         self.free_from: Optional[float] = None  # a standby UAV is on the dock after the pin: it can leave from then
         self.extend_failed = False
+        self.messengers: dict[str, dict] = {}  # UAV out of touch -> {"by": the standby UAV sent to tell it, "t": when it can}
+        self.messenger_failed: set[tuple[str, int]] = set()  # (UAV, plan_id): a messenger called for that landing never left
         self.blockage = BlockageModel(self.roads, self.cfg.block_prior, self.cfg.block_prior_weight,
                                       self.cfg.max_cutoff_fraction) if self.cfg.road_planner == "ctp" else None
         self.ctp: Optional[CtpPlanner] = None
         self.ctp_paths: dict[tuple, tuple[float, list[int], float]] = {}  # (src, dst, search leg) -> (when, path, cost)
+        self.detour_cache: dict = {}  # (prev, node, next) -> would its blockage send the UGV the long way round?
+        self.detour_road: Optional[TraversabilityGraph] = None  # the road map detour_cache is for
         self.now = 0.0
 
     def _start(self, s: RobotState) -> None:
@@ -388,6 +396,10 @@ class TimedRouteUgv(BookingRobot):
             if "started" in land or j0 < head:
                 continue
             xy, t, spare, fresh = self._free(b, now)
+            if not fresh and u in self.messengers:  # it hears the new plan once the messenger gets there
+                t_told = max(t, self.messengers[u]["t"])
+                spare -= self.setup.robots[u].energy.idle_power * (t_told - t)
+                t, fresh = t_told, True
             free = (np.asarray(xy), t)
             tm0, c0, score0 = self._meet(u, free, pos[[self.nodes[j0]]], arr[[j0]])
             late = retime and tm0[0] - t > self.cfg.recover_gain_s  # the UAV would wait this long for the UGV
@@ -424,6 +436,10 @@ class TimedRouteUgv(BookingRobot):
                 key = (not feas[i], score[i] if feas[i] else c[i])
                 if best is None or key < best[0]:
                     best = (key, int(idx[ok][i]), float(tm[i]), float(c[i]), path)
+            if not fresh and c0[0] > spare and (best is None or best[0][0]) \
+                    and self._send_messenger(s, now, u, xy, head, arr):
+                b["moved"] = moved  # re-planned next step, as if in touch from when the messenger gets there
+                continue
             if c0[0] <= spare:  # affordable: only for a landing that much sooner
                 better = best is not None and not best[0][0] and best[0][1] < score0[0] - self.cfg.recover_gain_s
             else:
@@ -443,6 +459,48 @@ class TimedRouteUgv(BookingRobot):
             self._pull_takeoffs(s, now)
             arr = self._times(s, now)
             n = len(self.nodes)
+
+    def _send_messenger(self, s: RobotState, now: float, u: str, xy, head: int, arr: np.ndarray) -> bool:
+        """UAV ``u`` is out of touch and can no longer be met in time where it waits (``xy``): call
+        the standby UAV on the dock (its battery swapped within a minute) to fly there, at route
+        index ``head``. Relaying tells ``u`` the UGV's plan once the messenger is in radio range; from
+        then the UGV plans to meet ``u`` as if in touch (``_check_landings``). False if it cannot."""
+        m, link = s.docked_uav, self._link_range()
+        if not (self.cfg.messenger and self.cfg.relay) or link is None or u in self.messengers \
+                or (u, self.bookings[u]["plan_id"]) in self.messenger_failed \
+                or m is None or m == u or m not in self.standby or m in self.lost \
+                or self.swap_end.get(m, 0.0) > now + 60.0 \
+                or any(st["uav"] == m and "started" in st for sts in self.stops.values() for st in sts):
+            return False
+        for i in list(self.stops):  # it leaves from here: its other take-offs (e.g. to make room) go
+            self.stops[i] = [st for st in self.stops[i] if not (st["uav"] == m and st["kind"] == TAKEOFF and i != head)]
+        self._pull_takeoffs(s, now)  # the dock free again as early as it can be: the messenger books its landing at once
+        arr = self._times(s, now)
+        ready, dock = self.swap_end.get(m, 0.0), self.setup.docking
+        t_off = max(arr[head], ready, now) + dock.undock_duration_s + self.cfg.stop_margin_s
+        reach = max(dist(self.road.positions[self.nodes[head]], xy) - 0.5 * link, 0.0)
+        call = {"deliver": u, "xy": tuple(map(float, xy)), "near": None}
+        sts = self.stops.setdefault(head, [])
+        own = next((st for st in sts if st["uav"] == m and st["kind"] == TAKEOFF), None)
+        if own is not None:
+            own.update(call)
+        else:
+            sts.insert(sum("started" in st for st in sts), {"kind": TAKEOFF, "uav": m, "ready": ready, "call": None, **call})
+        self.messengers[u] = {"by": m, "t": t_off + reach / self.setup.robots[m].speed}
+        self.version += 1
+        self.revision += 1
+        return True
+
+    def _check_messengers(self, s: RobotState) -> None:
+        """Forget a messenger once its UAV's landing is over, or if it never left (its call withdrawn,
+        e.g. it could not land anywhere in time): then not again for that landing."""
+        for u, info in list(self.messengers.items()):
+            called = any(st.get("deliver") == u and st.get("xy") is not None for sts in self.stops.values() for st in sts)
+            if u not in self.bookings:
+                del self.messengers[u]
+            elif s.docked_uav == info["by"] and not called:
+                self.messenger_failed.add((u, self.bookings[u]["plan_id"]))
+                del self.messengers[u]
 
     def _pull_takeoffs(self, s: RobotState, now: float) -> None:
         """Move each take-off still to come back to the first route node after the stops before
@@ -657,7 +715,8 @@ class TimedRouteUgv(BookingRobot):
                 if st["kind"] == TAKEOFF and st["uav"] not in takeoffs:
                     takeoffs[st["uav"]] = (i, st["ready"])
                     if "call" in st:
-                        calls[st["uav"]] = {"for": st["call"], "xy": st.get("xy"), "near": st.get("near")}
+                        calls[st["uav"]] = {"for": st["call"], "xy": st.get("xy"), "near": st.get("near"),
+                                            "deliver": st.get("deliver")}
         out = {"version": self.version, "cur": self.cur, "nodes": self.nodes[self.cur:],
                "arrive": arr[self.cur:].tolist(), "pin": self._pin(), "last_land": self.last_land,
                "queue": list(self.bookings.values()), "takeoffs": takeoffs, "lost": sorted(self.lost),
@@ -665,6 +724,12 @@ class TimedRouteUgv(BookingRobot):
                "busy": [(a, b) for _, a, b in self._spans(s)]}
         if self.roads:  # every road-map change it knows: the route may use roads the UAVs have not seen
             out["map"] = self.roads.changes()
+        if self.blockage is not None:  # (ctp) per route index: the chance of getting there with no long detour
+            if self.detour_road is not self.road:
+                self.detour_cache, self.detour_road = {}, self.road
+            slack_m = (self.cfg.rendezvous_slack_s + self.cfg.hover_margin_s) * self.spec.speed
+            out["clear"] = clear_probabilities(self.road, self.nodes[self.cur:], self.blockage.probabilities(self.road),
+                                               slack_m, self.detour_cache).round(3).tolist()
         return out
 
     # ---------------------------------------------------------------- step
@@ -683,6 +748,7 @@ class TimedRouteUgv(BookingRobot):
                 self.lost.add(rid)
                 self._drop(rid)
         self._give_up_late(s, now)
+        self._check_messengers(s)
         self._check_landings(s, now)
         self._call_standby(s, now)
         if now - self.last_replan >= self.cfg.route_replan_s:

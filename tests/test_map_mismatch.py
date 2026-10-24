@@ -309,6 +309,34 @@ def test_a_uav_flies_straight_to_a_ugv_that_waits_for_it():
     assert cmds == [GoToPoint((325.0, 550.0))]
 
 
+def test_an_out_of_touch_uav_down_to_its_reserve_goes_to_look_for_the_ugv():
+    from marsupial_search.controllers.dock_booking import BookingUavConfig
+    from marsupial_search.controllers.uav_greedy_tour import GreedyTourUav
+    from marsupial_search.core import GoToPoint, RobotMode, RobotState
+    from marsupial_search.sim.radio import RadioConfig
+    sim = Simulator(_ladder_scenario(), SimConfig(radio=RadioConfig(range_m={t: 300.0 for t in RobotType})))
+    uav = GreedyTourUav(BookingUavConfig(seek_ugv=True))
+    uav.reset("uav0", sim.setup)
+    land = tuple(uav.road.positions[10])  # (525, 500); the UGV's route runs along the top road from node 2
+    uav.plan = {"cur": 2, "nodes": list(range(2, 20)), "queue": [], "version": 0, "t": 0.0}
+    uav.phase, uav.booking, uav.waypoints, uav.tour = "sortie", {"land_idx": 10, "land_node": 10, "t_land": 60.0}, [land], []
+    uav.peers["ugv0"] = gs = {"pos": tuple(uav.road.positions[2]), "t": 0.0, "done": False}  # last heard at t = 0
+
+    def state(energy):
+        return RobotState("uav0", RobotType.UAV, land, RobotMode.ACTIVE, energy, 2000.0, False, None, None, (), (), None)
+    cmds = []
+    uav._step_sortie(state(400.0), 100.0, gs, cmds)  # out of touch, above its reserve: it waits for the UGV
+    assert uav.phase == "sortie" and cmds == []
+    uav._step_sortie(state(200.0), 101.0, gs, cmds)  # down to its reserve (10 %): back along the route, 150 m steps
+    assert uav.phase == "seeking" and uav.seek_path == [(375.0, 500.0), (225.0, 500.0), (125.0, 500.0)]
+    uav._step_seeking(state(199.0), 102.0, gs, cmds)
+    assert cmds == [GoToPoint((375.0, 500.0))]
+    gs["t"] = 102.0  # heard again: back to its landing, wherever the UGV has it now
+    uav.booking["land_node"] = 6
+    uav._step_seeking(state(190.0), 103.0, gs, cmds)
+    assert uav.phase == "sortie" and uav.waypoints == [tuple(uav.road.positions[6])]
+
+
 def test_out_of_touch_uavs_are_met_instead_of_landing_blind():
     # small map 0 with a 300 m radio: the UGV moves the landings of UAVs out of touch (detours
     # make it late). A UAV out of touch used to try landing blind, again and again.

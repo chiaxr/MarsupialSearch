@@ -37,6 +37,13 @@ Standby UAVs
     standby UAV on the dock can leave it), and share the landing slots (``"standby"`` lists
     the standby UAVs).
 
+A UAV out of touch with the UGV
+    waits at its landing node, where the UGV meets it (``ugv_timed_route``), until it is down
+    to its reserve energy. Then, with ``seek_ugv`` (off by default: it saved no UAVs in tests),
+    it flies back along the UGV's last planned route and on to where it last heard it, until it
+    hears the UGV again: a blockage may have sent the UGV the long way round, with a new plan
+    the UAV never heard.
+
 :class:`BookingUav` is the UAV side of the protocol: booking, take-off, flight, landing and
 sync. A UAV policy subclasses it and implements :meth:`BookingUav.plan_sortie`, which picks
 the landing and the tour flown on the way to it.
@@ -63,6 +70,7 @@ from marsupial_search.core import (
     RobotObservation,
     RobotState,
     RobotType,
+    Relay,
     Transmit,
     Undock,
 )
@@ -81,6 +89,8 @@ class DockBookingConfig(SortieConfig):
     (:func:`slot_spacing`) on both sides."""
     slot_s: float = 0.0  # spacing of booked landings (0: automatic, see slot_spacing)
     stop_margin_s: float = 3.0  # planned on top of each landing and take-off
+    relay: bool = True  # pass on the other robots' latest status to robots that lack it (core.relay)
+    relay_period_s: float = 5.0  # ... unless their copy is less than this much older
 
 
 @dataclass
@@ -90,6 +100,8 @@ class BookingUavConfig(DockBookingConfig):
     plan_lead_s: float = 30.0  # a docked UAV books its next sortie this long before its take-off
     abort_reserve_fraction: float = 0.05  # in flight: skip the rest of the tour below this margin
     dock_retry_s: float = 3.0  # wait after a rejected or aborted landing
+    seek_ugv: bool = False  # out of touch at its landing and down to its reserve: fly back along the UGV's route to find it
+    max_landing_risk: float = 1.0  # land only where the UGV's plan gives at least 1 - this chance of no long detour on its way (1: anywhere)
 
 
 @dataclass(frozen=True)
@@ -148,6 +160,7 @@ class BookingRobot(RobotController):
         self.road = self.roads.graph  # the current road map
         self.road_visited = np.zeros(self.road.n_nodes, dtype=bool)
         self.peers: dict[str, dict[str, Any]] = {}
+        self.relay = Relay(robot_id, self.cfg.relay_period_s, self.cfg.relay_period_s) if self.cfg.relay else None
         self.started = False
         self._new_visited: list[int] = []
         self._new_updates: list = []
@@ -171,7 +184,7 @@ class BookingRobot(RobotController):
             self._mark_visited(reached)
             self._new_visited += reached
         for msg in obs.messages(STATUS):
-            self._ingest(msg.sender, msg.payload, msg.sent_time)
+            self._receive(msg.sender, msg.payload, msg.sent_time, now)
         cmds: list[Command] = []
         self._step(s, now, obs, cmds)
         status = {"type": self.type.value, "pos": s.position, "mode": s.mode.value, "energy": s.energy,
@@ -180,9 +193,30 @@ class BookingRobot(RobotController):
         report = self._map_report()
         if report is not None:
             status["map"] = report
+        if self.relay is not None:
+            self.relay.update(self.rid, now, _relayable(status))
+            status["clock"] = self.relay.clock()
+            out = self.relay.outgoing(now)
+            if out:
+                status["relay"] = out
         self._new_visited, self._new_updates = [], []
         cmds.append(Transmit(STATUS, status))
         return cmds
+
+    def _receive(self, sender: str, p: dict, t: float, now: float) -> None:
+        """A status heard directly, and the statuses of other robots it relays (those newer than held)."""
+        if self.relay is None:
+            self._ingest(sender, p, t)
+            return
+        if self.relay.update(sender, t, _relayable(p)):
+            self._ingest(sender, p, t)
+        else:  # a newer copy came relayed: keep its state, but this step's belief updates still count
+            v, rec = self.relay.records[sender]
+            self._ingest(sender, {**rec, "updates": p["updates"], "visited": p["visited"]}, v)
+        self.relay.heard(sender, p.get("clock", {}), now)
+        for origin, (v, rec) in p.get("relay", {}).items():
+            if origin != self.rid and self.relay.update(origin, v, rec):
+                self._ingest(origin, self.relay.records[origin][1], v)
 
     def _ingest(self, sender: str, p: dict, t: float) -> None:
         self.peers[sender] = {**p, "t": t}
@@ -229,6 +263,14 @@ class BookingRobot(RobotController):
         return {}
 
 
+def _relayable(status: dict) -> dict:
+    """The part of a status that may be applied more than once: without this step's belief updates
+    and road nodes reached, nor the relay fields."""
+    out = {k: v for k, v in status.items() if k not in ("clock", "relay")}
+    out["updates"], out["visited"] = [], []
+    return out
+
+
 # --------------------------------------------------------------------- UAV side
 
 
@@ -246,7 +288,7 @@ class BookingUav(BookingRobot):
             raise ValueError(f"{self.name} supports exactly one UGV")
         self.ugv = ugvs[0]
         self.n_uav = len(setup.robots_of(RobotType.UAV))
-        self.phase = "airborne"  # docked | airborne (no booking) | sortie | landing | lost
+        self.phase = "airborne"  # docked | airborne (no booking) | sortie | seeking (the UGV) | landing | lost
         self.plan: Optional[dict] = None  # the UGV's latest route broadcast (+ "t")
         self.pending: Optional[Booking] = None
         self.booking: Optional[dict] = None  # accepted: the UGV's queue entry
@@ -259,6 +301,7 @@ class BookingUav(BookingRobot):
         self.next_dock_try = 0.0
         self.dock_tries = 0
         self.t0 = 0.0
+        self.seek_path: list[tuple[float, float]] = []  # seeking: where to look for the UGV, in order
         self.ugv_roads = GraphKnowledge(setup.graphs[RobotType.UGV])  # the road-map changes the UGV's plan had
 
     @abstractmethod
@@ -324,6 +367,8 @@ class BookingUav(BookingRobot):
             else:
                 self._step_docked(s, now, obs, gs, cmds)
                 return
+        if self.phase == "seeking":
+            self._step_seeking(s, now, gs, cmds)
         if self.phase == "airborne":
             self._step_airborne(s, now, cmds)
         if self.phase == "sortie":
@@ -343,7 +388,7 @@ class BookingUav(BookingRobot):
             if self.phase == "sortie" and mine["land_node"] != self.booking["land_node"]:  # moved off a blocked node
                 self.waypoints[-1] = tuple(self.road.positions[mine["land_node"]])
             self.booking = mine  # the UGV may have re-timed it (a detour)
-        elif self.booking is not None and mine is None and self.phase == "sortie":
+        elif self.booking is not None and mine is None and self.phase in ("sortie", "seeking"):
             self.booking, self.phase = None, "airborne"  # the UGV gave up on it: book again
 
     def _launched(self, now: float) -> None:
@@ -451,12 +496,58 @@ class BookingUav(BookingRobot):
                 cmds.append(GoToPoint(target))
             return
         # At the landing node: land once the UGV holds there for this UAV (or, with no radio, is due).
-        # With a radio, a UAV out of touch waits: the UGV meets it within radio range (ugv_timed_route).
+        # With a radio, a UAV out of touch waits: the UGV meets it within radio range (ugv_timed_route),
+        # until it is down to its reserve: then it goes to look for the UGV.
+        if not fresh and len(self.waypoints) == 1 and self._seek_due(s):
+            self._start_seeking(s)
+            return
         here = waiting and dist(gs["pos"], s.position) <= 0.5 * self.setup.docking.dock_tolerance_m
         due = self.setup.radio_range_m is None and now >= b["t_land"] + 2 * self.setup.dt
         if (here or due) and now >= self.next_dock_try:
             cmds.append(Dock(self.ugv))
             self.phase = "landing"
+
+    # -------------------------------------------------------------- seeking
+    def _seek_due(self, s: RobotState) -> bool:
+        """Waited at the landing node, out of touch, down to the energy kept in reserve: the UGV
+        has not come in the time the UAV could afford, so waiting longer only runs it flat."""
+        return self.cfg.seek_ugv and self.setup.radio_range_m is not None and self.plan is not None \
+            and s.energy <= self.cfg.uav_reserve_fraction * self.spec.energy.capacity
+
+    def _start_seeking(self, s: RobotState) -> None:
+        """Look for the UGV where a late UGV most likely is: back along its last planned route from
+        the landing node, then where it was last heard. Points about half a radio range apart."""
+        p, gs = self.plan, self.peers.get(self.ugv)
+        local = self.booking["land_idx"] - p["cur"] if self.booking is not None else len(p["nodes"]) - 1
+        pts = [tuple(self.road.positions[n]) for n in p["nodes"][max(min(local, len(p["nodes"]) - 1), 0)::-1]]
+        if gs is not None:
+            pts.append(tuple(gs["pos"]))
+        step = 0.5 * min(self.setup.radio_range_m.values())
+        self.seek_path = []
+        for q in pts:
+            if dist(q, self.seek_path[-1] if self.seek_path else s.position) >= step:
+                self.seek_path.append(q)
+        if pts and (not self.seek_path or self.seek_path[-1] != pts[-1]):
+            self.seek_path.append(pts[-1])
+        self.phase = "seeking"
+
+    def _step_seeking(self, s: RobotState, now: float, gs: Optional[dict], cmds: list) -> None:
+        """Fly the seek path until the UGV is heard again; then back to the sortie, landing where
+        the UGV now has it (or book again, if it gave up on this landing)."""
+        if gs is not None and now - gs["t"] <= self.cfg.partner_stale_s:
+            if self.booking is None:
+                self.phase = "airborne"
+            else:
+                self.phase, self.tour = "sortie", []
+                self.waypoints = [tuple(self.road.positions[self.booking["land_node"]])]
+            return
+        while self.seek_path and dist(s.position, self.seek_path[0]) < 0.5:
+            self.seek_path.pop(0)
+        if self.seek_path:
+            if s.goal_point is None or dist(s.goal_point, self.seek_path[0]) > 0.5:
+                cmds.append(GoToPoint(self.seek_path[0]))
+        elif s.goal_point is not None or s.moving:
+            cmds.append(Hold())
 
     def _margin_ok(self, s: RobotState, now: float) -> bool:
         """Can the UAV still fly the rest of its tour, wait for the UGV and land?"""

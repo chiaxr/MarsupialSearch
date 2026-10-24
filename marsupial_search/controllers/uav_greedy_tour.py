@@ -6,7 +6,9 @@ Landing (the split)
     After the pin (the last promised take-off), and ``slot_s`` after the last booked landing,
     so the UAVs land in turn and each gets the next stretch of the route. If it can't reach
     that landing node in time, the UAV takes the latest earlier one it can. Energy caps how
-    late it can land.
+    late it can land. With ``max_landing_risk``, only where the UGV's plan (``ugv_ctp_route``)
+    gives at least 1 - that chance of getting there with no long detour: one longer than the
+    hover slack a UAV keeps, which would strand a UAV out of radio contact.
 
 Tour
     :meth:`~.sortie_planner.SortiePlanner.chain_tour` from the take-off point to the landing
@@ -50,6 +52,7 @@ class GreedyTourUav(BookingUav):
             idx = idx[arr[idx] >= p["free_from"]]
         if not len(idx):
             return None
+        idx = self._safe(idx)
         budget = P.energy_budget(energy)
         flight = max(budget, 0.0) / (e.idle_power + e.energy_per_m * v)
         last = p["last_land"] if p["last_land"] is not None else now
@@ -59,6 +62,16 @@ class GreedyTourUav(BookingUav):
         order = ([later[0]] if later else []) + [i for i in idx[::-1] if not later or i < later[0]]
         pick = next((i for i in order if reach(i) >= 0), int(idx[0]))  # none reachable: the earliest
         return self._sortie(int(pick), start, t_start, energy, now)
+
+    def _safe(self, idx: np.ndarray) -> np.ndarray:
+        """The landing indices the UGV's plan says it gets to with no long detour on the way, with
+        a chance of at least 1 - ``max_landing_risk`` (none: the safest)."""
+        clear = self.plan.get("clear")
+        if clear is None or self.cfg.max_landing_risk >= 1.0:
+            return idx
+        c = np.asarray(clear)[idx]
+        safe = idx[c >= 1.0 - self.cfg.max_landing_risk]
+        return safe if len(safe) else idx[c >= c.max() - 1e-9]
 
     def _reach(self, start, t_start: float, budget: float):
         """Per local route index: the longest tour that lands there in time (-1: out of reach)."""

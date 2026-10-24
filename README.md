@@ -145,7 +145,9 @@ Robots running their own policies share information only by radio (`SimConfig.ra
 
 Depleted robots can't send or receive, even on an ideal channel. Docked UAVs can. There is no acknowledgement
 and no multi-hop routing: algorithms that need reliability or relaying re-send messages
-themselves. Per-robot counters (`radio_sent`, `radio_received`, `radio_dropped_range`, `radio_dropped_offline`, …)
+themselves. `marsupial_search/core/relay.py` is a simple store-and-forward relay (each robot's
+latest state, versioned by its send time, with a vector clock in every broadcast so a robot only
+passes on what a neighbour lacks); the dock-booking policies use it (`relay`, on by default). Per-robot counters (`radio_sent`, `radio_received`, `radio_dropped_range`, `radio_dropped_offline`, …)
 appear in `robot_stats` and in the run summary. Centralised controllers ignore the radio.
 
 ### 1.5 Environments
@@ -318,6 +320,16 @@ for msg in obs.inbox("uav1", topic="claims"):   # RadioMessage: sender, topic, p
 
 How messages are delivered (range, loss, bandwidth) is set by the [radio channel](#14-radio-channel).
 
+**Relaying** (`core.Relay`). Each robot keeps, per robot, the latest record of that robot's
+state it knows, versioned by the time its origin sent it, and merged key by key (so a key sent
+only now and then, like the UGV's plan, stays in it). Each broadcast carries the sender's vector
+clock (the version it holds per robot) and the records a neighbour heard in the last
+`relay_period_s` (5 s) lacks, by more than that much. A UGV plan then reaches a UAV out of the
+UGV's range through the other UAV, at once if it is between them, or later if it carries the
+plan until it meets that UAV. Only state that may be applied twice is relayed: the dock-booking
+policies relay their `"status"` without that step's belief updates and road nodes reached;
+bookings and belief syncs stay direct.
+
 ### 2.3 Teams
 
 A mission is run by a *team*, which is controlled by either:
@@ -481,16 +493,18 @@ python scripts/compare.py --config configs/small_car.yaml
 | map | team | expected | median | p90 | vs `joint_planner` (paired by map) |
 |---|---|---|---|---|---|
 | `large` | `joint_planner` | **56.4 ± 3.7** | 45.8 | 113.5 | |
-| `large` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 75.6 ± 5.9 | 57.7 | 135.4 | +19.2 ± 4.3 |
+| `large` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 78.2 ± 6.8 | 56.8 | 149.0 | +21.9 ± 5.2 |
 | `small` | `joint_planner` | **6.7 ± 0.8** | 5.6 | 13.6 | |
-| `small` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 9.9 ± 1.8 | 6.5 | 15.5 | +3.3 ± 1.7 |
+| `small` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 9.9 ± 1.8 | 6.4 | 14.9 | +3.3 ± 1.7 |
 
-Every mission found the target; no UAV was lost and no landing or take-off aborted.
+Every mission found the target; no UAV was lost and no landing or take-off aborted. The default
+team relays the robots' status (`relay`, on by default); before it did, it took 75.6 ± 5.9 min on
+`large` (relaying: +2.6 ± 2.6 min paired by map, within noise) and the same on `small`.
 
-- **Joint planning is worth about 19 min on `large`** against the per-robot policies, and its
-  tail is shorter (p90 114 against 135 min). The oracle needs no radio, so part of the gap could
-  be information; but the default team is no faster with the default 2 km range (79.7 ± 6.0 min
-  on `large`, 9.9 ± 1.8 on `small`), so the gap is mostly planning.
+- **Joint planning is worth about 20 min on `large`** against the per-robot policies, and its
+  tail is shorter (p90 114 against 149 min). The oracle needs no radio, so part of the gap could
+  be information; but the default team was no faster with the default 2 km range (79.7 ± 6.0 min
+  on `large`, 9.9 ± 1.8 on `small`, before relaying), so the gap is mostly planning.
 - **The default team copes with a short radio range.** At 300 m it receives about a quarter as
   many messages as at 2 km on `large` (63 k against 244 k), with no loss in time to find: a
   sortie's landing is agreed before take-off, so it needs no radio in flight.
@@ -538,23 +552,56 @@ of 1 to 10 nodes. `ugv_ctp_route` either knows that limit (`max_cutoff_fraction:
 
 | map | maps × missions | `ugv_ctp_route` | − `ugv_timed_route` | missions losing a UAV (UAVs lost) | not found |
 |---|---|---|---|---|---|
-| `small` | 20 × 4 | `ugv_timed_route` itself | | 3 (3) | 1 |
+| `small` | 20 × 4 | `ugv_timed_route` itself (without relaying) | | 3 (3) | 1 |
 | `small` | 20 × 4 | told the limit | +0.0 ± 0.0 min | 3 (3) | 1 |
 | `small` | 20 × 4 | not told | +0.0 ± 0.0 min | 3 (3) | 1 |
-| `large` | 40 × 2 | `ugv_timed_route` itself (116.1 ± 3.9 min) | | 18 (27) | 0 |
-| `large` | 40 × 2 | told the limit | −4.8 ± 2.4 min | 19 (28) | 2 |
-| `large` | 20 × 2 | not told (maps 0–19; told: −4.1 ± 2.5) | −3.2 ± 2.1 min | 7 (10) | 1 |
+| `large` | 40 × 2 | `ugv_timed_route` itself (114.2 ± 3.9 min) | | 16 (24) | 0 |
+| `large` | 40 × 2 | told the limit | −3.5 ± 2.0 min | 16 (22) | 1 |
+| `large` | 20 × 2 | not told (maps 0–19, without relaying; told: −4.1 ± 2.5) | −3.2 ± 2.1 min | 7 (10) | 1 |
 
 The UGV's ms per step is about the same with either planner. On `large` the CTP is ahead on
-average, by about two standard errors, but not on the typical map: the median difference is
-−0.6 min, it is better on 22 maps and worse on 16 (sign test p = 0.4), and one map alone gains
-71 min. It pays off now and then, where a blockage would send the optimistic planner a long way
-round, and otherwise makes little difference.
+average, by less than two standard errors, but not on the typical map: the median difference is
+−0.6 min, and it is better on 21 maps and worse on 17. It pays off now and then, where a blockage
+would send the optimistic planner a long way round, and otherwise makes little difference.
 
-Most UAVs are lost the same way, with either planner (about one mission in four on `large`): a
-blockage puts the UGV's route the long way round, delaying the landings ahead by 10 to 20 min,
-while the UAVs are out of radio range (300 m). They never hear the new plan, wait at the landing
-node they booked, and run flat there.
+Most UAVs are lost the same way, with either planner: a blockage puts the UGV's route the long
+way round, delaying the landings ahead by 10 to 20 min, while the UAVs are out of radio range
+(300 m). They never hear the new plan, wait at the landing node they booked, and run flat there.
+What was tried against it, on the same 40 maps (maps 0–19 for `seek_ugv`):
+
+| change | UAVs lost (missions losing one) | time to find, paired by map |
+|---|---|---|
+| none (no relaying), `ugv_timed_route` / `ugv_ctp_route` | 27 (18) / 28 (19) | |
+| relaying (`relay`, now on by default) | 24 (16) / 22 (16) | −2.0 ± 1.0 / −0.7 ± 1.9 min |
+| a UAV down to its reserve goes to look for the UGV (`seek_ugv`, no relaying) | 6 against 4 / 9 against 8 | +0.3 ± 0.6 / +0.2 ± 0.6 min |
+| with relaying, landings only where the UGV gets with a long detour at most half the time (`max_landing_risk: 0.5`, `ugv_ctp_route`) | 12 (11) | +17.0 ± 3.9 min |
+
+- **Relaying** reaches few UAVs (with three robots and a 300 m radio, a few dozen relayed records
+  per mission), but saves some, at no cost.
+- **Seeking** starts too late: at its reserve a UAV has about 1 km of flight left, and the UGV is
+  usually further away than that. Off by default.
+- **Risk-aware landings** halve the UAVs lost but cost 17 min. `ugv_ctp_route` publishes, per
+  route index, the chance it gets there with no detour longer than the hover slack a UAV keeps
+  (90 s): one in the way of no node that may be blocked (its blockage model) and whose blockage
+  would send it further round. On these maps that chance is small almost everywhere (0 to 0.2
+  past the last promised stop): about 5 % of the nodes are blocked, most unseen ones on sparse
+  roads have a long way round, and the UGV passes dozens of them before any landing. So UAVs land
+  at the first index they may, sorties are half as long (18 per mission against 9), and the
+  search is slower. Off by default (`max_landing_risk: 1`).
+
+**A messenger.** With a standby UAV on the team (`ugv_timed_route` + `uav_near_scout` +
+`uav_far_scout`), the UGV sends it to a UAV out of touch that it can no longer meet in time where
+that UAV waits (`messenger`, on by default; [controllers.md](controllers.md#dock-booking-dock_bookingpy-how-the-uavs-share-the-dock)).
+Same 40 large maps with cut-offs, relaying on:
+
+| `messenger` | expected | UAVs lost (missions losing one) | not found |
+|---|---|---|---|
+| off | 107.5 ± 2.9 min | 18 (16) | 1 |
+| on | −2.3 ± 2.2 min (21 maps unchanged: it was never called) | 6 (5) | 0 |
+
+It saves two UAVs in three. Of the 6 still lost, none was the messenger on its way: in one map
+(two missions) a messenger was out but did not save the far scout, and for the others none was
+sent. The other teams have no standby UAV, so it changes nothing for them.
 
 ### 3.5 Compute and messages
 

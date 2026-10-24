@@ -96,6 +96,34 @@ def cut_nodes(graph: TraversabilityGraph) -> np.ndarray:
     return cut_off_counts(graph) > 0
 
 
+def clear_probabilities(road: TraversabilityGraph, route, p: np.ndarray, max_detour_m: float,
+                        cache: Optional[dict] = None) -> np.ndarray:
+    """Per index of ``route``: the chance the UGV gets there with no detour longer than
+    ``max_detour_m``, i.e. no node on the way that may be blocked (``p``) and whose blockage would
+    send it more than that much further round (or cut it off). ``cache`` keeps each node's answer
+    for the next call on the same map."""
+    route = np.asarray(route, dtype=int)
+    cache = {} if cache is None else cache
+    pos, csr = road.positions, road.csr
+    ok = np.ones(len(route))
+    for i in range(1, len(route) - 1):
+        a, j, b = int(route[i - 1]), int(route[i]), int(route[i + 1])
+        if p[j] <= 0 or a == b:
+            continue
+        key = (a, j, b)
+        if key not in cache:
+            data = csr.data.copy()
+            data[csr.indptr[j]:csr.indptr[j + 1]] = np.inf
+            data[np.flatnonzero(csr.indices == j)] = np.inf
+            direct = float(np.hypot(*(pos[j] - pos[a])) + np.hypot(*(pos[b] - pos[j])))
+            g = csr_matrix((data, csr.indices, csr.indptr), shape=csr.shape)
+            d = dijkstra(g, directed=True, indices=a, limit=direct + max_detour_m)
+            cache[key] = not np.isfinite(d[b])
+        if cache[key]:
+            ok[i] = 1.0 - p[j]
+    return np.cumprod(ok)
+
+
 class BlockageModel:
     """What a robot knows of which road nodes are blocked. ``look`` records the nodes a sensor
     has seen; ``probabilities`` gives, per node of the current map, the chance it is blocked."""

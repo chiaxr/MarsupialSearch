@@ -42,6 +42,8 @@ controller_params:
     # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UAVs'
     slot_s: 0.0                    # spacing of booked landings (0: automatic, see controllers.md)
     stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    relay: true                    # pass on the other robots' latest status to robots that lack it (marsupial_search/core/relay.py)
+    relay_period_s: 5.0            # ... unless their copy is less than this much older
     # UGV route
     route_horizon_s: 0.0           # keep the route planned this far ahead (0: one slot per UAV, plus one, plus a full sortie)
     route_replan_s: 60.0           # re-plan the unpromised part of the route this often
@@ -56,6 +58,7 @@ controller_params:
     call_min_belief: 0.005         # call the standby UAV if the belief it can see round them is at least this
     pocket_weight: 2.0             # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: 15.0           # a called standby UAV that has not booked its landing by then stays docked
+    messenger: true                # a UAV out of touch can no longer be met in time: send the standby UAV to tell it where (needs relay)
     # road planner (controllers.md#road-map-mismatch)
     road_planner: optimistic       # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
     ctp_samples: 16                # ctp: blockage scenarios per decision
@@ -78,6 +81,8 @@ controller_params:
     # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UAVs'
     slot_s: 0.0                    # spacing of booked landings (0: automatic, see controllers.md)
     stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    relay: true                    # pass on the other robots' latest status to robots that lack it (marsupial_search/core/relay.py)
+    relay_period_s: 5.0            # ... unless their copy is less than this much older
     # UGV route
     route_horizon_s: 0.0           # keep the route planned this far ahead (0: one slot per UAV, plus one, plus a full sortie)
     route_replan_s: 60.0           # re-plan the unpromised part of the route this often
@@ -92,6 +97,7 @@ controller_params:
     call_min_belief: 0.005         # call the standby UAV if the belief it can see round them is at least this
     pocket_weight: 2.0             # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: 15.0           # a called standby UAV that has not booked its landing by then stays docked
+    messenger: true                # a UAV out of touch can no longer be met in time: send the standby UAV to tell it where (needs relay)
     # road planner (controllers.md#road-map-mismatch)
     road_planner: ctp              # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
     ctp_samples: 16                # ctp: blockage scenarios per decision
@@ -114,12 +120,16 @@ controller_params:
     # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UGV's
     slot_s: 0.0                    # spacing of booked landings (0: automatic)
     stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    relay: true                    # pass on the other robots' latest status to robots that lack it (marsupial_search/core/relay.py)
+    relay_period_s: 5.0            # ... unless their copy is less than this much older
     # UAV side of the booking
     partner_stale_s: 10.0          # the UGV's status or route older than this: do not plan or land on it
     sync_resend_s: 5.0             # a docked UAV re-sends its belief until the UGV returns the fused map
     plan_lead_s: 45.0              # book the next sortie this long before take-off (default: 30.0)
     abort_reserve_fraction: 0.05   # in flight: skip the rest of the tour below this energy margin
     dock_retry_s: 3.0              # wait after a rejected or aborted landing
+    seek_ugv: false                # out of touch at its landing and down to its reserve: fly back along the UGV's route to find it
+    max_landing_risk: 1.0          # land only where the UGV's plan (ugv_ctp_route) gives at least 1 - this chance of no long detour on its way (1: anywhere)
   uav_far_scout:                   # flies high: uav_greedy_tour's keys, plus how it weighs belief
     # shared search settings
     uav_reserve_fraction: 0.1      # energy kept in hand at landing
@@ -133,12 +143,16 @@ controller_params:
     # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UGV's
     slot_s: 0.0                    # spacing of booked landings (0: automatic)
     stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    relay: true                    # pass on the other robots' latest status to robots that lack it (marsupial_search/core/relay.py)
+    relay_period_s: 5.0            # ... unless their copy is less than this much older
     # UAV side of the booking
     partner_stale_s: 10.0          # the UGV's status or route older than this: do not plan or land on it
     sync_resend_s: 5.0             # a docked UAV re-sends its belief until the UGV returns the fused map
     plan_lead_s: 30.0              # book the next sortie this long before take-off
     abort_reserve_fraction: 0.05   # in flight: skip the rest of the tour below this energy margin
     dock_retry_s: 3.0              # wait after a rejected or aborted landing
+    seek_ugv: false                # out of touch at its landing and down to its reserve: fly back along the UGV's route to find it
+    max_landing_risk: 1.0          # land only where the UGV's plan (ugv_ctp_route) gives at least 1 - this chance of no long detour on its way (1: anywhere)
     # weighing the belief its tours score (0: off)
     near_route_m: 300.0            # belief this close to the UGV's route during a sortie counts less ...
     near_route_weight: 0.25        # ... this much on the route, rising to full at near_route_m
@@ -158,11 +172,15 @@ controller_params:
     rendezvous_slack_s: 60.0       # spare hover kept at the landing, so the UGV can divert to a sighting
     slot_s: 0.0                    # unused (it lands where the dock is free)
     stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    relay: true                    # pass on the other robots' latest status to robots that lack it (marsupial_search/core/relay.py)
+    relay_period_s: 5.0            # ... unless their copy is less than this much older
     partner_stale_s: 10.0          # the UGV's status or route older than this: do not plan or land on it
     sync_resend_s: 5.0             # a docked UAV re-sends its belief until the UGV returns the fused map
     plan_lead_s: 30.0              # book a sortie this long before the take-off it is called for
     abort_reserve_fraction: 0.05   # in flight: skip the rest of the tour below this energy margin
     dock_retry_s: 3.0              # wait after a rejected or aborted landing
+    seek_ugv: false                # out of touch at its landing and down to its reserve: fly back along the UGV's route to find it
+    max_landing_risk: 1.0          # land only where the UGV's plan (ugv_ctp_route) gives at least 1 - this chance of no long detour on its way (1: anywhere)
     # its calls
     scout_radius_m: 75.0           # called to a blockage: search UAV-grid nodes this close to the road nodes it cuts off
     scout_min_s: 60.0              # called to a blockage: fly at least this long ...
@@ -171,6 +189,7 @@ controller_params:
     trace_roads: true              # called to a blockage: follow the roads it finds missing from the map ...
     trace_radius_m: 200.0          # ... within this radius of the blocked node
     nearby_m: 300.0                # making room: search UAV-grid nodes this close to the UGV's route until it lands back
+    deliver_wait_s: 180.0          # a messenger: the time its landing leaves it to wait for the other UAV
   joint_planner:
     # shared search settings
     uav_reserve_fraction: 0.1      # energy every sortie must land with
@@ -183,6 +202,8 @@ controller_params:
     rendezvous_slack_s: 60.0       # spare hover budgeted at each landing
     slot_s: 0.0                    # unused
     stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    relay: true                    # pass on the other robots' latest status to robots that lack it (marsupial_search/core/relay.py)
+    relay_period_s: 5.0            # ... unless their copy is less than this much older
     # joint search
     horizon_s: 2700.0              # the plan is scored this far ahead
     replan_s: 120.0                # re-plan at least this often (and after every dock event)
