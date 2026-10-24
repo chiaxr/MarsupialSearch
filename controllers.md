@@ -8,7 +8,7 @@ how they are combined into teams, are in the [README](README.md#2-controllers).
 | `ugv_timed_route` | policy | UGV | commits to a timed road route; UAVs book landings on it | `ugv_timed_route.py` |
 | `ugv_ctp_route` | policy | UGV | `ugv_timed_route`, planning its way on the road as a Canadian Traveller's Problem (`road_planner: ctp`) | `ugv_timed_route.py`, `ctp.py` |
 | `uav_greedy_tour` | policy | UAV | books the next landing slot on that route and flies a greedy tour to it | `uav_greedy_tour.py` |
-| `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing or to scout a blocked node | `uav_near_scout.py` |
+| `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing, to scout a blocked node, or as a messenger to a UAV out of touch | `uav_near_scout.py` |
 | `uav_far_scout` | policy | UAV | flies high, searching the wider area on sorties it books itself (for now as `uav_greedy_tour`) | `uav_far_scout.py` |
 | `joint_planner` | centralised **oracle** | the whole team | plans the UGV route, the dock schedule and both UAVs' tours jointly, over a horizon, with perfect information | `joint_planner.py` |
 
@@ -74,6 +74,16 @@ flight**.
 
 With `swap_while_moving: false` the UGV also holds at a landing stop until the swap is done.
 
+**Relaying** (`relay`, on by default). Each robot passes on the other robots' latest `"status"`
+(`core.Relay`: versioned by when its origin sent it, with a vector clock in every broadcast, so a
+robot sends only what a neighbour lacks by more than `relay_period_s`, 5 s). A UAV out of the
+UGV's range thus hears its plan through the other UAV, at once or when that UAV gets to it, and
+the UGV hears that UAV's status the same way. A relayed status counts like one heard directly:
+a robot is *in touch* if the status it holds was sent within 10 s (`partner_stale_s`,
+`uav_stale_s`). A relayed status leaves out that step's belief updates and road nodes reached
+(applying a belief update twice would count it twice); bookings and belief syncs are never
+relayed.
+
 **Standby UAVs.** A UAV whose status says `standby` (`uav_near_scout`) does not book sorties of its
 own: it stays on the dock until the UGV *calls* it, with a take-off stop marked as a call in the
 plan (`calls`). The UGV calls it in three cases:
@@ -131,9 +141,33 @@ route is re-planned on the current belief every 60 s.
   any node of its route between the stops around it, or of the shortest way to the landing node
   (it then skips the route in between). The best meeting lands the UAV soonest with the least
   waiting by the UGV, among those the UAV can afford to fly to. The take-off follows to the first
-  node the UGV reaches once the battery is swapped. A UAV out of touch (no status for
-  `uav_stale_s`, 10 s) is only met within radio range of the end of its tour, where it waits, so it
-  hears the UGV arrive.
+  node the UGV reaches once the battery is swapped (a landing moved onto its own take-off's index
+  goes before it). A UAV out of touch (no status for `uav_stale_s`, 10 s, direct or relayed) is
+  only met within radio range of the end of its tour, where it waits, so it hears the UGV arrive;
+  if no meeting there is affordable, the UGV may send a standby UAV as a messenger (see standby
+  UAVs above), and from when it should get there plans to meet that UAV as if in touch.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Driving" as Driving
+    state "Holding for a landing" as HoldLand
+    state "Holding for the swap" as HoldSwap
+    state "Holding for a take-off" as HoldOff
+
+    [*] --> Driving
+    Driving --> HoldLand : at a landing stop
+    HoldLand --> Driving : docked, or landing moved / dropped
+    HoldLand --> HoldSwap : docked (no swap while moving)
+    HoldSwap --> Driving : swap done
+    Driving --> HoldOff : at a take-off stop
+    HoldOff --> Driving : UAV took off
+```
+
+The UGV holds at each stop until it is done; the re-planning above (route, sightings, blockages,
+recovery) goes on in any state, and the mission ends once the target is within its sensor range.
+`ugv_ctp_route` has the same states. With a standby UAV on the team, it has one more (see
+[`uav_near_scout`](#uav_near_scout-and-uav_far_scout)).
 
 ### `uav_greedy_tour`
 
@@ -145,7 +179,10 @@ route is re-planned on the current belief every 60 s.
 
    With 120 s swaps, `S ≈ 1290 s` and `R ≈ 170 s`, so the slots are about 730 s apart. If it can't reach that
    landing node in time, the UAV takes the latest earlier one it can. The UAVs therefore land in
-   turn, each searching the stretch between its take-off and its landing.
+   turn, each searching the stretch between its take-off and its landing. With
+   `max_landing_risk` below 1 (off by default), it only considers landings that the UGV's plan
+   (`ugv_ctp_route`'s `clear`, see [road-map mismatch](#road-map-mismatch)) says it gets to with no
+   long detour, with at least 1 − that chance.
 2. **Tour.** A greedy chain to the landing node, arriving no later than the UGV: the next node has
    the best `belief / (distance + 100 m)` among those that still leave range to reach the landing.
    It skips nodes in the other UAV's booked tour, and counts shared belief only where it gets there
@@ -153,6 +190,36 @@ route is re-planned on the current belief every 60 s.
 3. **Out of touch:** it flies to where it last heard the UGV and books again.
 
 It assumes both UAVs have its speed and battery (`slot_spacing`); their sensors may differ.
+
+```mermaid
+stateDiagram-v2
+    state "Docked" as Docked
+    state "Airborne, no landing" as Airborne
+    state "Sortie" as Sortie
+    state "Landing" as Landing
+    state "Seeking the UGV" as Seeking
+
+    [*] --> Docked : uav0
+    [*] --> Airborne : uav1
+    Docked --> Sortie : UGV holds for its take-off
+    Docked --> Airborne : took off, no landing ahead
+    Airborne --> Sortie : landing booked
+    Sortie --> Landing : UGV holds for it
+    Landing --> Docked : docked
+    Landing --> Sortie : rejected, retries
+    Sortie --> Airborne : landing dropped
+    Sortie --> Seeking : out of touch, at its reserve
+    Seeking --> Sortie : hears the UGV
+    Seeking --> Airborne : hears the UGV, landing dropped
+
+    classDef optional stroke-dasharray: 5 5
+    class Seeking optional
+```
+
+Both UAVs of the default team run it: `uav0` starts docked, `uav1` hovering over the UGV. The
+transitions are the steps of [dock booking](#dock-booking-dock_bookingpy-how-the-uavs-share-the-dock);
+the dashed state is off by default (`seek_ugv`). A UAV whose battery runs out is lost, whatever
+its state.
 
 ### `uav_near_scout` and `uav_far_scout`
 
@@ -162,7 +229,8 @@ the team searches with the UGV and one UAV most of the time.
 
 **`uav_far_scout`** flies high and searches the wider area on sorties it books itself, taking
 every landing slot. It plans as `uav_greedy_tour`, on the belief weighed to complement the UGV and
-the near scout. The UGV's route here is the stretch it drives during one full sortie.
+the near scout, and has its states (diagram above). The UGV's route here is the stretch it drives
+during one full sortie.
 
 | option | what it does | default | effect (near + far scout team, `cv`, paired by map) |
 |---|---|---|---|
@@ -187,11 +255,71 @@ next tour node go in `uav_far_scout.py` (`_tour_mass`).
 3. **Tracing roads** (`trace_roads`). Called to a blockage, it follows any road it finds that is
    missing from the map: it flies to the far end of each new road node it sees (within
    `trace_radius_m`, 200 m, of the blocked node), dropping tour nodes from the end as needed to
-   land on time with its reserve.
+   land on time with its reserve. It reports what it finds like any UAV, so the UGV uses those
+   roads from its next re-plan.
+4. **As a messenger** (`deliver`). Its tour is one UAV-grid node, the nearest to where the other
+   UAV waits; it lands at the first route index that leaves it `deliver_wait_s` (180 s) there
+   (else the first it can reach, and if it can reach none, it books nothing and stays on the
+   dock). At that node it holds until it hears the other UAV directly (relaying then hands over
+   the UGV's plan, and carries that UAV's status back), or until it must leave to land on time.
 
-Either way, it lands only where the dock is free, and early enough that its battery is swapped
+Each time, it lands only where the dock is free, and early enough that its battery is swapped
 before the other UAV's next landing.
-   It reports what it finds like any UAV, so the UGV uses those roads from its next re-plan.
+
+```mermaid
+stateDiagram-v2
+    state "On the dock, standby" as OnDock
+    state "Making room" as Room
+    state "Scouting a blockage" as Scout
+    state "Landing" as Landing
+    state "Messenger" as Msg {
+        state "To the far scout" as ToPoint
+        state "Waiting for it" as Waiting
+        state "To its landing" as ToLanding
+        [*] --> ToPoint
+        ToPoint --> Waiting : there
+        Waiting --> ToLanding : heard it, or must leave
+    }
+
+    [*] --> OnDock : uav0
+    OnDock --> Room : called, far scout about to land
+    OnDock --> Scout : called to a blockage
+    OnDock --> Msg : called as messenger
+    OnDock --> OnDock : no landing booked in time
+    Room --> Landing : UGV holds for it
+    Scout --> Landing : UGV holds for it
+    ToLanding --> Landing : UGV holds for it
+    Landing --> OnDock : docked
+```
+
+A call to a blockage or as a messenger is withdrawn if it books no landing within
+`call_timeout_s` (15 s); called to make room, it leaves either way and books from the air.
+
+With a standby UAV on the team, the UGV holds at a call (highlighted) as at any take-off, until
+the near scout has left or the call is withdrawn:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Driving" as Driving
+    state "Holding for a landing" as HoldLand
+    state "Holding for the swap" as HoldSwap
+    state "Holding for a take-off" as HoldOff
+    state "Holding for a call" as HoldCall
+
+    [*] --> Driving
+    Driving --> HoldLand : at a landing stop
+    HoldLand --> Driving : docked, or landing moved / dropped
+    HoldLand --> HoldSwap : docked (no swap while moving)
+    HoldSwap --> Driving : swap done
+    Driving --> HoldOff : at the far scout's take-off
+    HoldOff --> Driving : far scout took off
+    Driving --> HoldCall : at a call for the near scout
+    HoldCall --> Driving : near scout took off, or call withdrawn
+
+    classDef added fill:#fde68a,stroke:#d97706,stroke-width:2px
+    class HoldCall added
+```
 
 ## Oracle: `joint_planner`
 
@@ -240,7 +368,9 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
 - **`ugv_timed_route`.** A road found missing is used from the next re-plan of the route. If the
   route runs into a blocked node, the UGV goes round it at once: the shortest way back to the
   first node of the route after it that keeps the next landing within the hover slack of the
-  UAVs still to land (with none to come, that keeps the route no longer than planned). Its
+  UAVs still to land (with none to come, that keeps the route no longer than planned); if no
+  node of the route after it can be reached (a blockage cut the rest off), the route ends there
+  and is planned on from there. Its
   landings stay where they are, put back to when the UGV now gets there (which uses up that much
   of the UAV's slack: later re-routes have only the rest to spend), and the take-offs move back
   to the first node the UGV reaches once the battery is swapped. A landing on a blocked node,
@@ -249,7 +379,8 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
 - **`ugv_ctp_route` (`road_planner: ctp`).** The optimistic planner above takes the shortest way on
   the map as known, as if every node not yet found blocked were passable. `ugv_ctp_route` plans
   the ways it drives to get somewhere as a [Canadian Traveller's Problem](https://en.wikipedia.org/wiki/Canadian_traveller_problem)
-  instead: round a blocked node (to the node `bypass` rejoins at), to a sighting and to a moved
+  instead: round a blocked node (to the node `bypass` rejoins at, and only if its way keeps the
+  landings within the hover slack left; else the shortest way), to a sighting and to a moved
   landing. With `ctp_search_legs` it also plans the ways between the nodes the greedy route picks
   (by shortest distance, as before), weighing the belief swept on the way. Distance alone would
   favour the roads a robot has seen, which are those already searched. That is off by default:
@@ -307,8 +438,9 @@ the UGV's sweep times and the chain tour.
 1. Implement a `RobotController` (one robot) or a `MissionController` (the whole team) in
    `marsupial_search/controllers/<name>.py`, importing only from `marsupial_search.core`.
    `BeliefMap` and `TraversabilityGraph` provide belief fusion and path search,
-   `GraphKnowledge` keeps the road map up to date from `obs.map_updates`, and
-   `Transmit` / `obs.messages(topic)` handle communication.
+   `GraphKnowledge` keeps the road map up to date from `obs.map_updates`,
+   `Transmit` / `obs.messages(topic)` handle communication, and `Relay` passes a robot's latest
+   state on to robots out of its origin's range.
 2. Register it in `marsupial_search/controllers/__init__.py`, optionally with a config
    dataclass so its parameters can be set from YAML (`controller_params`):
 
