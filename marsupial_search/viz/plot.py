@@ -12,6 +12,7 @@ import numpy as np
 from matplotlib.collections import LineCollection
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
+from scipy.sparse.csgraph import connected_components
 
 from marsupial_search.core import EventType, RobotMode, RobotType, Terrain
 from marsupial_search.sim import MissionResult, Scenario
@@ -62,6 +63,9 @@ def draw_map(ax, scenario: Scenario, prior: bool = True, uav_grid: bool = False,
         ax.set_aspect("equal")
         ax.scatter(*road.positions.T, s=_node_marker_size(ax, scenario), c=NODE_FACE, edgecolors=NODE_EDGE,
                    linewidths=0.4, zorder=2.6)
+    cut = _cut_off_nodes(scenario)
+    if len(cut):  # mapped road nodes the blockages cut off from the rest
+        ax.scatter(*road.positions[cut].T, s=14, c=BLOCKED_COLOR, alpha=0.35, linewidths=0, zorder=2.65)
     if mm.blocked:
         ax.scatter(*road.positions[list(mm.blocked)].T, marker="x", s=30, c=BLOCKED_COLOR, linewidths=1.4, zorder=2.7)
     if uav_grid:
@@ -79,6 +83,16 @@ def draw_map(ax, scenario: Scenario, prior: bool = True, uav_grid: bool = False,
     ax.set_ylabel("y [m]")
 
 
+def _cut_off_nodes(scenario: Scenario) -> np.ndarray:
+    """Mapped road nodes that the blocked ones cut off from the largest part of the map."""
+    if not scenario.meta.get("road_cutoff_nodes"):
+        return np.zeros(0, dtype=int)
+    road = scenario.graphs[RobotType.UGV].with_changes(blocked=scenario.road_mismatch.blocked)
+    _, comp = connected_components(road.csr, directed=False)
+    open_ = ~road.blocked
+    return np.flatnonzero(open_ & (comp != np.bincount(comp[open_]).argmax()))
+
+
 def _legend_handles():
     return [Patch(color=TERRAIN_COLORS[t], label=t.name.lower()) for t in Terrain]
 
@@ -90,6 +104,9 @@ def _mismatch_handles(scenario: Scenario) -> list:
         out.append(plt.Line2D([], [], color=UNMAPPED_COLOR, ls=UNMAPPED_STYLE, label="road missing from the map"))
     if mm.blocked:
         out.append(plt.Line2D([], [], ls="", marker="x", ms=6, mew=1.4, color=BLOCKED_COLOR, label="blocked road node"))
+    if scenario.meta.get("road_cutoff_nodes"):
+        out.append(plt.Line2D([], [], ls="", marker="o", ms=4, mew=0, color=BLOCKED_COLOR, alpha=0.35,
+                              label="road node cut off by blockages"))
     return out
 
 
@@ -138,7 +155,8 @@ def plot_scenario(scenario: Scenario, path: Optional[str] = None, show_target: b
     ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
     m = scenario.meta
     mm = scenario.road_mismatch
-    differ = f" ({len(mm.new_nodes)} missing, {len(mm.blocked)} blocked)" if mm else ""
+    cut = m.get("road_cutoff_nodes", 0)
+    differ = f" ({len(mm.new_nodes)} missing, {len(mm.blocked)} blocked{f', {cut} cut off' if cut else ''})" if mm else ""
     ax.set_title(f"{scenario.name}: {scenario.graphs[RobotType.UGV].n_nodes} mapped road nodes{differ}, "
                  f"{m.get('road_length_m', 0) / 1e3:.0f} km roads, "
                  f"{scenario.graphs[RobotType.UAV].n_nodes} UAV nodes")

@@ -18,12 +18,13 @@ the orienteering one: collect the most belief, with several points per sortie.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
 from marsupial_search.core import BeliefMap, MissionSetup, RobotSpec, RobotType, TraversabilityGraph
 
-from .common import SearchConfig, dist, footprint_matrix
+from .common import PathFn, SearchConfig, dist, footprint_matrix
 
 
 @dataclass
@@ -59,6 +60,7 @@ class SortiePlanner:
         """Plan on this road map (the prior map, updated with the mismatches found)."""
         self.road = road
         self.F_road = footprint_matrix(self.setup.grid, road, self.ugv.sensor.range_m, self._road_cells)
+        self._seers = np.maximum(np.asarray(self.F_road.sum(axis=0)).ravel(), 1.0)  # per cell: road nodes that see it
 
     # ------------------------------------------------------------- energy model
     def energy_budget(self, energy: float) -> float:
@@ -108,9 +110,15 @@ class SortiePlanner:
 
     # --------------------------------------------------------------- UGV route
     def ugv_route(self, m: np.ndarray, src: int, start_xy, candidates: np.ndarray, horizon_s: float,
-                  claim_eta: np.ndarray) -> tuple[list[int], list[float]]:
+                  claim_eta: np.ndarray, path_fn: Optional[PathFn] = None,
+                  belief_weight: float = 0.0) -> tuple[list[int], list[float]]:
         """Greedy belief-orienteering road route of about ``horizon_s``. Sweeps ``m`` in place.
-        ``claim_eta`` marks the UAV-grid nodes already taken (-inf), which relocation ignores."""
+        ``claim_eta`` marks the UAV-grid nodes already taken (-inf), which relocation ignores.
+        The next node is chosen by shortest distance; ``path_fn`` plans the way to it (default:
+        the shortest way). With ``belief_weight`` > 0, ``path_fn`` also gets a reward per road
+        node: its share of the belief left in its footprint (a cell seen from k road nodes
+        gives each 1/k), in metres at ``belief_weight`` / the chosen node's score (belief per
+        metre): the way may go further to sweep more on the way."""
         cfg, road, v = self.cfg, self.road, self.ugv.speed
         cand = candidates.copy()
         nodes, times = [src], [dist(start_xy, road.positions[src]) / v]
@@ -128,10 +136,19 @@ class SortiePlanner:
                 path, _ = road.nearest_matching(cur, cand & (value > 0))
                 if not path:
                     break
+            if path_fn is not None and len(path) > 2:
+                if belief_weight > 0 and ok.any():
+                    rate = value[best] / (d[best] + cfg.belief_distance_offset_m)
+                    share = self.F_road @ (m[self.ugv_layers].sum(0) * self.p_ugv / self._seers)
+                    path = path_fn(cur, path[-1], belief_weight / rate * share)[0] or path
+                else:
+                    path = path_fn(cur, path[-1])[0] or path
             self._extend(m, nodes, times, path, cand)
             cur = path[-1]
         if len(nodes) == 1:  # roads covered: move towards UAV belief
             path = self._relocation_path(m, src, horizon_s, claim_eta)
+            if path_fn is not None and len(path) > 2:
+                path = path_fn(src, path[-1])[0] or path
             self._extend(m, nodes, times, path, cand)
         return nodes, times
 

@@ -1,0 +1,29 @@
+# The default team on the small map with a wrong road map (as small_car_mismatch.yaml), its UGV
+# planning its way on the road two ways: the shortest way on the map as known (ugv_timed_route),
+# and as a Canadian Traveller's Problem, weighing the risk of blockages not yet seen (ugv_ctp_route).
+# python scripts/compare.py     --config configs/small_car_ctp.yaml
+# python scripts/run_mission.py --config configs/small_car_ctp.yaml   # one mission per team
+teams:
+  - {ugv0: ugv_timed_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+  - {ugv0: ugv_ctp_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+out: outputs/small_car_ctp
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: car       # car | building | hiker
+  road_unmapped_fraction: 0.1
+  road_blocked_fraction: 0.05
+
+sim:
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+  gif_speedup: 30          # small missions last minutes: play the GIF at 30x real time
+
+compare:
+  maps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  targets: 4
+  estimator: cv
+  workers: 10

@@ -115,6 +115,7 @@ class ScenarioConfig:
     # road-map mismatch: the robots are given a prior road map that differs from the true network
     road_unmapped_fraction: float = 0.0  # share of road nodes missing from the map (whole stretches of road)
     road_blocked_fraction: float = 0.0  # share of mapped road nodes that cannot be traversed
+    road_cutoff_fraction: float = 0.0  # blocked nodes may cut off at most this share of the road nodes from the rest (0: never)
     # UAV grid
     uav_grid_spacing_m: Optional[float] = None  # None: √2 · the smallest UAV sensor range, the widest square grid whose footprints leave no gaps
     # prior
@@ -418,6 +419,7 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         "road_length_m": float(full_road.lengths.sum()),
         "road_unmapped_nodes": len(mismatch.new_nodes),
         "road_blocked_nodes": len(mismatch.blocked),
+        "road_cutoff_nodes": int((~reachable.blocked & ~_main_part(reachable)).sum()),  # mapped, cut off by blocked ones
         "cities": [{k: v for k, v in c.items() if k != "nodes"} for c in cities],
         "terrain_fractions": {t.name.lower(): float((terrain == int(t)).mean()) for t in Terrain},
     }
@@ -530,7 +532,9 @@ def _map_mismatch(road: TraversabilityGraph, cfg: ScenarioConfig, rng) -> tuple[
     Unmapped: whole stretches of road between junctions (or out to a dead end) are left off the
     map, but never one that the map needs to stay connected. Blocked: random mapped nodes whose
     loss leaves the map connected, so a blockage forces a detour but every other mapped node
-    stays reachable. Mapped nodes keep their order; the unmapped ones get the indices after them."""
+    stays reachable; with ``road_cutoff_fraction``, as long as the nodes cut off from the
+    largest part stay within that share of the nodes, on the map and on the ground. Mapped nodes
+    keep their order; the unmapped ones get the indices after them."""
     n = road.n_nodes
     hidden = np.zeros(n, dtype=bool)
     target = int(round(cfg.road_unmapped_fraction * n))
@@ -556,19 +560,34 @@ def _map_mismatch(road: TraversabilityGraph, cfg: ScenarioConfig, rng) -> tuple[
     prior = TraversabilityGraph(road.positions[mapped], e[(e < len(mapped)).all(axis=1)], name=road.name)
     full = TraversabilityGraph(road.positions[order], e).csr
     open_ = np.ones(n, dtype=bool)
+    cutoff_map, cutoff_full = cfg.road_cutoff_fraction * prior.n_nodes, cfg.road_cutoff_fraction * n
     for b in rng.permutation(prior.n_nodes) if n_blocked else []:
         if open_.sum() <= n - n_blocked:
             break
         open_[b] = False
         m = open_[:prior.n_nodes]
-        if connected_components(prior.csr[m][:, m], directed=False)[0] > 1 \
-                or connected_components(full[open_][:, open_], directed=False)[0] > 1:
-            open_[b] = True  # the only way past it, on the map or on the ground
+        if _cut_off(prior.csr[m][:, m]) > cutoff_map or _cut_off(full[open_][:, open_]) > cutoff_full:
+            open_[b] = True  # the only way past it, on the map or on the ground (cutting off too much)
     return prior, MapMismatch(
         blocked=tuple(int(b) for b in np.flatnonzero(~open_)),
         new_nodes={int(index[h]): tuple(map(float, road.positions[h])) for h in np.flatnonzero(hidden)},
         new_edges=tuple((int(a), int(b)) for a, b in np.sort(e[(e >= len(mapped)).any(axis=1)], axis=1)),
     )
+
+
+def _cut_off(csr) -> int:
+    """Nodes outside the largest connected part of a graph."""
+    if csr.shape[0] == 0:
+        return 0
+    _, comp = connected_components(csr, directed=False)
+    return csr.shape[0] - int(np.bincount(comp).max())
+
+
+def _main_part(road: TraversabilityGraph) -> np.ndarray:
+    """Per node: is it in the largest connected part of the nodes that are not blocked?"""
+    _, comp = connected_components(road.csr, directed=False)
+    open_ = ~road.blocked
+    return open_ & (comp == np.bincount(comp[open_]).argmax()) if open_.any() else open_
 
 
 def _grid_graph(size_m: tuple[float, float], spacing: float) -> TraversabilityGraph:
@@ -663,9 +682,9 @@ def sample_target(grid, dist, layer_fractions, confirm_mask, rng) -> tuple[tuple
 
 def _make_fleet(cfg: ScenarioConfig, road: TraversabilityGraph, terrain, grid, rng):
     f = cfg.fleet
-    # Depot: a random non-urban road node that is not blocked.
+    # Depot: a random non-urban road node that is not blocked (nor cut off by blocked ones).
     r, c = _cells_of(grid, road.positions)
-    rural = np.flatnonzero((terrain[r, c] != int(Terrain.URBAN)) & ~road.blocked)
+    rural = np.flatnonzero((terrain[r, c] != int(Terrain.URBAN)) & _main_part(road))
     depot = int(rng.choice(rural)) if len(rural) else 0
     ugv_sensor = SensorSpec(range_m=f.ugv_sensor_range, visible_layers=(Layer.SHARED, Layer.GROUND))
     robots = {"ugv0": RobotSpec("ugv0", RobotType.UGV, f.ugv_speed, f.ugv_energy, ugv_sensor)}

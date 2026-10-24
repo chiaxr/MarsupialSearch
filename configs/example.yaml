@@ -17,6 +17,9 @@ teams:
   - ugv0: ugv_timed_route
     uav0: uav_greedy_tour  # starts docked on the UGV
     uav1: uav_greedy_tour  # starts hovering over it
+  # - ugv0: ugv_ctp_route     # the same, planning round blockages not yet seen (see small_car_ctp.yaml)
+  #   uav0: uav_greedy_tour
+  #   uav1: uav_greedy_tour
   # - ugv0: ugv_timed_route
   #   uav0: uav_near_scout   # flies low, stays docked until the UGV calls it (see small_car_scout.yaml)
   #   uav1: uav_far_scout    # flies high, books its own sorties
@@ -53,6 +56,51 @@ controller_params:
     call_min_belief: 0.005         # call the standby UAV if the belief it can see round them is at least this
     pocket_weight: 2.0             # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: 15.0           # a called standby UAV that has not booked its landing by then stays docked
+    # road planner (controllers.md#road-map-mismatch)
+    road_planner: optimistic       # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
+    ctp_samples: 16                # ctp: blockage scenarios per decision
+    ctp_search_legs: false         # ctp: also the ways between the search route's nodes (else: detours, pursuits, moved landings)
+    ctp_belief_weight: 1.0         # ctp search legs: belief swept on the way, in metres at the greedy route's rate, times this (0: off)
+    ctp_reuse_s: 60.0              # ctp: re-use a way planned between the same two nodes this long (until the map changes)
+    block_prior: 0.05              # ctp: prior share of road nodes blocked ...
+    block_prior_weight: 20.0       # ... worth this many road nodes seen
+    max_cutoff_fraction: 0.0       # ctp: blockages cut off at most this share of the mapped road nodes (the generator's road_cutoff_fraction; 1: no limit)
+  ugv_ctp_route:                   # ugv_timed_route with road_planner: ctp
+    # shared search settings
+    uav_reserve_fraction: 0.1      # UAV energy kept in hand at landing; sets the landing spacing
+    hover_margin_s: 30.0           # unused
+    belief_radius_m: 1500.0        # the next road node is chosen within this radius
+    belief_distance_offset_m: 100.0  # a node scores belief in footprint / (distance + offset)
+    pursue_sightings: true         # drive over to confirm UAV sightings
+    relocation_radius_m: 800.0     # roads covered: drive to the most UAV belief within this radius
+    fill_tours: true               # unused
+    rendezvous_slack_s: 60.0       # unused
+    # dock booking: keep slot_s, stop_margin_s and uav_reserve_fraction the same as the UAVs'
+    slot_s: 0.0                    # spacing of booked landings (0: automatic, see controllers.md)
+    stop_margin_s: 3.0             # planned on top of each landing and take-off stop
+    # UGV route
+    route_horizon_s: 0.0           # keep the route planned this far ahead (0: one slot per UAV, plus one, plus a full sortie)
+    route_replan_s: 60.0           # re-plan the unpromised part of the route this often
+    route_resend_s: 5.0            # re-broadcast an unchanged route this often
+    max_late_s: 120.0              # past a UAV's landing time and slack: drop its landing
+    uav_stale_s: 10.0              # no status from a UAV for this long: out of touch (recovery meets it within radio range)
+    recover_gain_s: 60.0           # after a re-route: move a late landing if that lands the UAV this much sooner
+    # standby UAVs (uav_near_scout)
+    call_radius_m: 250.0           # the route runs into a blocked node this close: maybe call a standby UAV to scout it
+    call_reach_m: 500.0            # cut off: road nodes this far from the UGV by road (before the blockage) ...
+    call_gain_m: 200.0             # ... that the blockage puts this much further away by road (or out of reach)
+    call_min_belief: 0.005         # call the standby UAV if the belief it can see round them is at least this
+    pocket_weight: 2.0             # belief round nodes the blockage puts out of reach counts this many times
+    call_timeout_s: 15.0           # a called standby UAV that has not booked its landing by then stays docked
+    # road planner (controllers.md#road-map-mismatch)
+    road_planner: ctp              # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
+    ctp_samples: 16                # ctp: blockage scenarios per decision
+    ctp_search_legs: false         # ctp: also the ways between the search route's nodes (else: detours, pursuits, moved landings)
+    ctp_belief_weight: 1.0         # ctp search legs: belief swept on the way, in metres at the greedy route's rate, times this (0: off)
+    ctp_reuse_s: 60.0              # ctp: re-use a way planned between the same two nodes this long (until the map changes)
+    block_prior: 0.05              # ctp: prior share of road nodes blocked ...
+    block_prior_weight: 20.0       # ... worth this many road nodes seen
+    max_cutoff_fraction: 0.0       # ctp: blockages cut off at most this share of the mapped road nodes (the generator's road_cutoff_fraction; 1: no limit)
   uav_greedy_tour:
     # shared search settings
     uav_reserve_fraction: 0.1      # energy kept in hand at landing
@@ -176,6 +224,7 @@ scenario:
   # road-map mismatch (README §1.6): the robots are given a road map that differs from the roads
   road_unmapped_fraction: 0.0        # share of road nodes missing from the map (whole stretches of road)
   road_blocked_fraction: 0.0         # share of mapped road nodes that cannot be traversed
+  road_cutoff_fraction: 0.0          # blocked nodes may cut off at most this share of the road nodes from the rest (0: never)
   # UAV grid
   uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the smallest UAV sensor range, the widest gap-free grid)
   # prior (README §1.5)

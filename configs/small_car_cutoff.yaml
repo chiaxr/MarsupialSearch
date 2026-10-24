@@ -1,0 +1,35 @@
+# The small map with a wrong road map (as small_car_mismatch.yaml), where blocked nodes may also
+# cut off parts of the road network (a bridge out, a dead-end valley closed): up to 10 % of the
+# road nodes. The target stays within reach. The UGV plans its way on the road two ways: the
+# shortest way on the map as known (ugv_timed_route), and as a Canadian Traveller's Problem
+# (ugv_ctp_route), told how much blockages may cut off.
+# python scripts/compare.py     --config configs/small_car_cutoff.yaml
+# python scripts/run_mission.py --config configs/small_car_cutoff.yaml   # one mission per team
+teams:
+  - {ugv0: ugv_timed_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+  - {ugv0: ugv_ctp_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+controller_params:
+  ugv_ctp_route:
+    max_cutoff_fraction: 0.1   # as road_cutoff_fraction below
+out: outputs/small_car_cutoff
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: car       # car | building | hiker
+  road_unmapped_fraction: 0.1
+  road_blocked_fraction: 0.05
+  road_cutoff_fraction: 0.1
+
+sim:
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+  gif_speedup: 30          # small missions last minutes: play the GIF at 30x real time
+
+compare:
+  maps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  targets: 4
+  estimator: cv
+  workers: 10

@@ -29,7 +29,7 @@ from .joint_planner import JointPlannerConfig, JointPlannerController
 from .uav_greedy_tour import GreedyTourUav
 from .uav_far_scout import FarScoutUav, FarScoutUavConfig
 from .uav_near_scout import NearScoutUav, NearScoutUavConfig
-from .ugv_timed_route import TimedRouteUgv, UgvTimedRouteConfig
+from .ugv_timed_route import CtpRouteUgv, TimedRouteUgv, UgvCtpRouteConfig, UgvTimedRouteConfig
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,9 @@ class CentralisedEntry:
 POLICIES: dict[str, PolicyEntry] = {
     "ugv_timed_route": PolicyEntry(TimedRouteUgv, RobotType.UGV, UgvTimedRouteConfig,
                                    "the mobile dock: drives a committed, timed route; UAVs book landings on it"),
+    "ugv_ctp_route": PolicyEntry(CtpRouteUgv, RobotType.UGV, UgvCtpRouteConfig,
+                                 "ugv_timed_route planning its way on the road as a Canadian Traveller's Problem "
+                                 "(risk of blockages not yet seen)"),
     "uav_greedy_tour": PolicyEntry(GreedyTourUav, RobotType.UAV, BookingUavConfig,
                                    "books the next landing slot on the UGV's route, flies a greedy chain tour to it"),
     "uav_near_scout": PolicyEntry(NearScoutUav, RobotType.UAV, NearScoutUavConfig,

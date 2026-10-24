@@ -6,14 +6,16 @@ how they are combined into teams, are in the [README](README.md#2-controllers).
 | name | kind | for | idea | file |
 |---|---|---|---|---|
 | `ugv_timed_route` | policy | UGV | commits to a timed road route; UAVs book landings on it | `ugv_timed_route.py` |
+| `ugv_ctp_route` | policy | UGV | `ugv_timed_route`, planning its way on the road as a Canadian Traveller's Problem (`road_planner: ctp`) | `ugv_timed_route.py`, `ctp.py` |
 | `uav_greedy_tour` | policy | UAV | books the next landing slot on that route and flies a greedy tour to it | `uav_greedy_tour.py` |
 | `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing or to scout a blocked node | `uav_near_scout.py` |
 | `uav_far_scout` | policy | UAV | flies high, searching the wider area on sorties it books itself (for now as `uav_greedy_tour`) | `uav_far_scout.py` |
 | `joint_planner` | centralised **oracle** | the whole team | plans the UGV route, the dock schedule and both UAVs' tours jointly, over a horizon, with perfect information | `joint_planner.py` |
 
 Shared building blocks: `common.py` (search settings, sensor footprints, pursuit paths),
-`sortie_planner.py` (UAV energy model, greedy road routes and chain tours) and `dock_booking.py`
-(the protocol the two policies speak).
+`sortie_planner.py` (UAV energy model, greedy road routes and chain tours), `dock_booking.py`
+(the protocol the two policies speak) and `ctp.py` (road paths that weigh the risk of blockages
+not yet seen).
 
 **What they optimise.** All of them score a place by the same quantity: the target probability
 (*belief*) still left inside a sensor footprint there. The UGV sees the ground and shared layers; a
@@ -78,7 +80,8 @@ plan (`calls`). The UGV calls it in two cases:
   any robot is gone from the UGV's map, so ground that has been looked at calls nobody. The call
   lists the cut-off nodes; the UAV takes off where the UGV is, once it has booked its landing (a
   call it has not booked within `call_timeout_s`, 15 s, is withdrawn). The generated maps keep the
-  roads connected round blocked nodes, so there a blockage only makes the way longer.
+  roads connected round blocked nodes (unless `road_cutoff_fraction` lets blockages cut off part of
+  the network), so there a blockage only makes the way longer.
 
 A called UAV books its landing wherever the dock is free, not only after the pin: the plan lists
 the route indices each UAV is on the dock (`busy`). The UGV adds no take-off after that landing.
@@ -98,7 +101,8 @@ route is re-planned on the current belief every 60 s.
 
 - *Sightings:* the UGV detours at once if no UAV still to land would wait past its hover
   slack (60 s), and otherwise straight after the pin.
-- *A missing UAV:* the UGV drops a landing 120 s after the UAV's slack runs out.
+- *A missing UAV:* the UGV drops a landing 120 s after the UAV's slack runs out, or 120 s after a
+  landing that started should have ended (the UAV ran out of energy on the way down: it sends nothing more).
 - *Recovery (a landing the UGV can't make):* when the UAV can no longer afford to wait for the
   UGV at its landing node (from the energy and tour end it reports, or as booked), when that node
   turns out to be blocked, or when after a re-route the UGV would get there more than
@@ -221,6 +225,44 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
   to the first node the UGV reaches once the battery is swapped. A landing on a blocked node,
   or one the UGV now reaches too late, goes to where the UGV best meets that UAV (the recovery
   above); a UAV on its way flies to the new landing node once it hears the plan.
+- **`ugv_ctp_route` (`road_planner: ctp`).** The optimistic planner above takes the shortest way on
+  the map as known, as if every node not yet found blocked were passable. `ugv_ctp_route` plans
+  the ways it drives to get somewhere as a [Canadian Traveller's Problem](https://en.wikipedia.org/wiki/Canadian_traveller_problem)
+  instead: round a blocked node (to the node `bypass` rejoins at), to a sighting and to a moved
+  landing. With `ctp_search_legs` it also plans the ways between the nodes the greedy route picks
+  (by shortest distance, as before), weighing the belief swept on the way. Distance alone would
+  favour the roads a robot has seen, which are those already searched. That is off by default:
+  it gained nothing in the [results](README.md#34-results), at up to 3× the compute.
+  - *Blockage model* (`ctp.BlockageModel`). A road node is open once a robot has seen it: the UGV
+    from where it drives, a UAV from where its status says it was (a UAV's sensor finds a
+    blockage in range, and its status carries it). So is a node whose blockage would cut off more
+    of the map than blockages may still cut off (`max_cutoff_fraction`, the generator's
+    `road_cutoff_fraction`; by default 0: no node the map needs to stay in one piece is ever
+    blocked), and a node missing from the map. Every other node is blocked with the share of the
+    nodes seen that were blocked, under a Beta prior (mean `block_prior`, 5 %, worth
+    `block_prior_weight`, 20, nodes).
+  - *Policy* (`ctp.CtpPlanner`): optimistic rollout (ORO; Eyerich, Keller and Helmert, AAAI 2010).
+    At each junction the next node `v` minimises `len(u, v) + E[cost of the optimistic policy
+    from v]`, averaged over `ctp_samples` (16) blockage scenarios drawn from the model. A rollout
+    drives the optimistic policy through one scenario: it finds each blocked node once within
+    UGV sensor range (55 m) and plans again when its path runs into one. A rollout never costs
+    less than the shortest distance, so a candidate whose shortest distance is already worse than
+    the best rollout cost is skipped. When no node within sensor range of the shortest way may be
+    blocked, that is the answer. The way stored in the route is what the policy drives if it
+    finds no blockage: nodes passed within sensor range count as open from there on. A blockage
+    found later re-routes as above, again with the CTP.
+  - *Search legs* (`ctp_search_legs`). The leg minimises E[metres driven − μ · belief swept]. A
+    road node's reward is its share of the belief left in its footprint (a cell seen from k road
+    nodes gives each 1/k), and μ is the greedy route's own rate: `ctp_belief_weight` (1) / the
+    chosen node's `belief / (distance + 100 m)`. A detour of x metres pays if it sweeps x times
+    that rate. Driving into a node costs its length less its reward, but at least 10 % of the
+    length, and the full length where the leg or the rollout has been already (a backtrack
+    sweeps nothing new). The rollouts then use two optimistic policies, shortest at these costs
+    and shortest by length, and a candidate scores the cheaper expectation (rollout with several
+    base policies, Bertsekas). The first heads for the belief from wherever it starts, so on its
+    own a safe road without belief would never be valued.
+  - *Compute.* A way planned between the same two nodes is re-used for `ctp_reuse_s` (60 s),
+    or until the map changes: the greedy route re-plans the same ways every minute.
 - **`uav_greedy_tour`.** Plans its tours on the UGV's route, which may now use roads found
   missing; its own finds only change where the UGV goes.
 - **`joint_planner`.** Sees every robot's finds at once. A blocked node on the route triggers a

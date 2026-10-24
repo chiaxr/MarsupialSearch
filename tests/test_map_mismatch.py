@@ -55,6 +55,18 @@ def test_bypass_goes_round_blocked_nodes_and_keeps_stops():
     assert route[-2:] == [3, 7] and index[3] >= 0
 
 
+def test_bypass_takes_a_planned_way_only_if_the_budget_allows_it():
+    g = _ladder().with_changes(blocked=[2])
+    def roundabout(a, b):  # a planner's way from 1 that goes round by 0 and 4: 2 longer than the shortest
+        rest, d = g.shortest_path(4, b)
+        return [1, 0] + rest, 2.0 + d
+    # Budget 0: it rejoins at 7 (no longer than planned), and the roundabout way would be 2 longer.
+    assert bypass(g, [0, 1, 2, 3, 7], budget=0.0, path_fn=roundabout)[0] == [0, 1, 5, 6, 7]
+    # Budget 4: it rejoins at 3 (2 longer), and the roundabout way (2 longer still) fits what is left.
+    assert bypass(g, [0, 1, 2, 3, 7], budget=4.0, path_fn=roundabout)[0] == [0, 1, 0, 4, 5, 6, 7, 3, 7]
+    assert bypass(g, [0, 1, 2, 3, 7], budget=3.0, path_fn=roundabout)[0] == [0, 1, 5, 6, 7, 3, 7]
+
+
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_generated_mismatch_keeps_every_road_reachable_and_the_target_confirmable(seed):
     cfg = dataclasses.replace(small(seed), road_unmapped_fraction=0.1, road_blocked_fraction=0.1)
@@ -73,6 +85,36 @@ def test_generated_mismatch_keeps_every_road_reachable_and_the_target_confirmabl
     assert np.hypot(*(pts - sc.target_xy).T).min() <= rng
     # The robots are only given the prior map.
     assert Simulator(sc).setup.graphs[RobotType.UGV] is prior
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_blocked_nodes_cut_off_no_more_than_road_cutoff_fraction(seed):
+    cfg = dataclasses.replace(small(seed), road_unmapped_fraction=0.1, road_blocked_fraction=0.1,
+                              road_cutoff_fraction=0.1)
+    sc = generate_scenario(cfg)
+    prior, mm = sc.graphs[RobotType.UGV], sc.road_mismatch
+    true_road = sc.true_road()
+    for g in (prior.with_changes(blocked=mm.blocked), true_road):
+        open_ = ~g.blocked
+        _, comp = connected_components(g.csr[open_][:, open_], directed=False)
+        assert open_.sum() - np.bincount(comp).max() <= 0.1 * g.n_nodes
+    reach = prior.with_changes(blocked=mm.blocked)
+    _, comp = connected_components(reach.csr, directed=False)
+    open_ = ~reach.blocked
+    main = np.bincount(comp[open_]).argmax()
+    assert sc.meta["road_cutoff_nodes"] == int((open_ & (comp != main)).sum())
+    assert comp[sc.init["ugv0"].node] == main  # the UGV starts in the main part, and the target is within its reach
+    pts = np.concatenate([np.linspace(reach.positions[a], reach.positions[b], 20) for a, b in reach.edges
+                          if comp[a] == main])
+    assert np.hypot(*(pts - sc.target_xy).T).min() <= sc.robots["ugv0"].sensor.range_m
+
+
+def test_some_maps_get_cut_off_regions():
+    cut = [generate_scenario(dataclasses.replace(small(s), road_blocked_fraction=0.05, road_cutoff_fraction=0.1))
+           .meta["road_cutoff_nodes"] for s in range(4)]
+    assert max(cut) > 0
+    assert [generate_scenario(dataclasses.replace(small(s), road_blocked_fraction=0.05)).meta["road_cutoff_nodes"]
+            for s in range(4)] == [0] * 4
 
 
 @pytest.mark.parametrize("seed", [0, 3])
@@ -293,3 +335,18 @@ def test_a_landing_whose_take_off_a_re_route_put_at_the_same_node_can_still_move
     s = RobotState("ugv0", RobotType.UGV, pos, RobotMode.ACTIVE, 1e5, 1e5, False, 3, 3, (), (), None)
     ugv._check_landings(s, 30.0)  # used to fail on an empty range of meeting points
     assert b["land_idx"] == 3
+    # The landing comes first: the UGV used to wait there for the take-off of a UAV not yet on the dock.
+    assert [st["kind"] for st in ugv.stops[3]] == ["land", "takeoff"]
+
+
+def test_the_ugv_gives_up_on_a_landing_that_started_and_never_ended():
+    # A UAV that runs out of energy while it lands sends nothing more: the UGV used to wait for it for good.
+    ugv, s = _ugv_on(range(6), 1000.0)
+    b = _book(ugv, s, 1, float(ugv._times(s, 0.0)[1]), slack_s=60.0)
+    ugv.cur = 1
+    ugv.stops[1][0]["started"] = 100.0
+    dock = ugv.setup.docking.dock_duration_s
+    ugv._give_up_late(s, 100.0 + dock + ugv.cfg.max_late_s - 1.0)
+    assert "uav0" in ugv.bookings
+    ugv._give_up_late(s, 100.0 + dock + ugv.cfg.max_late_s + 1.0)
+    assert "uav0" not in ugv.bookings and not any(ugv.stops.values())

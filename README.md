@@ -57,7 +57,8 @@ marsupial_search/
   sim/           research only: scenario generator, simulator, evaluation
   viz/           research only: matplotlib plots / GIF
 configs/         YAML experiment files (example.yaml documents the format; small_car_mismatch.yaml: a wrong road map;
-                 small_car_scout.yaml: a near and a far scout)
+                 small_car_ctp.yaml: the UGV planning round blockages not yet seen; small_car_cutoff.yaml: blockages
+                 that cut off parts of the network; small_car_scout.yaml: a near and a far scout)
 scripts/
   run_mission.py one mission + plots + GIF
   compare.py     teams x map seeds x target seeds -> CSV + summary + plot
@@ -214,15 +215,19 @@ from the true roads (`Scenario.road_mismatch`, a `MapMismatch`), in two ways:
 |---|---|---|
 | `road_unmapped_fraction` | 0 | about this share of road nodes is missing from the map: whole stretches of road between junctions, or out to a dead end |
 | `road_blocked_fraction` | 0 | this share of mapped road nodes cannot be traversed |
+| `road_cutoff_fraction` | 0 | blocked nodes may cut off up to this share of the road nodes from the rest (a bridge out, a closed valley) |
 
 Both are off by default, and the [results](#34-results) are without them;
 `configs/small_car_mismatch.yaml` turns them on (10 % missing, 5 % blocked). They are drawn
 from their own random stream, so the rest of a map seed's map is unchanged, but the UGV's start
 can differ (it must be a mapped node that is not blocked, and the mapped nodes are re-indexed).
 
-* **Mismatches never cut the network.** A stretch of road is left off the map only if the map
-  stays connected without it, and a node is blocked only if both the map and the true roads
-  stay connected without it. A blockage forces a detour; every other road node stays reachable.
+* **Mismatches cut off little of the network, or none.** A stretch of road is left off the map
+  only if the map stays connected without it, and a node is blocked only if both the map and
+  the true roads stay connected without it. A blockage then forces a detour; every other road
+  node stays reachable. With `road_cutoff_fraction`, a node may also be blocked if the nodes cut
+  off from the largest part of the network stay within that share of the nodes, on the map and
+  on the ground (`configs/small_car_cutoff.yaml`: 10 %). The UGV starts in the largest part.
 * **The target is always reachable.** It is placed within UGV sensor range of a *mapped*
   road the UGV can reach from its start without passing a blocked node, so a mission can end
   without the team ever finding a missing road.
@@ -332,6 +337,7 @@ and print its kind (centralised or decentralised).
 | name | kind | for | idea |
 |---|---|---|---|
 | `ugv_timed_route` | policy | UGV | commits to a timed road route; UAVs book landings on it |
+| `ugv_ctp_route` | policy | UGV | `ugv_timed_route`, planning its way on the road as a Canadian Traveller's Problem: it weighs the risk of blockages not yet seen |
 | `uav_greedy_tour` | policy | UAV | books the next landing slot on that route and flies a greedy tour to it |
 | `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing or to scout a blocked node |
 | `uav_far_scout` | policy | UAV | flies high, searching the wider area on sorties it books itself (for now as `uav_greedy_tour`) |
@@ -493,6 +499,62 @@ Every mission found the target; no UAV was lost and no landing or take-off abort
   50 m road nodes, 2 km radio): 61.4 ± 6.2 min on `large`, 12 min slower than `joint_planner`
   then (49.5 ± 3.0), and 5.3 ± 0.5 on `small`, 0.2 min faster (`small` missions end within
   minutes, before a planned sortie pays off).
+
+**Road-map mismatch: planning round blockages not yet seen.** The default team with its UGV on
+`ugv_timed_route` (shortest ways) or on `ugv_ctp_route` (the
+[Canadian Traveller's Problem](controllers.md#road-map-mismatch) policy), 10 % of the roads
+missing from the map and 5 % of the mapped nodes blocked (`configs/small_car_ctp.yaml`; on
+`large`, the same with `configs/large_car_mismatch.yaml`'s settings). Paired by map, against
+`ugv_timed_route`:
+
+| map | maps × missions | CTP on | `ugv_ctp_route` − `ugv_timed_route` | UGV ms/step |
+|---|---|---|---|---|
+| `small` | 20 × 4 | detours, pursuits, moved landings (default) | +0.1 ± 0.1 min | 0.52 |
+| `small` | 20 × 4 | also the search legs (`ctp_search_legs`), distance only (`ctp_belief_weight: 0`) | +0.1 ± 0.1 min | 0.68 |
+| `small` | 20 × 4 | also the search legs, weighing the belief swept | −0.2 ± 0.4 min | 1.25 |
+| `small` | 20 × 4 | the same with no risk (`block_prior: 0`): belief-weighted legs alone | −0.2 ± 0.4 min | 0.58 |
+| `large` | 10 × 2 | detours, pursuits, moved landings (default) | +2.1 ± 2.7 min | 1.45 |
+| `large` | 10 × 2 | also the search legs, distance only | +2.8 ± 3.2 min | 2.75 |
+| `large` | 10 × 2 | also the search legs, weighing the belief swept | +2.6 ± 4.6 min | 4.75 |
+| `large` | 10 × 2 | the same with no risk: belief-weighted legs alone | +6.3 ± 6.5 min | 1.61 |
+| `small`, no mismatch | 20 × 4 | also the search legs, distance only | −0.0 ± 0.0 min | 0.62 |
+
+`ugv_timed_route` takes 0.5–0.7 ms per step on `small` and 1.0–1.4 on `large` (timings vary by
+about 20 % between runs). The CTP finds no time to gain here. The blockages cost the shortest-way
+planner little: the UGV sees a blocked node from the node before it, the UAVs find most of them
+first (on `small` with the car prior, 86 % against the UGV's 6 %: the prior puts the belief on
+the roads, so the UAVs fly along them), and a detour round one node is short (on `small`, about
+4 re-routes per mission add a few hundred metres in all). On the search legs, distance alone
+favours the roads a robot has seen, which are those already searched. Weighing the belief swept
+on the way does not help either, with or without the risk; probably because the greedy route
+already picks its next node by belief, and a leg that sweeps more on the way reaches it later.
+
+**Blockages that cut off parts of the network.** As above, with blockages that may cut off up
+to 10 % of the road nodes (`road_cutoff_fraction: 0.1`; `configs/small_car_cutoff.yaml`, and on
+`large` with `large_car_mismatch.yaml`'s settings). On `large` that cuts off about 9 % of the
+mapped nodes in many pieces, the largest about 60 nodes (3 km of road); on `small`, a few pieces
+of 1 to 10 nodes. `ugv_ctp_route` either knows that limit (`max_cutoff_fraction: 0.1`) or not
+(`1.0`: any node may be blocked).
+
+| map | maps × missions | `ugv_ctp_route` | − `ugv_timed_route` | missions losing a UAV (UAVs lost) | not found |
+|---|---|---|---|---|---|
+| `small` | 20 × 4 | `ugv_timed_route` itself | | 3 (3) | 1 |
+| `small` | 20 × 4 | told the limit | +0.0 ± 0.0 min | 3 (3) | 1 |
+| `small` | 20 × 4 | not told | +0.0 ± 0.0 min | 3 (3) | 1 |
+| `large` | 40 × 2 | `ugv_timed_route` itself (116.1 ± 3.9 min) | | 18 (27) | 0 |
+| `large` | 40 × 2 | told the limit | −4.8 ± 2.4 min | 19 (28) | 2 |
+| `large` | 20 × 2 | not told (maps 0–19; told: −4.1 ± 2.5) | −3.2 ± 2.1 min | 7 (10) | 1 |
+
+The UGV's ms per step is about the same with either planner. On `large` the CTP is ahead on
+average, by about two standard errors, but not on the typical map: the median difference is
+−0.6 min, it is better on 22 maps and worse on 16 (sign test p = 0.4), and one map alone gains
+71 min. It pays off now and then, where a blockage would send the optimistic planner a long way
+round, and otherwise makes little difference.
+
+Most UAVs are lost the same way, with either planner (about one mission in four on `large`): a
+blockage puts the UGV's route the long way round, delaying the landings ahead by 10 to 20 min,
+while the UAVs are out of radio range (300 m). They never hear the new plan, wait at the landing
+node they booked, and run flat there.
 
 ### 3.5 Compute and messages
 

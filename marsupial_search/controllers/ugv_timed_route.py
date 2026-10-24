@@ -10,7 +10,8 @@ Dock queue
     battery has been swapped. The UGV stops at the landing node until the UAV has docked, and at the take-off
     node until it has left. A landing must come after the last promised take-off, so
     bookings are append-only and never move one another. A UAV that has not landed
-    ``max_late_s`` after its landing time and slack is dropped.
+    ``max_late_s`` after its landing time and slack, or after its landing should have ended
+    (it ran out of energy on the way down), is dropped.
 Broadcast
     The route, its arrival times and the queue (with each booked tour) in its ``"status"``
     when they change, and every ``route_resend_s``.
@@ -32,6 +33,15 @@ Recovery
     way there (skipping the route in between). The UAV flies there from where its tour ends,
     as it reports in its status (or as booked). A UAV out of touch (no status for
     ``uav_stale_s``) is only met within radio range of that point, so it hears the UGV there.
+Road planner (``road_planner``)
+    How the UGV gets round a blocked node, to a sighting and to a moved landing (and, with
+    ``ctp_search_legs``, from one node of its search route to the next it chooses).
+    ``"optimistic"``: the shortest way on the road map as known, as if every node not yet found
+    blocked were passable. ``"ctp"``: a Canadian Traveller's Problem policy (:mod:`.ctp`) that
+    weighs the risk of blockages not yet seen and the way back from them. A node is open once a robot has seen it (the UGV from where
+    it drives, a UAV from where its status says it is); every other mapped node is blocked
+    with the share found blocked so far (prior ``block_prior``). ``ugv_ctp_route`` is this
+    policy with ``"ctp"``.
 Standby UAVs
     A UAV on standby (``uav_near_scout``) leaves the dock only when called: just before another UAV
     lands while it is on the dock, and when the route runs into a blocked node within
@@ -61,6 +71,7 @@ from marsupial_search.core import (
 )
 
 from .common import bypass, dist, pursuit_path
+from .ctp import BlockageModel, CtpPlanner
 from .dock_booking import BOOK, LAND, SYNC, TAKEOFF, Booking, BookingRobot, DockBookingConfig, slot_spacing
 from .sortie_planner import SortiePlanner
 
@@ -79,6 +90,23 @@ class UgvTimedRouteConfig(DockBookingConfig):
     call_min_belief: float = 0.005  # call the standby UAV if the belief it can see around them is at least this
     pocket_weight: float = 2.0  # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: float = 15.0  # a standby UAV called to a blocked node that has not booked its landing by then stays docked
+    road_planner: str = "optimistic"  # optimistic: shortest paths on the map as known | ctp: Canadian Traveller's Problem
+    ctp_samples: int = 16  # ctp: blockage scenarios per decision
+    ctp_search_legs: bool = False  # ctp: also the ways between the search route's nodes (else: detours, pursuits, moved landings)
+    ctp_belief_weight: float = 1.0  # ctp search legs: belief swept on the way, in metres at the greedy route's rate, times this (0: off)
+    ctp_reuse_s: float = 60.0  # ctp: re-use a way planned between the same two nodes this long (until the map changes)
+    block_prior: float = 0.05  # ctp: prior share of road nodes blocked ...
+    block_prior_weight: float = 20.0  # ... worth this many road nodes seen
+    max_cutoff_fraction: float = 0.0  # ctp: blockages cut off at most this share of the mapped road nodes (the generator's road_cutoff_fraction; 1: no limit)
+
+    def __post_init__(self):
+        if self.road_planner not in ("optimistic", "ctp"):
+            raise ValueError(f"road_planner must be 'optimistic' or 'ctp', got {self.road_planner!r}")
+
+
+@dataclass
+class UgvCtpRouteConfig(UgvTimedRouteConfig):
+    road_planner: str = "ctp"
 
 
 class TimedRouteUgv(BookingRobot):
@@ -114,8 +142,14 @@ class TimedRouteUgv(BookingRobot):
         self.standby: set[str] = set()  # UAVs that stay on the dock until called (they say so in their status)
         self.free_from: Optional[float] = None  # a standby UAV is on the dock after the pin: it can leave from then
         self.extend_failed = False
+        self.blockage = BlockageModel(self.roads, self.cfg.block_prior, self.cfg.block_prior_weight,
+                                      self.cfg.max_cutoff_fraction) if self.cfg.road_planner == "ctp" else None
+        self.ctp: Optional[CtpPlanner] = None
+        self.ctp_paths: dict[tuple, tuple[float, list[int], float]] = {}  # (src, dst, search leg) -> (when, path, cost)
+        self.now = 0.0
 
     def _start(self, s: RobotState) -> None:
+        self._look(s.position, self.spec.sensor.range_m)
         self.nodes, self.arrived = [s.node if s.node is not None else s.last_node], 0.0
         if s.docked_uav is not None:  # it takes off first, from where the UGV stands
             self.stops[0] = [{"kind": TAKEOFF, "uav": s.docked_uav, "ready": 0.0}]
@@ -191,7 +225,8 @@ class TimedRouteUgv(BookingRobot):
             claim = np.full(P.air.n_nodes, np.inf)
             for b in self.bookings.values():
                 claim[list(b["tour"])] = -np.inf
-            new, _ = P.ugv_route(m, src, tuple(self.road.positions[src]), cand, end - arr[-1], claim)
+            new, _ = P.ugv_route(m, src, tuple(self.road.positions[src]), cand, end - arr[-1], claim,
+                                 self._ctp_path_fn() if self.cfg.ctp_search_legs else None, self.cfg.ctp_belief_weight)
             self.extend_failed = len(new) < 2
             if not self.extend_failed:
                 self.nodes += [int(n) for n in new[1:]]
@@ -214,6 +249,36 @@ class TimedRouteUgv(BookingRobot):
         self._extend(now, s, replan=True)
 
     # ------------------------------------------------------------- road map
+    def _path(self, src: int, dst: int, reward: Optional[np.ndarray] = None) -> tuple[list[int], float]:
+        """The way from ``src`` to ``dst`` (``road_planner``) and its cost: its length, or (ctp)
+        the expected length with the detours round blockages not yet seen, less the ``reward``
+        collected on the way (a search leg's belief, in metres)."""
+        if self.blockage is None:
+            return self.road.shortest_path(src, dst)
+        if self.ctp is None or self.ctp.road is not self.road:
+            self.ctp = CtpPlanner(self.road, self.spec.sensor.range_m, self.cfg.ctp_samples,
+                                  seed=self.road.n_nodes + len(self.roads.blocked))
+            self.ctp_paths = {}
+        key = (src, dst, reward is not None)
+        t, path, cost = self.ctp_paths.get(key, (-np.inf, None, 0.0))
+        if self.now - t > self.cfg.ctp_reuse_s:
+            path, cost = self.ctp.path(src, dst, self.blockage.probabilities(self.road), reward)
+            self.ctp_paths[key] = (self.now, path, cost)
+        return list(path), cost
+
+    def _ctp_path_fn(self):
+        """``_path`` for the shared planners when it is the CTP (None: their own shortest paths)."""
+        return self._path if self.blockage is not None else None
+
+    def _look(self, xy, radius: float) -> None:
+        if self.blockage is not None:
+            self.blockage.look(self.road, xy, radius - 1.0)  # (a margin for where it was when it looked)
+
+    def _ingest(self, sender: str, p: dict, t: float) -> None:
+        super()._ingest(sender, p, t)
+        if p["type"] == RobotType.UAV.value and sender in self.setup.robots:  # what that UAV has seen
+            self._look(p["pos"], self.setup.robots[sender].sensor.range_m)
+
     def _map_changed(self, s: RobotState, now: float) -> None:
         """Re-route at once if the route runs into a blocked node; new roads wait for the next re-plan."""
         if self.planner is None:
@@ -238,7 +303,7 @@ class TimedRouteUgv(BookingRobot):
         arr = self._times(s, now)
         spare = min((st["ready"] + st["slack"] - arr[i] for i, sts in self.stops.items() if i > head
                      for st in sts if st["kind"] == LAND), default=0.0)  # the UGV may come this much later
-        tail, index = bypass(self.road, self.nodes[head:], ahead, max(spare, 0.0) * self.spec.speed)
+        tail, index = bypass(self.road, self.nodes[head:], ahead, max(spare, 0.0) * self.spec.speed, self._ctp_path_fn())
         index = np.concatenate([np.arange(head), head + np.where(index >= 0, index, -head - 1)])
         before = np.maximum.accumulate(index)  # the new index of the last kept old index up to each one
         self.nodes = self.nodes[:head] + tail
@@ -339,8 +404,8 @@ class TimedRouteUgv(BookingRobot):
             cand = [(np.arange(lo, hi + 1), np.asarray(self.nodes[lo:hi + 1], dtype=int), arr[lo:hi + 1], None)]
             a = max(lo - 1, head)
             if a < j0:
-                path, length = self.road.shortest_path(self.nodes[a], self.nodes[j0])
-                if path and length < self.road.path_length(self.nodes[a:j0 + 1]) - 1.0:
+                path, _ = self._path(self.nodes[a], self.nodes[j0])
+                if path and self.road.path_length(path) < self.road.path_length(self.nodes[a:j0 + 1]) - 1.0:
                     dep = arr[a + 1] - dist(pos[self.nodes[a]], pos[self.nodes[a + 1]]) / self.spec.speed
                     legs = np.hypot(*np.diff(pos[path], axis=0).T)
                     t_path = dep + np.concatenate([[0.0], np.cumsum(legs)]) / self.spec.speed
@@ -372,7 +437,8 @@ class TimedRouteUgv(BookingRobot):
             if path is not None:  # take the shortest way to the landing node
                 self._splice(a, j0, path)
                 self.target, self.sent_path = head, None
-            self.stops.setdefault(j, []).append(land)
+            sts = self.stops.setdefault(j, [])  # (before its own take-off, which a re-route may have put here)
+            sts.insert(next((k for k, st in enumerate(sts) if st["kind"] == TAKEOFF and st["uav"] == u), len(sts)), land)
             self._set_landing(b, land, j, tm, spare - c)
             self._pull_takeoffs(s, now)
             arr = self._times(s, now)
@@ -605,11 +671,13 @@ class TimedRouteUgv(BookingRobot):
     def _step(self, s: RobotState, now: float, obs: RobotObservation, cmds: list) -> None:
         if self.planner is None:
             return
+        self.now = now
         self._track(s, now)
         self._handle_events(obs, now)
         self._handle_messages(obs, s, now, cmds)
         self.standby |= {rid for rid, p in self.peers.items() if p.get("standby")}
         self._check_map(s, now)
+        self._look(s.position, self.spec.sensor.range_m)
         for rid, p in self.peers.items():
             if p["type"] == RobotType.UAV.value and p["mode"] == RobotMode.DEPLETED.value and rid not in self.lost:
                 self.lost.add(rid)
@@ -667,11 +735,16 @@ class TimedRouteUgv(BookingRobot):
             self._accept(msg.payload, s, now)
 
     def _give_up_late(self, s: RobotState, now: float) -> None:
-        """At a landing stop whose UAV is long overdue: drop its booking and drive on."""
+        """At a landing stop whose UAV is long overdue, or whose landing started long ago and never
+        ended (the UAV ran out of energy on the way down, and a depleted UAV sends nothing): drop
+        its booking and drive on."""
         here = self.stops.get(self.cur, [])
-        if here and here[0]["kind"] == LAND and "started" not in here[0] \
-                and now > here[0]["ready"] + here[0]["slack"] + self.cfg.max_late_s:
-            self._drop(here[0]["uav"])
+        if not here or here[0]["kind"] != LAND:
+            return
+        st = here[0]
+        due = st["started"] + self.setup.docking.dock_duration_s if "started" in st else st["ready"] + st["slack"]
+        if now > due + self.cfg.max_late_s:
+            self._drop(st["uav"])
 
     def _maybe_pursue(self, s: RobotState, now: float) -> None:
         """Route the UGV past a sighting: right away if the detour keeps every UAV still to land
@@ -685,7 +758,7 @@ class TimedRouteUgv(BookingRobot):
         if not (at_node and self._detour_now(s.node, xy)):
             keep = max(self._pin(), self.cur + 1, self.target)
             del self.nodes[keep + 1:]
-            self.nodes += [int(n) for n in pursuit_path(self.road, xy, self.nodes[keep])[1:]]
+            self.nodes += [int(n) for n in pursuit_path(self.road, xy, self.nodes[keep], self._path)[1:]]
             self.pursuit_end = len(self.nodes) - 1
         self.pursuit = "planned"
         self.version += 1
@@ -693,12 +766,12 @@ class TimedRouteUgv(BookingRobot):
 
     def _detour_now(self, src: int, xy) -> bool:
         """Drive via the sighting to the next stop, if no UAV still to land waits past its slack."""
-        path = [int(n) for n in pursuit_path(self.road, xy, src)]
+        path = [int(n) for n in pursuit_path(self.road, xy, src, self._path)]
         nxt = min((i for i, st in self.stops.items() if st and i > self.cur), default=None)
         if nxt is None:  # no stops ahead: the detour replaces the route
             self.nodes = self.nodes[:self.cur] + path
         else:
-            back, _ = self.road.shortest_path(path[-1], self.nodes[nxt])
+            back, _ = self._path(path[-1], self.nodes[nxt])
             detour = path + [int(n) for n in back[1:]]
             delay = (self.road.path_length(detour) - self.road.path_length(self.nodes[self.cur:nxt + 1])) \
                 / self.spec.speed
@@ -752,3 +825,10 @@ class TimedRouteUgv(BookingRobot):
             out["plan"] = self._plan_payload(s, now)
             self.sent_revision, self.sent_at = self.revision, now
         return out
+
+
+class CtpRouteUgv(TimedRouteUgv):
+    """``ugv_timed_route`` planning its way on the road with the Canadian Traveller's Problem policy."""
+
+    name = "ugv_ctp_route"
+    config_cls = UgvCtpRouteConfig
