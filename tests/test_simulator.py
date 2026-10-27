@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from conftest import make_line_scenario
-from marsupial_search.core import Dock, DockingSpec, EventType, FollowPath, GoToPoint, Hold, RobotMode, RobotType, Undock
+from marsupial_search.core import (Dock, DockingSpec, EventType, FollowPath, GoToPoint, Hold, Layer, RobotMode, RobotType,
+                                   Undock)
 from marsupial_search.sim import SimConfig, Simulator
 
 
@@ -201,3 +202,41 @@ def test_urban_needs_both_robot_types():
 
     _run(sim, {"ugv0": FollowPath(tuple(range(0, 16)))}, 200)
     assert sim.truth_belief.mass[:, cell[0], cell[1]].sum() == pytest.approx(0.0)
+
+
+def _ground_seeing_uav(sc, p):
+    """``sc`` with uav0 seeing urban street level with probability ``p`` per look."""
+    spec = sc.robots["uav0"]
+    sensor = dataclasses.replace(spec.sensor, layer_p_detect=((Layer.GROUND, p),))
+    return dataclasses.replace(sc, robots={**sc.robots, "uav0": dataclasses.replace(spec, sensor=sensor)})
+
+
+def test_a_partial_look_is_one_per_pass():
+    sc = _ground_seeing_uav(make_line_scenario(urban_right_half=True, target_xy=(25.0, 25.0)), 0.5)
+    sim = Simulator(sc, SimConfig(terminate_on=()))
+    _launch(sim)
+    r, c = sc.grid.world_to_cell(725.0, 725.0)
+    init = sim.truth_belief.initial_mass[Layer.GROUND, r, c]
+    _run(sim, {"uav0": GoToPoint((725.0, 725.0))}, 120)  # fly there and hover: still one pass
+    assert sim.truth_belief.mass[Layer.AERIAL, r, c] == 0.0
+    assert sim.truth_belief.mass[Layer.GROUND, r, c] == pytest.approx(0.5 * init)
+    _run(sim, {"uav0": GoToPoint((725.0, 900.0))}, 30)  # out of range, and back: a second pass
+    _run(sim, {"uav0": GoToPoint((725.0, 725.0))}, 30)
+    assert sim.truth_belief.mass[Layer.GROUND, r, c] == pytest.approx(0.25 * init)
+
+
+@pytest.mark.parametrize("p", [0.0, 0.5, 1.0])
+def test_a_street_level_target_is_rolled_for_once_per_pass(p):
+    sc = make_line_scenario(urban_right_half=True, target_xy=(725.0, 725.0))
+    sc = _ground_seeing_uav(dataclasses.replace(sc, target_layer=Layer.GROUND), p)
+    sighted = 0
+    for seed in range(40):
+        sim = Simulator(sc, SimConfig(terminate_on=(), seed=seed))
+        _launch(sim)
+        _run(sim, {"uav0": GoToPoint((725.0, 725.0))}, 120)  # about 60 s hovering over it
+        events = [e.type for e in sim.events]
+        sighted += EventType.TARGET_SIGHTED in events
+    if p in (0.0, 1.0):
+        assert sighted == 40 * p
+    else:  # a roll per step while hovering would sight it nearly every time
+        assert 10 <= sighted <= 30

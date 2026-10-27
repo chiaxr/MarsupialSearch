@@ -75,7 +75,9 @@ class FleetConfig:
     """The marsupial team: one UGV (``ugv0``) and two UAVs that share its dock. ``uav0``
     starts docked on the UGV; ``uav1`` starts airborne, hovering over it. The UAVs share a
     speed and battery; ``uav_sensor_ranges`` gives a UAV its own sensor range (e.g. a UAV
-    flying lower sees a smaller footprint)."""
+    flying lower sees a smaller footprint). A UAV sees the shared and aerial layers on every
+    look, and the ground layer (urban street level) with probability ``uav_ground_p_detect``
+    per look (``uav_ground_p_detects`` per UAV)."""
     ugv_speed: float = 5.0
     ugv_energy: EnergySpec = field(default_factory=lambda: EnergySpec(capacity=250_000, idle_power=2.0, energy_per_m=1.0))
     ugv_sensor_range: float = 55.0
@@ -83,9 +85,14 @@ class FleetConfig:
     uav_energy: EnergySpec = field(default_factory=lambda: EnergySpec(capacity=2_000, idle_power=1.0, energy_per_m=0.04))
     uav_sensor_range: float = 60.0
     uav_sensor_ranges: dict[str, float] = field(default_factory=dict)  # per UAV (uav0, uav1): overrides uav_sensor_range
+    uav_ground_p_detect: float = 0.0  # UAV detection probability per look at urban street level (0: unseen)
+    uav_ground_p_detects: dict[str, float] = field(default_factory=dict)  # per UAV: overrides uav_ground_p_detect
 
     def uav_range(self, rid: str) -> float:
         return self.uav_sensor_ranges.get(rid, self.uav_sensor_range)
+
+    def uav_ground_p(self, rid: str) -> float:
+        return self.uav_ground_p_detects.get(rid, self.uav_ground_p_detect)
 
 
 @dataclass
@@ -200,9 +207,10 @@ class _RoadBuilder:
 
 def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     cfg = cfg or ScenarioConfig()
-    unknown = set(cfg.fleet.uav_sensor_ranges) - set(UAV_IDS)
-    if unknown:
-        raise ValueError(f"fleet.uav_sensor_ranges: no UAV {sorted(unknown)}; the UAVs are {list(UAV_IDS)}")
+    for key in ("uav_sensor_ranges", "uav_ground_p_detects"):
+        unknown = set(getattr(cfg.fleet, key)) - set(UAV_IDS)
+        if unknown:
+            raise ValueError(f"fleet.{key}: no UAV {sorted(unknown)}; the UAVs are {list(UAV_IDS)}")
     rng = np.random.default_rng(cfg.seed)
     W, H = cfg.size_m
     grid = GridSpec(origin=(0.0, 0.0), resolution=cfg.cell_m, shape=(int(round(H / cfg.cell_m)), int(round(W / cfg.cell_m))))
@@ -689,7 +697,9 @@ def _make_fleet(cfg: ScenarioConfig, road: TraversabilityGraph, terrain, grid, r
     ugv_sensor = SensorSpec(range_m=f.ugv_sensor_range, visible_layers=(Layer.SHARED, Layer.GROUND))
     robots = {"ugv0": RobotSpec("ugv0", RobotType.UGV, f.ugv_speed, f.ugv_energy, ugv_sensor)}
     for rid in UAV_IDS:
-        uav_sensor = SensorSpec(range_m=f.uav_range(rid), visible_layers=(Layer.SHARED, Layer.AERIAL))
+        ground = ((Layer.GROUND, f.uav_ground_p(rid)),) if f.uav_ground_p(rid) > 0 else ()
+        uav_sensor = SensorSpec(range_m=f.uav_range(rid), visible_layers=(Layer.SHARED, Layer.AERIAL),
+                                layer_p_detect=ground)
         robots[rid] = RobotSpec(rid, RobotType.UAV, f.uav_speed, f.uav_energy, uav_sensor)
     init = {"ugv0": RobotInit(node=depot), "uav0": RobotInit(docked_on="ugv0"),
             "uav1": RobotInit(position=tuple(road.positions[depot]))}  # the dock takes one UAV at a time

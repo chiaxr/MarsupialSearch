@@ -4,8 +4,9 @@ import pathlib
 import numpy as np
 import pytest
 
-from marsupial_search.core import RobotType, Terrain, TraversabilityGraph
-from marsupial_search.sim import ScenarioConfig, generate_scenario
+from marsupial_search.core import Layer, RobotType, SensorSpec, Terrain, TraversabilityGraph
+from marsupial_search.sim import SCENARIO_BASES, ScenarioConfig, generate_scenario
+from marsupial_search.sim.generator import FleetConfig
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "marsupial_search"
 
@@ -71,6 +72,24 @@ def test_fleet_is_one_ugv_carrying_uav0_with_uav1_hovering_over_it(small_scenari
     assert sc.init["uav0"].docked_on == "ugv0"
     road = sc.graphs[RobotType.UGV]
     assert sc.init["uav1"].docked_on is None and sc.init["uav1"].position == tuple(road.positions[sc.init["ugv0"].node])
+
+
+def test_sensor_detection_per_layer():
+    s = SensorSpec(60.0, (Layer.SHARED, Layer.AERIAL), 0.9, layer_p_detect=((Layer.GROUND, 0.3),))
+    assert s.layer_p().tolist() == [0.9, 0.9, 0.3]
+    assert s.seen_layers == (0, 1, 2)
+    assert SensorSpec(60.0, (Layer.SHARED, Layer.AERIAL)).seen_layers == (int(Layer.SHARED), int(Layer.AERIAL))
+
+
+def test_uavs_see_street_level_only_with_a_ground_detection_probability():
+    cfg = SCENARIO_BASES["small"](0)
+    sc = generate_scenario(cfg)
+    assert all(sc.robots[r].sensor.layer_p()[Layer.GROUND] == 0 for r in ("uav0", "uav1"))
+    cfg.fleet = FleetConfig(uav_ground_p_detect=0.3, uav_ground_p_detects={"uav0": 0.5})
+    sc = generate_scenario(cfg)
+    assert [sc.robots[r].sensor.layer_p()[Layer.GROUND] for r in ("ugv0", "uav0", "uav1")] == [1.0, 0.5, 0.3]
+    with pytest.raises(ValueError, match="uav_ground_p_detects"):
+        generate_scenario(ScenarioConfig(fleet=FleetConfig(uav_ground_p_detects={"uav7": 0.5})))
 
 
 def test_semantic_prior_follows_labels_and_target_sits_on_a_label():

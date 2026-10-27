@@ -339,8 +339,8 @@ class JointPlannerController(MissionController):
         self.replans += 1
         ctx = self._context(S, now)
         P = self.P
-        if not ((P.F_road @ ctx.m0[P.ugv_layers].sum(0) > 0).any()
-                or (P.F_air @ ctx.m0[P.air_layers].sum(0) > 0).any()):
+        if not ((P.F_road @ P.seen(ctx.m0, P.p_ugv) > 0).any()
+                or (P.F_air @ P.seen(ctx.m0, P.p_air) > 0).any()):
             self._done = self.sighting is None or self.pursuit_done  # no searchable belief left
         starts = self._starts(ctx)
         warm = self._advance(ctx)
@@ -537,7 +537,7 @@ class JointPlannerController(MissionController):
         """Σ swept belief × (horizon end − time found), looks applied in time order."""
         P, h_end = self.P, min(ctx.h_end, t_dead)
         keep = arrive <= h_end
-        looks = [(P.F_road, R[keep], arrive[keep], arrive[keep], P.ugv_layers, P.p_ugv)]
+        looks = [(P.F_road, R[keep], arrive[keep], arrive[keep], P.p_ugv)]
         lam = self.cfg.sighting_delay_weight
         for s in sorties:
             if not s.tour:
@@ -546,17 +546,17 @@ class JointPlannerController(MissionController):
             found = t + lam * self._confirm_delay(R, arrive, nodes, t) if lam > 0 else t
             keep = found <= h_end
             Pu = self.PU[s.uav]
-            looks.append((Pu.F_air, nodes[keep], t[keep], found[keep], Pu.air_layers, Pu.p_air))
+            looks.append((Pu.F_air, nodes[keep], t[keep], found[keep], Pu.p_air))
         keys, order_t, w, p = [], [], [], []
-        for F, nodes, t, found, layers, pd in looks:
+        for F, nodes, t, found, pd in looks:
             if not len(nodes):
                 continue
             rep, cells = _gather(F, nodes)
-            for l in layers:
+            for l in np.flatnonzero(pd > 0):
                 keys.append(l * self.n_cells + cells)
                 order_t.append(t[rep])
                 w.append(h_end - found[rep])
-                p.append(np.full(len(cells), min(pd, 1 - 1e-12)))
+                p.append(np.full(len(cells), min(pd[l], 1 - 1e-12)))
         if not keys:
             return 0.0
         keys, order_t, w, p = map(np.concatenate, (keys, order_t, w, p))
@@ -788,7 +788,7 @@ class JointPlannerController(MissionController):
         P = self.P
         m = ctx.m0.copy()
         for n in plan.route:
-            P.sweep(m, P.F_road, n, P.ugv_layers, P.p_ugv)
+            P.sweep(m, P.F_road, n, P.p_ugv)
         cand = ctx.candidates.copy()
         cand[plan.route] = False
         src = plan.route[-1]
@@ -870,7 +870,7 @@ class JointPlannerController(MissionController):
         cand = np.asarray(self.air_graph.nodes_within(pts[rng.integers(len(pts))], self.cfg.insert_radius_m), int)
         if s.uav not in ctx.air_value:
             Pu = self.PU[s.uav]
-            ctx.air_value[s.uav] = np.asarray(Pu.F_air @ ctx.m0[Pu.air_layers].sum(0)).ravel()
+            ctx.air_value[s.uav] = np.asarray(Pu.F_air @ Pu.seen(ctx.m0, Pu.p_air)).ravel()
         val = ctx.air_value[s.uav][cand] if len(cand) else np.zeros(0)
         if val.sum() <= 0:
             return False
@@ -962,7 +962,7 @@ class JointPlannerController(MissionController):
         if not len(near):
             return False
         P = self.P
-        val = np.asarray(P.F_road[near] @ ctx.m0[P.ugv_layers].sum(0)).ravel() * ctx.candidates[near]
+        val = np.asarray(P.F_road[near] @ P.seen(ctx.m0, P.p_ugv)).ravel() * ctx.candidates[near]
         if val.sum() <= 0:
             return False
         w = int(near[rng.choice(len(near), p=val / val.sum())])

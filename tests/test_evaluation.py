@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 
 from marsupial_search.controllers import DEFAULT_TEAM, make_team
-from marsupial_search.core import EventType
+import dataclasses
+
+from marsupial_search.core import EventType, Layer
 from marsupial_search.sim import SCENARIO_BASES, SimConfig, Simulator, generate_scenario, resample_target
 from marsupial_search.sim import evaluation
 
@@ -53,6 +55,39 @@ def test_prediction_is_exact_when_the_ugv_gets_there_first(small):
             exact += 1
     assert exact >= 2
     assert evaluation.expected(T, evaluation.target_weights(sc)) <= free.time_s
+
+
+def test_first_look_is_first_contact(small):
+    sc, _, free = small
+    for rid in sc.robots:
+        cells, t = evaluation.look_events(sc, free, rid)
+        first = np.full(sc.grid.rows * sc.grid.cols, np.inf)
+        np.minimum.at(first, cells, t)
+        assert np.array_equal(first, evaluation.first_contact(sc, free, rid).ravel())
+
+
+def test_partial_ground_detection_predicts_between_never_and_always(small):
+    sc, cfg, free = small
+
+    def with_ground_p(p):
+        robots = {r: dataclasses.replace(s, sensor=dataclasses.replace(s.sensor, layer_p_detect=((Layer.GROUND, p),)))
+                  if s.robot_type.value == "uav" else s for r, s in sc.robots.items()}
+        return evaluation.predicted_find_times(dataclasses.replace(sc, robots=robots), free, cfg)
+
+    T0, Th, T1 = with_ground_p(0.0), with_ground_p(0.5), with_ground_p(1.0)
+    assert np.array_equal(T0, evaluation.predicted_find_times(sc, free, cfg))
+    g = int(Layer.GROUND)
+    assert np.array_equal(np.delete(Th, g, 0), np.delete(T0, g, 0))
+    # Per cell, the UAV looks before the UGV gets there: with one, sighted on it or never, half each.
+    found = evaluation.first_contact(sc, free, "ugv0").ravel()
+    n = np.zeros(found.size, dtype=int)
+    for rid in ("uav0", "uav1"):
+        cells, t = evaluation.look_events(sc, free, rid)
+        np.add.at(n, cells[t < found[cells]], 1)
+    n = n.reshape(T0[g].shape)
+    assert np.array_equal(Th[g][n == 0], T0[g][n == 0])
+    assert (n == 1).any() and (n > 1).any()
+    assert np.allclose(Th[g][n == 1], 0.5 * T0[g][n == 1] + 0.5 * T1[g][n == 1])
 
 
 def test_compare_cv_runs(tmp_path):

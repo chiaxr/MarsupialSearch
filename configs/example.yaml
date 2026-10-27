@@ -268,6 +268,8 @@ scenario:
     uav_energy: {capacity: 2000, idle_power: 1.0, energy_per_m: 0.04}
     uav_sensor_range: 60.0           # m; sees the aerial and shared layers
     uav_sensor_ranges: {}            # per UAV, overriding uav_sensor_range, e.g. {uav0: 20, uav1: 50} (a UAV flying lower sees less)
+    uav_ground_p_detect: 0.0         # chance per pass that a UAV sees a target at urban street level (0: never)
+    uav_ground_p_detects: {}         # per UAV, overriding uav_ground_p_detect, e.g. {uav0: 0.5, uav1: 0.2}
   # dock
   docking:
     dock_duration_s: 30.0            # landing; the UGV must stand still

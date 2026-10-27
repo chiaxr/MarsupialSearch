@@ -20,8 +20,9 @@ Shared building blocks: `common.py` (search settings, sensor footprints, pursuit
 not yet seen).
 
 **What they optimise.** All of them score a place by the same quantity: the target probability
-(*belief*) still left inside a sensor footprint there. The UGV sees the ground and shared layers; a
-UAV sees the aerial and shared layers (see
+(*belief*) still left inside a sensor footprint there, each layer weighted by the chance a look
+detects it. The UGV sees the ground and shared layers; a UAV sees the aerial and shared layers,
+and street level with probability `fleet.uav_ground_p_detect` (default 0; see
 [Visibility layers](README.md#13-visibility-layers-urban-needs-both-robot-types)). Only the UGV can
 end the mission, so a UAV sighting is worth something only once the UGV drives over to confirm it.
 
@@ -165,8 +166,10 @@ within 1.5 km, else the nearest road node with belief left) and keeps it planned
 at least one landing slot per UAV, plus one, plus a full UAV flight ahead. After the pin, the
 route is re-planned on the current belief every 60 s.
 
-- *Sightings:* the UGV detours at once if no UAV still to land would wait past its hover
-  slack (60 s), and otherwise straight after the pin.
+- *Sightings:* the UGV detours at once, from the node it is at or driving to, if no UAV still
+  to land would wait past its hover slack (60 s). Otherwise it goes straight after the pin, and
+  checks the detour again at every node it gets to (and once a stop there is done) while a stop
+  still comes before the sighting.
 - *A missing UAV:* the UGV drops a landing 120 s after the UAV's slack runs out, or 120 s after a
   landing that started should have ended (the UAV ran out of energy on the way down: it sends nothing more).
 - *Recovery (a landing the UGV can't make):* when the UAV can no longer afford to wait for the

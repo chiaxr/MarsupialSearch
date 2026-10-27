@@ -72,7 +72,7 @@ class FarScoutUav(GreedyTourUav):
         unit = None
         if cfg.recon_weight > 0:  # an average footprint's belief, before any weighing
             P = self.planner
-            v = P.F_air @ m[P.air_layers].sum(0)
+            v = P.F_air @ P.seen(m, P.p_air)
             unit = float(v[v > 0].mean()) if (v > 0).any() else 0.0
         w = np.ones(m.shape[1])
         pos = self.road.positions

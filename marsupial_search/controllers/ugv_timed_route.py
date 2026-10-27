@@ -16,9 +16,10 @@ Broadcast
     The route, its arrival times and the queue (with each booked tour) in its ``"status"``
     when they change, and every ``route_resend_s``.
 Sightings
-    The UGV drives past a sighting when the detour delays its next stops by no more than the
-    hover slack of every UAV still to land; until then it re-checks at every node, and
-    otherwise goes straight after the pin.
+    The UGV drives past a sighting at once, from the node it is at or driving to, when the
+    detour delays its next stops by no more than the hover slack of every UAV still to land.
+    Otherwise it goes there straight after the pin, and re-checks the detour at every node it
+    gets to (and once a stop there is done) while a stop still comes before the sighting.
 Road-map changes
     Found by the UGV or reported by a UAV. New roads are used from the next re-plan. If the
     route runs into a blocked node, it goes round it at once: by the shortest way back to the
@@ -141,6 +142,7 @@ class TimedRouteUgv(BookingRobot):
         self.lost: set[str] = set()
         self.pursuit = "none"  # none -> planned (route goes past the sighting) -> done (passed it)
         self.pursuit_end = 0  # route index where the pursuit path ends
+        self.pursuit_check: Optional[tuple] = None  # pursuit planned after the pin: where the detour was last checked
         self.swap_until = -np.inf  # a docked UAV's battery swap ends then (held for, without swap_while_moving)
         self.swap_end: dict[str, float] = {}  # UAV -> when the battery swap after its last landing ends
         self.standby: set[str] = set()  # UAVs that stay on the dock until called (they say so in their status)
@@ -227,7 +229,7 @@ class TimedRouteUgv(BookingRobot):
             P = self.planner
             m = P.searchable_mass(self.belief)
             for n in self.nodes[self.cur:]:  # what the route will sweep anyway
-                P.sweep(m, P.F_road, n, P.ugv_layers, P.p_ugv)
+                P.sweep(m, P.F_road, n, P.p_ugv)
             cand = ~self.road_visited[:self.road.n_nodes]
             cand[self.nodes[self.cur:]] = False
             claim = np.full(P.air.n_nodes, np.inf)
@@ -690,8 +692,7 @@ class TimedRouteUgv(BookingRobot):
         cut = near[d1[near] - d0[near] >= cfg.call_gain_m]
         if not len(cut):
             return None
-        layers = [int(l) for l in uav.sensor.visible_layers]
-        m = P.searchable_mass(self.belief)[layers].sum(0) * uav.sensor.p_detect
+        m = P.seen(P.searchable_mass(self.belief), uav.sensor.layer_p())
 
         def mass(nodes):
             return float(m[np.unique(P.F_road[nodes].indices)].sum()) if len(nodes) else 0.0
@@ -761,8 +762,7 @@ class TimedRouteUgv(BookingRobot):
             # no searchable belief left for either type (UAVs may still be flying)
             P = self.planner
             m = P.searchable_mass(self.belief)
-            self._done = not any((F @ m[layers].sum(0) > 0).any()
-                                 for F, layers in ((P.F_road, P.ugv_layers), (P.F_air, P.air_layers)))
+            self._done = not any((F @ P.seen(m, p) > 0).any() for F, p in ((P.F_road, P.p_ugv), (P.F_air, P.p_air)))
         else:
             self._done = False
 
@@ -814,46 +814,67 @@ class TimedRouteUgv(BookingRobot):
 
     def _maybe_pursue(self, s: RobotState, now: float) -> None:
         """Route the UGV past a sighting: right away if the detour keeps every UAV still to land
-        within its slack, otherwise straight after the last promised stop (so no booking moves)."""
+        within its slack, otherwise straight after the last promised stop (so no booking moves),
+        re-checking the detour at every node it gets to while a stop still comes before it."""
         if self.pursuit == "planned" and self.cur >= self.pursuit_end:
             self.pursuit = "done"  # drove past it without confirming
-        if not self.cfg.pursue_sightings or self.belief.detection_xy is None or self.pursuit != "none":
+        if not self.cfg.pursue_sightings or self.belief.detection_xy is None or self.pursuit == "done":
+            return
+        if self.pursuit == "planned" and self.pursuit_check is None:
             return
         xy = self.belief.detection_xy
-        at_node = s.node is not None and s.node == self.nodes[self.cur] and not self.stops.get(self.cur)
-        if not (at_node and self._detour_now(s.node, xy)):
+        at_node = s.node is not None and s.node == self.nodes[self.cur]
+        head = min(self.cur if at_node else self.cur + 1, len(self.nodes) - 1)  # the node it is at, or driving to
+        free = not self.stops.get(head)
+        if self.pursuit == "planned":  # planned after the pin: is the detour now worth it?
+            if not any(st and head <= i < self.pursuit_end for i, st in self.stops.items()):
+                self.pursuit_check = None  # no stop left before it: it is on its way there
+                return
+            if (head, free, self.version) == self.pursuit_check:
+                return
+            self.pursuit_check = (head, free, self.version)
+            if not (free and self._detour_now(head, xy)):
+                return
+            del self.nodes[max(self._pin(), self.cur + 1, self.target, self.pursuit_end) + 1:]  # the pursuit after the pin
+            self.pursuit_check = None
+            self._extend(now, s)
+        elif free and self._detour_now(head, xy):
+            self.pursuit_check = None
+        else:
             keep = max(self._pin(), self.cur + 1, self.target)
             del self.nodes[keep + 1:]
             self.nodes += [int(n) for n in pursuit_path(self.road, xy, self.nodes[keep], self._path)[1:]]
             self.pursuit_end = len(self.nodes) - 1
+            self.pursuit_check = ()  # check the detour from the next step on
         self.pursuit = "planned"
         self.version += 1
         self.revision += 1
 
-    def _detour_now(self, src: int, xy) -> bool:
-        """Drive via the sighting to the next stop, if no UAV still to land waits past its slack."""
-        path = [int(n) for n in pursuit_path(self.road, xy, src, self._path)]
-        nxt = min((i for i, st in self.stops.items() if st and i > self.cur), default=None)
+    def _detour_now(self, at: int, xy) -> bool:
+        """Drive from route index ``at`` via the sighting to the next stop, if no UAV still to
+        land waits past its slack."""
+        path = [int(n) for n in pursuit_path(self.road, xy, self.nodes[at], self._path)]
+        nxt = min((i for i, st in self.stops.items() if st and i > at), default=None)
         if nxt is None:  # no stops ahead: the detour replaces the route
-            self.nodes = self.nodes[:self.cur] + path
+            self.nodes = self.nodes[:at] + path
         else:
             back, _ = self._path(path[-1], self.nodes[nxt])
             detour = path + [int(n) for n in back[1:]]
-            delay = (self.road.path_length(detour) - self.road.path_length(self.nodes[self.cur:nxt + 1])) \
+            delay = (self.road.path_length(detour) - self.road.path_length(self.nodes[at:nxt + 1])) \
                 / self.spec.speed
             slack = min((st["slack"] for sts in self.stops.values() for st in sts if st["kind"] == LAND),
                         default=np.inf)
             if delay > slack:
                 return False
-            shift = len(detour) - 1 - (nxt - self.cur)
-            self.nodes = self.nodes[:self.cur] + detour + self.nodes[nxt + 1:]
+            shift = len(detour) - 1 - (nxt - at)
+            self.nodes = self.nodes[:at] + detour + self.nodes[nxt + 1:]
             self.stops = {(i + shift if i >= nxt else i): st for i, st in self.stops.items()}
             for b in self.bookings.values():
                 b["land_idx"] += shift if b["land_idx"] >= nxt else 0
                 if b["off_idx"] is not None and b["off_idx"] >= nxt:
                     b["off_idx"] += shift
                 b["t_land"] += max(delay, 0.0)
-        self.pursuit_end = self.cur + len(path) - 1
+        self.pursuit_end = at + len(path) - 1
         return True
 
     def _drive(self, s: RobotState, now: float, cmds: list) -> None:

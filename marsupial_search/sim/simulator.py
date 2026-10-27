@@ -10,7 +10,10 @@ Per step (``dt`` seconds), in order:
 5. advance manoeuvres in progress, aborting any whose host UGV moved;
 6. drain energy and swap the batteries of docked UAVs, marking robots that run out as DEPLETED;
 7. sense: emit a :class:`LocalBeliefUpdate` per sensing robot and check the target, and a
-   :class:`TraversabilityUpdate` per robot that sees road-map mismatches it had not seen;
+   :class:`TraversabilityUpdate` per robot that sees road-map mismatches it had not seen. Each
+   pass is one look: for a layer seen with probability < 1 the update covers only the cells that
+   entered the footprint this step, and a sighting is rolled once per pass over the target and
+   holds while it stays in view;
 8. radio: queue this step's ``Transmit`` commands and deliver messages that are due.
 
 Robots are given the prior road map (``Scenario.graphs``); the UGV drives on the true one
@@ -30,7 +33,6 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from marsupial_search.core import (
-    N_LAYERS,
     BeliefMap,
     Command,
     Dock,
@@ -278,11 +280,15 @@ class Simulator:
                 uav.pos = ugv.pos.copy()
                 uav.last_node = uav.graph.nearest_node(uav.pos)
 
-        self._layer_vis = {}
-        for rid, spec in sc.robots.items():
-            vis = np.zeros(N_LAYERS)
-            vis[[int(l) for l in spec.sensor.visible_layers]] = spec.sensor.p_detect
-            self._layer_vis[rid] = vis
+        self._layer_vis = {rid: spec.sensor.layer_p() for rid, spec in sc.robots.items()}
+        # One look per pass: a cell gets a look when it enters a footprint, and the target one
+        # roll per pass, whose outcome holds while it stays in view. Layers seen for certain are
+        # looked at every step, as repeating a certain look changes nothing: a robot that missed
+        # another's update over the radio still hears the cells it keeps in view.
+        self._detect_rng = np.random.default_rng([cfg.seed, 2])
+        self._view: dict[str, Optional[tuple[int, int, np.ndarray]]] = {rid: None for rid in sc.robots}  # looked, in view
+        self._target_in_view = {rid: False for rid in sc.robots}
+        self._target_seen = {rid: False for rid in sc.robots}
 
         self._terrain_masks = {t: sc.terrain == int(t) for t in Terrain if (sc.terrain == int(t)).any()}
         self._log: dict[str, list] = {"t": [], "searched_prob": []}
@@ -549,12 +555,17 @@ class Simulator:
         sc, grid = self.scenario, self.scenario.grid
         updates = []
         for r in self.robots.values():
-            if r.mode != RobotMode.ACTIVE:
-                continue  # depleted, or a UAV that is not airborne
+            if r.mode != RobotMode.ACTIVE:  # depleted, or a UAV that is not airborne
+                self._view[r.rid], self._target_in_view[r.rid] = None, False  # back in the air: a new pass
+                continue
             rng_m = r.spec.sensor.range_m
             row0, col0, mask = grid.disk_window(r.pos[0], r.pos[1], rng_m)
-            p = self._layer_vis[r.rid][:, None, None] * mask[None, :, :]
+            new = mask & ~self._in_view_last_step(r.rid, row0, col0, mask)
+            vis = self._layer_vis[r.rid][:, None, None]
+            p = vis * np.where(vis >= 1, mask, new)  # a certain look may repeat: it cannot double-count
             in_range = np.hypot(*(self._target_center - r.pos)) <= rng_m
+            entering = in_range and not self._target_in_view[r.rid]
+            self._target_in_view[r.rid] = in_range
             detected = False
             if in_range:
                 if r.spec.robot_type in self.config.terminate_on:
@@ -564,10 +575,15 @@ class Simulator:
                         self._emit(EventType.TARGET_FOUND, r.rid)
                         self._finish("found")
                 else:
-                    pd = self._layer_vis[r.rid][int(sc.target_layer)]
-                    if pd > 0 and self.rng.random() < pd:
+                    if entering:
+                        pd = self._layer_vis[r.rid][int(sc.target_layer)]
+                        self._target_seen[r.rid] = pd >= 1 or (pd > 0 and self._detect_rng.random() < pd)
+                    if self._target_seen[r.rid]:
                         detected = True
                         self._emit(EventType.TARGET_SIGHTED, r.rid)
+            # A sighting's update carries no looks (BeliefMap.apply skips it): the cells that came
+            # into view get theirs on the next step without one.
+            self._view[r.rid] = (row0, col0, mask & ~new if detected else mask)
             upd = LocalBeliefUpdate(
                 robot_id=r.rid,
                 robot_type=r.spec.robot_type,
@@ -581,6 +597,19 @@ class Simulator:
             self.truth_belief.apply(upd)
             updates.append(upd)
         return updates
+
+    def _in_view_last_step(self, rid: str, row0: int, col0: int, mask: np.ndarray) -> np.ndarray:
+        """Which cells of this footprint window were in robot ``rid``'s footprint last step and had
+        their look."""
+        out = np.zeros_like(mask)
+        if self._view[rid] is None:
+            return out
+        r0, c0, m0 = self._view[rid]
+        ra, rb = max(row0, r0), min(row0 + mask.shape[0], r0 + m0.shape[0])
+        ca, cb = max(col0, c0), min(col0 + mask.shape[1], c0 + m0.shape[1])
+        if ra < rb and ca < cb:
+            out[ra - row0:rb - row0, ca - col0:cb - col0] = m0[ra - r0:rb - r0, ca - c0:cb - c0]
+        return out
 
     def _sense_map(self) -> list[TraversabilityUpdate]:
         """Road-map mismatches each active robot sees (or ran into) for the first time: blocked nodes,

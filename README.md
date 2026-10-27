@@ -80,7 +80,7 @@ any scenario without exactly one UGV.
 |---|---|---|
 | start | a random non-urban road node | `uav0` docked on the UGV; `uav1` hovering over it |
 | motion | road graph only, 5 m/s; road nodes at most 55 m apart (the sensor range) | free, 10 m/s, between nodes of an 85 m UAV grid (√2 × the sensor range: the widest square grid whose footprints leave no gaps) or to any point |
-| sensor | 55 m disk; ground and shared layers | 60 m disk; aerial and shared layers (per UAV: `fleet.uav_sensor_ranges`, e.g. `{uav0: 20, uav1: 50}` for a low and a high UAV; the UAV grid then follows the smaller) |
+| sensor | 55 m disk; ground and shared layers | 60 m disk; aerial and shared layers (per UAV: `fleet.uav_sensor_ranges`, e.g. `{uav0: 20, uav1: 50}` for a low and a high UAV; the UAV grid then follows the smaller), and street level with probability `fleet.uav_ground_p_detect` per pass (default 0; per UAV: `fleet.uav_ground_p_detects`) |
 | energy | 250 000 units; 2.0 /s + 1.0 /m | 2000 units; 1.0 /s (hovering included) + 0.04 /m, so 1.4 /s at full speed |
 | endurance | about 10 h of driving (`small` base: 17 000 units, about 40 min) | about 24 min flying (14 km), 33 min hovering |
 
@@ -113,7 +113,7 @@ is depleted, or at the 6 h limit.
 | Docking | UAV within `dock_tolerance_m` of the UGV, which has not moved this step and has its dock free. Landing takes `dock_duration_s`; the dock **aborts** if the UGV moves during it. One UAV at a time. |
 | Docked | UAV rides with the UGV and draws no power. Its battery is swapped for a full one in `swap_duration_s`, while the UGV drives or (with `swap_while_moving: false`) only while it stands still. A docked UAV's `mode_time_remaining` is what is left of its swap. |
 | Undocking | take-off takes `undock_duration_s`; it **aborts** if the UGV moves during it, and is rejected while the swap is in progress |
-| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Road-map mismatches in range come as a `TraversabilityUpdate`. |
+| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Each pass over a cell is one look: a layer seen with probability `p < 1` gets its look when the cell enters the footprint, not again while it stays in view, and the target is rolled for once per pass (hovering over it does not help). Road-map mismatches in range come as a `TraversabilityUpdate`. |
 | Termination | `TARGET_FOUND` when the target is inside the sensor range of a robot whose type is in `SimConfig.terminate_on` (default: UGV only; perfect, distance-only test). Other robots report `TARGET_SIGHTED`. Other outcomes: `ugv_depleted` (`stop_when_ugv_depleted`, on by default), `all_depleted`, `controller_done`, `timeout`. |
 
 ### 1.3 Visibility layers ("urban needs both robot types")
@@ -122,11 +122,14 @@ Each cell's probability mass is split across visibility layers (`marsupial_searc
 
 * road / vegetation: 100 % `SHARED` (seen by either type)
 * urban: `urban_aerial_fraction` (default 50 %) `AERIAL` (rooftops, courtyards, seen only
-  by UAVs) and the rest `GROUND` (street level, seen only by the UGV)
+  by UAVs) and the rest `GROUND` (street level, seen by the UGV, and by UAVs only with
+  `fleet.uav_ground_p_detect` > 0)
 
 A UAV pass therefore halves an urban cell's mass, and the cell only reaches zero
 once the UGV has also passed within range. The belief update is Bayesian:
-`mass *= 1 - p_detect` over the footprint.
+`mass *= 1 - p_detect` over the footprint, per layer (`SensorSpec.layer_p()`). With
+`uav_ground_p_detect: 0.3`, a UAV pass leaves 35 % of an urban cell's mass (its street-level
+half × 0.7) instead of 50 %.
 
 ### 1.4 Radio channel
 
@@ -467,9 +470,10 @@ of `T`, the more `cv` gains. Use `plain`, or `cv` with more `targets`, when:
   or real quantiles, which `cv` only has from 2 missions per map;
 * the prediction is poor (`sd(T-T̂)` close to the spread of `T`), for example a team that is slow
   to confirm sightings;
-* the target-free run no longer replays the missions up to first contact: imperfect sensors
-  (`p_detect < 1`), energy-estimate noise, or controllers that randomise. `cv` stays unbiased but
-  removes less variance;
+* the target-free run no longer replays the missions up to first contact: energy-estimate noise,
+  or controllers that randomise. `cv` stays unbiased but removes less variance. Imperfect sensors
+  (`p_detect < 1`, such as `uav_ground_p_detect`) are fine: a missed look reads the same as an
+  empty cell, and `T̂` is the expectation over which pass, if any, sights the target;
 * you are checking `cv` itself: run both on the same maps and compare the means.
 
 ```bash
@@ -493,16 +497,21 @@ python scripts/compare.py --config configs/small_car.yaml
 | map | team | expected | median | p90 | vs `joint_planner` (paired by map) |
 |---|---|---|---|---|---|
 | `large` | `joint_planner` | **56.4 ± 3.7** | 45.8 | 113.5 | |
-| `large` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 78.2 ± 6.8 | 56.8 | 149.0 | +21.9 ± 5.2 |
+| `large` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 72.4 ± 4.5 | 55.7 | 138.0 | +16.1 ± 3.4 |
 | `small` | `joint_planner` | **6.7 ± 0.8** | 5.6 | 13.6 | |
-| `small` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 9.9 ± 1.8 | 6.4 | 14.9 | +3.3 ± 1.7 |
+| `small` | `ugv_timed_route+uav_greedy_tour+uav_greedy_tour` | 7.9 ± 1.1 | 6.5 | 15.5 | +1.2 ± 0.7 |
 
-Every mission found the target; no UAV was lost and no landing or take-off aborted. The default
-team relays the robots' status (`relay`, on by default); before it did, it took 75.6 ± 5.9 min on
-`large` (relaying: +2.6 ± 2.6 min paired by map, within noise) and the same on `small`.
+Every mission found the target; no UAV was lost and no landing or take-off aborted. Before the
+UGV re-checked its detour to a sighting at every node (it used to check only once, when it heard
+of the sighting, and otherwise went there after its last promised stop), the default team took
+78.2 ± 6.8 min on `large` and 9.9 ± 1.8 on `small` (−5.8 ± 2.8 and −2.0 ± 1.3 min since, paired
+by map; −3.9 ± 1.0 min on 20 `small` maps); the results after this table predate that change.
+The default team relays the robots' status (`relay`, on by default); before it did, it took
+75.6 ± 5.9 min on `large` (relaying: +2.6 ± 2.6 min paired by map, within noise) and the same on
+`small`.
 
-- **Joint planning is worth about 20 min on `large`** against the per-robot policies, and its
-  tail is shorter (p90 114 against 149 min). The oracle needs no radio, so part of the gap could
+- **Joint planning is worth about 16 min on `large`** against the per-robot policies, and its
+  tail is shorter (p90 114 against 138 min). The oracle needs no radio, so part of the gap could
   be information; but the default team was no faster with the default 2 km range (79.7 ± 6.0 min
   on `large`, 9.9 ± 1.8 on `small`, before relaying), so the gap is mostly planning.
 - **The default team copes with a short radio range.** At 300 m it receives about a quarter as

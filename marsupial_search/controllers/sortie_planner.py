@@ -43,11 +43,10 @@ class SortiePlanner:
         self._road_cells: dict[int, np.ndarray] = {}
         self.set_road(setup.graphs[RobotType.UGV])
         self.F_air = footprint_matrix(setup.grid, self.air, uav.sensor.range_m)
-        self.ugv_layers = [int(l) for l in ugv.sensor.visible_layers]
-        self.air_layers = [int(l) for l in uav.sensor.visible_layers]
-        self.common_layers = [l for l in self.air_layers if l in self.ugv_layers]  # seen by either robot
-        self.own_layers = [l for l in self.air_layers if l not in self.ugv_layers]  # seen only from the air
-        self.p_ugv, self.p_air = ugv.sensor.p_detect, uav.sensor.p_detect
+        self.p_ugv, self.p_air = ugv.sensor.layer_p(), uav.sensor.layer_p()  # detection per look, per layer
+        air = uav.sensor.seen_layers
+        self.common_layers = [l for l in air if self.p_ugv[l] > 0]  # seen by either robot
+        self.own_layers = [l for l in air if self.p_ugv[l] == 0]  # seen only from the air
 
     def for_uav(self, uav: RobotSpec) -> "SortiePlanner":
         """This planner for another UAV (its own sensor footprints and energy model); itself if the
@@ -81,13 +80,20 @@ class SortiePlanner:
 
     # ---------------------------------------------------------------- sweeping
     @staticmethod
-    def sweep(m: np.ndarray, F, node: int, layers: list[int], p: float) -> float:
-        """Apply one look from ``node`` to ``m`` in place; returns the belief swept."""
+    def sweep(m: np.ndarray, F, node: int, p: np.ndarray) -> float:
+        """Apply one look from ``node`` (detection ``p`` per layer) to ``m`` in place; returns the
+        belief swept."""
         cells = F.indices[F.indptr[node]:F.indptr[node + 1]]
-        win = m[np.ix_(layers, cells)]
-        gained = float(win.sum()) * p
-        m[np.ix_(layers, cells)] = win * (1.0 - p)
-        return gained
+        layers = np.flatnonzero(p > 0)
+        win = m[np.ix_(layers, cells)] * p[layers, None]
+        m[np.ix_(layers, cells)] -= win
+        return float(win.sum())
+
+    @staticmethod
+    def seen(m: np.ndarray, p: np.ndarray) -> np.ndarray:
+        """Belief per cell one look would sweep: ``Σ_l p[l] m[l]``."""
+        layers = np.flatnonzero(p > 0)
+        return (m[layers] * p[layers, None]).sum(0)
 
     def searchable_mass(self, belief: BeliefMap) -> np.ndarray:
         """Belief per (layer, cell) a sortie may search: a sighting keeps its mass, but a
@@ -122,11 +128,11 @@ class SortiePlanner:
         cfg, road, v = self.cfg, self.road, self.ugv.speed
         cand = candidates.copy()
         nodes, times = [src], [dist(start_xy, road.positions[src]) / v]
-        self.sweep(m, self.F_road, src, self.ugv_layers, self.p_ugv)
+        self.sweep(m, self.F_road, src, self.p_ugv)
         cand[src] = False
         cur = src
         while times[-1] < horizon_s:
-            value = self.F_road @ m[self.ugv_layers].sum(0) * self.p_ugv
+            value = self.F_road @ self.seen(m, self.p_ugv)
             d, pred = road.distances_from(cur, limit=cfg.belief_radius_m)
             ok = cand & np.isfinite(d) & (value > 0)
             if ok.any():
@@ -139,7 +145,7 @@ class SortiePlanner:
             if path_fn is not None and len(path) > 2:
                 if belief_weight > 0 and ok.any():
                     rate = value[best] / (d[best] + cfg.belief_distance_offset_m)
-                    share = self.F_road @ (m[self.ugv_layers].sum(0) * self.p_ugv / self._seers)
+                    share = self.F_road @ (self.seen(m, self.p_ugv) / self._seers)
                     path = path_fn(cur, path[-1], belief_weight / rate * share)[0] or path
                 else:
                     path = path_fn(cur, path[-1])[0] or path
@@ -158,12 +164,12 @@ class SortiePlanner:
         for n in path[1:]:
             times.append(times[-1] + dist(self.road.positions[nodes[-1]], self.road.positions[n]) / self.ugv.speed)
             nodes.append(n)
-            gained += self.sweep(m, self.F_road, n, self.ugv_layers, self.p_ugv)
+            gained += self.sweep(m, self.F_road, n, self.p_ugv)
             cand[n] = False
         return gained
 
     def _relocation_path(self, m, src: int, horizon_s: float, claim_eta: np.ndarray) -> list[int]:
-        a = np.where(claim_eta < np.inf, 0.0, self.F_air @ m[self.air_layers].sum(0) * self.p_air)
+        a = np.where(claim_eta < np.inf, 0.0, self.F_air @ self.seen(m, self.p_air))
         if not (a > 0).any():
             return []
         d, pred = self.road.distances_from(src, limit=0.5 * horizon_s * self.ugv.speed)
@@ -185,20 +191,21 @@ class SortiePlanner:
                    claim_eta: np.ndarray, t_off: float):
         """Greedy tour from ``start`` to ``end``: the next node has the best ``belief /
         (distance + offset)`` among those that leave enough range to reach ``end``. Collects
-        the most belief early, which matters for time to find. Shared-layer belief counts for
-        the UAV only in cells it reaches before the UGV route sweeps them (``t_ugv``); the team
-        value drops what both would sweep. ``claim_eta``: per UAV-grid node, when another UAV
+        the most belief early, which matters for time to find. Belief in layers both robots see
+        counts for the UAV only in cells it reaches before the UGV route sweeps them (``t_ugv``);
+        the team value drops what both would sweep. ``claim_eta``: per UAV-grid node, when another UAV
         reaches it (inf: unclaimed, -inf: claimed outright). Returns (rate, nodes, length, value),
         or None if ``end`` is out of range."""
-        cfg, p, v = self.cfg, self.p_air, self.uav.speed
+        cfg, v = self.cfg, self.uav.speed
         L0 = dist(start, end)
         if L_max < L0:
             return None
         rate = self._rate(tau, ugv_value)
-        own, common = m[self.own_layers].sum(0), m[self.common_layers].sum(0)
+        own, common = m[self.own_layers], m[self.common_layers]  # per layer: (layers, cells)
+        p_own, p_com = self.p_air[self.own_layers, None], self.p_air[self.common_layers, None]
+        p_both = p_com * self.p_ugv[self.common_layers, None]  # swept by both: counted twice
         t_ugv = np.where(t_ugv <= tau, t_ugv, np.inf)  # the UGV stops at k
-        mloc = own + common
-        value = self.F_air @ mloc * p
+        value = self.F_air @ ((own * p_own).sum(0) + (common * p_com).sum(0))
         pos = self.air.positions
         to_end = np.hypot(*(pos - end).T)
         direct = np.hypot(*(pos - start).T)
@@ -221,10 +228,10 @@ class SortiePlanner:
             cur = pts[c]
             cells = Fc.indices[Fc.indptr[c]:Fc.indptr[c + 1]]
             later = t_ugv[cells] > flown / v
-            overlap += float(common[cells][later & np.isfinite(t_ugv[cells])].sum()) * self.p_ugv
-            own[cells] *= 1.0 - p
-            common[cells] = np.where(later, common[cells] * (1.0 - p), common[cells])
-            vals = Fc @ (own + common * (t_ugv > flown / v)) * p
+            overlap += float((common[:, cells[later & np.isfinite(t_ugv[cells])]] * p_both).sum())
+            own[:, cells] *= 1.0 - p_own
+            common[:, cells] = np.where(later, common[:, cells] * (1.0 - p_com), common[:, cells])
+            vals = Fc @ ((own * p_own).sum(0) + (common * p_com).sum(0) * (t_ugv > flown / v))
             length = flown + float(to_end[c])
             r = rate(length, uav_value - overlap)
             if r > best[0] or cfg.fill_tours:

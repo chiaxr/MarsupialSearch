@@ -131,3 +131,28 @@ def test_reproducible_across_processes():
     outs = {subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                            env={**os.environ, "PYTHONHASHSEED": seed}).stdout for seed in ("1", "2")}
     assert len(outs) == 1, outs
+
+
+def test_a_pursuit_put_after_the_pin_takes_the_detour_once_it_fits(scenario):
+    sim = Simulator(scenario, SimConfig(terminate_on=()))
+    team = make_team(DEFAULT_TEAM)
+    obs = sim.reset()
+    team.reset(sim.setup)
+    ugv = team.robots["ugv0"]
+    ahead = lambda: sorted(i for i, st in ugv.stops.items() if st and i > ugv.cur + 1)
+    while not (len(ahead()) >= 2 and ahead()[0] > ugv.cur + 6 and obs.robots["ugv0"].moving):
+        obs = sim.step(team.step(obs))
+    nxt = ahead()[0]
+    sighting = ugv.nodes[nxt - 2]  # on the route before the next stop: the detour costs nothing
+    ugv.belief.detection_xy = tuple(ugv.road.positions[sighting])
+    calls, detour_now = [], ugv._detour_now
+    ugv._detour_now = lambda at, xy: calls.append(at) is None and len(calls) > 1 and detour_now(at, xy)
+    obs = sim.step(team.step(obs))  # the first check fails: it goes after the pin
+    assert ugv.pursuit == "planned" and ugv.pursuit_end > ugv._pin() and len(calls) == 1
+    for _ in range(300):
+        if ugv.pursuit_check is None:
+            break
+        obs = sim.step(team.step(obs))
+    assert ugv.pursuit_check is None and len(calls) >= 2
+    assert ugv.pursuit == "planned" and ugv.pursuit_end < ahead()[0]  # now before the next stop
+    assert sighting not in ugv.nodes[ugv._pin():]  # the pursuit after the pin is gone

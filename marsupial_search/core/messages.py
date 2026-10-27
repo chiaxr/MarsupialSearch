@@ -16,7 +16,7 @@ import numpy as np
 
 from .graph import TraversabilityGraph
 from .grid import GridSpec
-from .types import Layer, RobotMode, RobotType
+from .types import N_LAYERS, Layer, RobotMode, RobotType
 
 # --------------------------------------------------------------------------- specs
 
@@ -42,9 +42,26 @@ class EnergySpec:
 
 @dataclass(frozen=True)
 class SensorSpec:
+    """A disk sensor. Each pass over a cell (the cell entering the footprint) is one look, which
+    detects a target in layer ``l`` of the cell with probability ``layer_p()[l]``."""
+
     range_m: float
     visible_layers: tuple[Layer, ...]
-    p_detect: float = 1.0  # detection probability inside the footprint (1 = perfect)
+    p_detect: float = 1.0  # detection probability per look in visible_layers (1 = perfect)
+    layer_p_detect: tuple[tuple[Layer, float], ...] = ()  # per-layer overrides, e.g. ((Layer.GROUND, 0.3),)
+
+    def layer_p(self) -> np.ndarray:
+        """Detection probability per look, per layer: shape (N_LAYERS,)."""
+        p = np.zeros(N_LAYERS)
+        p[[int(l) for l in self.visible_layers]] = self.p_detect
+        for l, q in self.layer_p_detect:
+            p[int(l)] = q
+        return p
+
+    @property
+    def seen_layers(self) -> tuple[int, ...]:
+        """The layers this sensor can detect a target in (probability > 0)."""
+        return tuple(int(l) for l in np.flatnonzero(self.layer_p() > 0))
 
 
 @dataclass(frozen=True)
