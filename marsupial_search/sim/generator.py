@@ -12,9 +12,21 @@ UGV cannot drive on). Construction order:
    relative-neighbourhood graph (plus some Gabriel edges for loops).
 5. Merge near-duplicate nodes, subdivide long edges, keep the largest component,
    and rasterise the roads; every remaining non-urban cell is VEGETATION.
-6. Optionally, a prior road map that differs from the true network (``MapMismatch``):
+6. Optionally (``occlusion``), what hides the target and the roads from the sensors
+   (:class:`~marsupial_search.core.Occlusion`): tree cover over vegetation (smooth noise,
+   ``canopy_*``), part of it over the roads through it (``road_canopy``), and per town the
+   building height over street width (``urban_canyon``).
+7. Optionally, a prior road map that differs from the true network (``MapMismatch``):
    stretches of road missing from the map (``road_unmapped_fraction``) and road nodes that
-   cannot be traversed (``road_blocked_fraction``). The robots are given the prior map.
+   cannot be traversed (``road_blocked_fraction``). The robots are given the prior map. With
+   ``occlusion``, roads under trees are more likely to be missing from it.
+
+Layers: without occlusion, a town cell's mass is split between the aerial layer (roofs, seen
+from the air only: ``urban_aerial_fraction``) and the ground layer (street level); elsewhere
+it is all shared. With occlusion, the split follows the target class (``TARGET_VISIBILITY``)
+and the occlusion: outside towns, the canopy's share is in the ground layer (hidden from the
+air), the rest shared; in a town, the class's share on roofs is aerial, its share in the open
+shared, the rest street level (ground layer).
 
 The UGV graph is the road network; the UAV graph is an 8-connected grid over the
 whole map.
@@ -47,21 +59,25 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from scipy.ndimage import binary_dilation, gaussian_filter
+from scipy.ndimage import binary_dilation, convolve, gaussian_filter
 from scipy.sparse.csgraph import connected_components, minimum_spanning_tree
 from scipy.spatial import Delaunay, cKDTree
 
 from marsupial_search.core import (
+    AIR,
+    GROUND,
     N_LAYERS,
     DockingSpec,
     EnergySpec,
     GridSpec,
     Layer,
+    Occlusion,
     RobotSpec,
     RobotType,
     SensorSpec,
     Terrain,
     TraversabilityGraph,
+    detection_map,
 )
 
 from .scenario import MapMismatch, RobotInit, Scenario
@@ -77,7 +93,8 @@ class FleetConfig:
     speed and battery; ``uav_sensor_ranges`` gives a UAV its own sensor range (e.g. a UAV
     flying lower sees a smaller footprint). A UAV sees the shared and aerial layers on every
     look, and the ground layer (urban street level) with probability ``uav_ground_p_detect``
-    per look (``uav_ground_p_detects`` per UAV)."""
+    per look (``uav_ground_p_detects`` per UAV). A UAV with the ``"ground"`` viewpoint
+    (``uav_viewpoints``) flies at street level instead and sees what the UGV sees."""
     ugv_speed: float = 5.0
     ugv_energy: EnergySpec = field(default_factory=lambda: EnergySpec(capacity=250_000, idle_power=2.0, energy_per_m=1.0))
     ugv_sensor_range: float = 55.0
@@ -85,14 +102,23 @@ class FleetConfig:
     uav_energy: EnergySpec = field(default_factory=lambda: EnergySpec(capacity=2_000, idle_power=1.0, energy_per_m=0.04))
     uav_sensor_range: float = 60.0
     uav_sensor_ranges: dict[str, float] = field(default_factory=dict)  # per UAV (uav0, uav1): overrides uav_sensor_range
-    uav_ground_p_detect: float = 0.0  # UAV detection probability per look at urban street level (0: unseen)
+    # UAV detection probability per look at urban street level (None: 0, unseen; with occlusion, 1:
+    # the street canyon then sets the chance, core.visibility)
+    uav_ground_p_detect: Optional[float] = None
     uav_ground_p_detects: dict[str, float] = field(default_factory=dict)  # per UAV: overrides uav_ground_p_detect
+    # per UAV: "air" (flies high: sees roofs, street level per uav_ground_p_detect) or "ground" (flies at
+    # street level with a front-facing camera: sees what the UGV sees, core.visibility)
+    uav_viewpoints: dict[str, str] = field(default_factory=dict)
 
     def uav_range(self, rid: str) -> float:
         return self.uav_sensor_ranges.get(rid, self.uav_sensor_range)
 
-    def uav_ground_p(self, rid: str) -> float:
-        return self.uav_ground_p_detects.get(rid, self.uav_ground_p_detect)
+    def uav_ground_p(self, rid: str, occlusion: bool = False) -> float:
+        p = self.uav_ground_p_detects.get(rid, self.uav_ground_p_detect)
+        return (1.0 if occlusion else 0.0) if p is None else p
+
+    def uav_viewpoint(self, rid: str) -> str:
+        return self.uav_viewpoints.get(rid, AIR)
 
 
 @dataclass
@@ -123,6 +149,14 @@ class ScenarioConfig:
     road_unmapped_fraction: float = 0.0  # share of road nodes missing from the map (whole stretches of road)
     road_blocked_fraction: float = 0.0  # share of mapped road nodes that cannot be traversed
     road_cutoff_fraction: float = 0.0  # blocked nodes may cut off at most this share of the road nodes from the rest (0: never)
+    # occlusion (core.visibility): what hides the target and the roads from the sensors
+    occlusion: bool = False  # False: nothing (a look detects with the sensor's own probability)
+    canopy_mean: float = 0.4  # tree cover over vegetation: its mean ...
+    canopy_spread: float = 0.3  # ... its spread (smooth noise, then clipped to [0, 1]) ...
+    canopy_smoothing_m: float = 150.0  # ... and the scale it varies over
+    road_canopy: float = 0.5  # a road through trees is covered by this share of their canopy
+    urban_canyon: tuple[float, float] = (0.5, 2.0)  # per town, drawn from this range: building height over street width
+    ground_veg_occlusion: float = 0.3  # from the ground, trees hide a look with this share of their canopy
     # UAV grid
     uav_grid_spacing_m: Optional[float] = None  # None: √2 · the smallest UAV sensor range, the widest square grid whose footprints leave no gaps
     # prior
@@ -155,6 +189,22 @@ SEMANTIC_LABELS: dict[str, tuple[str, ...]] = {
     "hiker": ("road_near_vegetation", "vegetation_near_road_node"),
 }
 LABELS = ("road", "urban", "vegetation", "road_near_vegetation", "vegetation_near_road_node")
+
+
+@dataclass(frozen=True)
+class TargetVisibility:
+    """How a target class shows to the sensors, with ``occlusion`` (module docstring: layers)."""
+    urban_roof: float  # in a town: share on roofs (seen from the air only)
+    urban_open: float  # ... share in the open (seen from the air and the ground); the rest is at street level
+    air_p: float  # per-look factor from the air
+    ground_p: float  # per-look factor from the ground
+
+
+TARGET_VISIBILITY: dict[str, TargetVisibility] = {
+    "car": TargetVisibility(urban_roof=0.0, urban_open=0.0, air_p=1.0, ground_p=1.0),  # on the street
+    "building": TargetVisibility(urban_roof=0.0, urban_open=1.0, air_p=1.0, ground_p=1.0),
+    "hiker": TargetVisibility(urban_roof=0.2, urban_open=0.0, air_p=0.8, ground_p=1.0),  # small from the air
+}
 
 
 def label_mask(label: str, grid: GridSpec, terrain: np.ndarray, road: TraversabilityGraph,
@@ -211,10 +261,16 @@ class _RoadBuilder:
 
 def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     cfg = cfg or ScenarioConfig()
-    for key in ("uav_sensor_ranges", "uav_ground_p_detects"):
+    for key in ("uav_sensor_ranges", "uav_ground_p_detects", "uav_viewpoints"):
         unknown = set(getattr(cfg.fleet, key)) - set(UAV_IDS)
         if unknown:
             raise ValueError(f"fleet.{key}: no UAV {sorted(unknown)}; the UAVs are {list(UAV_IDS)}")
+    bad = {rid: v for rid, v in cfg.fleet.uav_viewpoints.items() if v not in (AIR, GROUND)}
+    if bad:
+        raise ValueError(f"fleet.uav_viewpoints: {bad}; a viewpoint is {AIR!r} or {GROUND!r}")
+    if cfg.occlusion and cfg.target_object not in TARGET_VISIBILITY:
+        raise ValueError(f"occlusion: no visibility for target_object {cfg.target_object!r}; "
+                         f"known: {sorted(TARGET_VISIBILITY)}")
     rng = np.random.default_rng(cfg.seed)
     W, H = cfg.size_m
     grid = GridSpec(origin=(0.0, 0.0), resolution=cfg.cell_m, shape=(int(round(H / cfg.cell_m)), int(round(W / cfg.cell_m))))
@@ -374,9 +430,13 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     keep = terrain[r, c] != int(Terrain.URBAN)
     terrain[r[keep], c[keep]] = int(Terrain.ROAD)
 
-    # 6. the road map the robots get (its own random stream: the rest of the map is unchanged)
+    # 6. occlusion (its own random stream: the rest of the map is unchanged)
+    occlusion = _occlusion(cfg, grid, terrain, cities, np.random.default_rng([cfg.seed, 3])) if cfg.occlusion else None
+
+    # 7. the road map the robots get (its own random stream: the rest of the map is unchanged)
     full_road = road_graph
-    road_graph, mismatch = _map_mismatch(full_road, cfg, np.random.default_rng([cfg.seed, 2]))
+    road_graph, mismatch = _map_mismatch(full_road, cfg, np.random.default_rng([cfg.seed, 2]),
+                                         None if occlusion is None else _at(grid, occlusion.canopy, full_road.positions))
     reachable = road_graph.with_changes(blocked=mismatch.blocked)  # what a UGV can drive without the missing roads
     # The terrain as the robots know it, and the prior is built from: roads missing from the map look like vegetation.
     map_terrain = terrain
@@ -391,9 +451,15 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     # Layers, prior, target -------------------------------------------------
     layer_fractions = np.zeros((N_LAYERS,) + grid.shape)
     urban = terrain == int(Terrain.URBAN)
-    layer_fractions[Layer.SHARED][~urban] = 1.0
-    layer_fractions[Layer.AERIAL][urban] = cfg.urban_aerial_fraction
-    layer_fractions[Layer.GROUND][urban] = 1.0 - cfg.urban_aerial_fraction
+    if occlusion is None:
+        layer_fractions[Layer.SHARED][~urban] = 1.0
+        layer_fractions[Layer.AERIAL][urban] = cfg.urban_aerial_fraction
+        layer_fractions[Layer.GROUND][urban] = 1.0 - cfg.urban_aerial_fraction
+    else:
+        tv = TARGET_VISIBILITY[cfg.target_object]
+        layer_fractions[Layer.SHARED] = np.where(urban, tv.urban_open, 1.0 - occlusion.canopy)
+        layer_fractions[Layer.GROUND] = np.where(urban, 1.0 - tv.urban_roof - tv.urban_open, occlusion.canopy)
+        layer_fractions[Layer.AERIAL] = np.where(urban, tv.urban_roof, 0.0)
 
     if cfg.prior_model == "semantic":
         labels = cfg.prior_labels or SEMANTIC_LABELS[cfg.target_object]
@@ -418,7 +484,9 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
 
     confirm_mask = _confirmable_mask(grid, reachable, cfg.fleet.ugv_sensor_range, init["ugv0"].node)
     target_mask = confirm_mask if cfg.target_ugv_confirmable else np.ones(grid.shape, dtype=bool)
-    if not (target_dist * target_mask).any():
+    if occlusion is not None and cfg.target_ugv_confirmable:  # per layer: also where the UGV's look can detect it
+        target_mask = confirm_mask[None] & (detection_map(robots["ugv0"], terrain, occlusion) > 0)
+    if not (target_dist * (target_mask if target_mask.ndim == 2 else target_mask.any(0))).any():
         raise ValueError("no cell is both a plausible target location and within UGV sensor range of a road")
     trng = np.random.default_rng(cfg.seed + 1 if cfg.target_seed is None else cfg.target_seed)
     target_xy, target_layer = sample_target(grid, target_dist, layer_fractions, target_mask, trng)
@@ -427,7 +495,7 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         "config": cfg,
         "confirmable_mask": confirm_mask,  # cells the UGV can get within sensor range of
         "confirmable_prior_mass": float(prior[confirm_mask].sum()),
-        "target_mask": target_mask,  # where the target may be (confirmable_mask, or everywhere)
+        "target_mask": target_mask,  # where the target may be (confirmable_mask, or everywhere; with occlusion, per layer)
         "target_distribution": target_dist,  # what the hidden target is drawn from (x target_mask)
         "label_mask": truth,  # true semantic label cells (semantic prior only)
         "road_length_m": float(full_road.lengths.sum()),
@@ -452,6 +520,7 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         meta=meta,
         road_mismatch=mismatch,
         map_terrain=None if map_terrain is terrain else map_terrain,
+        occlusion=occlusion,
     )
 
 
@@ -540,7 +609,8 @@ def _road_chains(road: TraversabilityGraph) -> list[tuple[list[int], bool]]:
     return chains
 
 
-def _map_mismatch(road: TraversabilityGraph, cfg: ScenarioConfig, rng) -> tuple[TraversabilityGraph, MapMismatch]:
+def _map_mismatch(road: TraversabilityGraph, cfg: ScenarioConfig, rng,
+                  canopy: Optional[np.ndarray] = None) -> tuple[TraversabilityGraph, MapMismatch]:
     """Split the true road network into the prior map the robots get and its mismatch with the world.
 
     Unmapped: whole stretches of road between junctions (or out to a dead end) are left off the
@@ -548,13 +618,20 @@ def _map_mismatch(road: TraversabilityGraph, cfg: ScenarioConfig, rng) -> tuple[
     loss leaves the map connected, so a blockage forces a detour but every other mapped node
     stays reachable; with ``road_cutoff_fraction``, as long as the nodes cut off from the
     largest part stay within that share of the nodes, on the map and on the ground. Mapped nodes
-    keep their order; the unmapped ones get the indices after them."""
+    keep their order; the unmapped ones get the indices after them. With ``canopy`` (per road
+    node), a stretch is tried earlier the more trees cover it (weight 0.1 + its mean canopy):
+    a road under trees is harder to map from the air."""
     n = road.n_nodes
     hidden = np.zeros(n, dtype=bool)
     target = int(round(cfg.road_unmapped_fraction * n))
     if target > 0:
         chains = _road_chains(road)
-        for k in rng.permutation(len(chains)):
+        if canopy is None:
+            order = rng.permutation(len(chains))
+        else:  # weighted random order (Efraimidis and Spirakis)
+            w = np.array([0.1 + canopy[inner].mean() for inner, _ in chains])
+            order = np.argsort(-rng.random(len(chains)) ** (1.0 / w))
+        for k in order:
             if hidden.sum() >= target:
                 break
             inner, dead = chains[k]
@@ -668,6 +745,38 @@ def _gaussian_mixture_prior(grid: GridSpec, terrain: np.ndarray, cfg: ScenarioCo
     return prior / prior.sum()
 
 
+def _occlusion(cfg: ScenarioConfig, grid: GridSpec, terrain: np.ndarray, cities: list[dict], rng) -> Occlusion:
+    """Tree cover over vegetation (smooth noise around ``canopy_mean``), a ``road_canopy`` share
+    of the trees round a road over it, and per town a building height over street width drawn
+    from ``urban_canyon`` (10 % noise per cell)."""
+    veg, road, urban = (terrain == int(t) for t in (Terrain.VEGETATION, Terrain.ROAD, Terrain.URBAN))
+    noise = gaussian_filter(rng.standard_normal(grid.shape), sigma=cfg.canopy_smoothing_m / cfg.cell_m)
+    noise = (noise - noise.mean()) / max(noise.std(), 1e-12)
+    trees = np.clip(cfg.canopy_mean + cfg.canopy_spread * noise, 0.0, 1.0)
+    canopy = np.where(veg, trees, 0.0)
+    if road.any():  # the trees round a road: the canopy averaged over its neighbourhood
+        k = np.ones((3, 3))
+        near = convolve(canopy, k, mode="nearest") / np.maximum(convolve(veg.astype(float), k, mode="nearest"), 1e-12)
+        canopy[road] = cfg.road_canopy * near[road]
+    canyon = np.zeros(grid.shape)
+    if urban.any() and cities:
+        X, Y = grid.cell_centers()
+        centres = np.array([c["center"] for c in cities])
+        ratio = rng.uniform(*cfg.urban_canyon, size=len(cities))
+        nearest = np.argmin(np.hypot(X[..., None] - centres[:, 0], Y[..., None] - centres[:, 1]), axis=-1)
+        jitter = 1.0 + 0.1 * rng.standard_normal(grid.shape)
+        canyon = np.where(urban, np.maximum(ratio[nearest] * jitter, 0.0), 0.0)
+    tv = TARGET_VISIBILITY.get(cfg.target_object, TargetVisibility(0.0, 0.0, 1.0, 1.0))
+    return Occlusion(canopy=canopy, canyon=canyon, ground_veg_occlusion=cfg.ground_veg_occlusion,
+                     air_p=tv.air_p, ground_p=tv.ground_p)
+
+
+def _at(grid: GridSpec, field_: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    """The values of a per-cell ``field_`` at points ``xy`` (n, 2)."""
+    r, c = _cells_of(grid, np.asarray(xy, dtype=float).reshape(-1, 2))
+    return field_[r, c]
+
+
 def _confirmable_mask(grid: GridSpec, road: TraversabilityGraph, sensor_range: float,
                       start: Optional[int] = None) -> np.ndarray:
     """Cells whose centre a UGV driving the road network (from ``start``, if given) can get in sensor range of."""
@@ -685,7 +794,12 @@ def _confirmable_mask(grid: GridSpec, road: TraversabilityGraph, sensor_range: f
 
 
 def sample_target(grid, dist, layer_fractions, mask, rng) -> tuple[tuple[float, float], Layer]:
-    """Draw a target cell from ``dist`` restricted to ``mask``, then its visibility layer."""
+    """Draw a target cell from ``dist`` restricted to ``mask`` ((H, W), or per layer (N_LAYERS, H,
+    W)), then its visibility layer."""
+    if mask.ndim == 3:  # a cell by the share of its layers allowed, then a layer among those
+        lf_all = layer_fractions / np.maximum(layer_fractions.sum(0, keepdims=True), 1e-300)
+        layer_fractions = layer_fractions * mask
+        mask = (lf_all * mask).sum(0)
     p = (dist * mask).ravel()
     idx = rng.choice(p.size, p=p / p.sum())
     r, c = divmod(int(idx), grid.cols)
@@ -703,7 +817,13 @@ def _make_fleet(cfg: ScenarioConfig, road: TraversabilityGraph, terrain, grid, r
     ugv_sensor = SensorSpec(range_m=f.ugv_sensor_range, visible_layers=(Layer.SHARED, Layer.GROUND))
     robots = {"ugv0": RobotSpec("ugv0", RobotType.UGV, f.ugv_speed, f.ugv_energy, ugv_sensor)}
     for rid in UAV_IDS:
-        ground = ((Layer.GROUND, f.uav_ground_p(rid)),) if f.uav_ground_p(rid) > 0 else ()
+        if f.uav_viewpoint(rid) == GROUND:  # at street level: as the UGV sees
+            uav_sensor = SensorSpec(range_m=f.uav_range(rid), visible_layers=(Layer.SHARED, Layer.GROUND),
+                                    viewpoint=GROUND)
+            robots[rid] = RobotSpec(rid, RobotType.UAV, f.uav_speed, f.uav_energy, uav_sensor)
+            continue
+        q = f.uav_ground_p(rid, cfg.occlusion)
+        ground = ((Layer.GROUND, q),) if q > 0 else ()
         uav_sensor = SensorSpec(range_m=f.uav_range(rid), visible_layers=(Layer.SHARED, Layer.AERIAL),
                                 layer_p_detect=ground)
         robots[rid] = RobotSpec(rid, RobotType.UAV, f.uav_speed, f.uav_energy, uav_sensor)

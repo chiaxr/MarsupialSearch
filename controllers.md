@@ -23,7 +23,11 @@ not yet seen).
 (*belief*) still left inside a sensor footprint there, each layer weighted by the chance a look
 detects it. The UGV sees the ground and shared layers; a UAV sees the aerial and shared layers,
 and street level with probability `fleet.uav_ground_p_detect` (default 0; see
-[Visibility layers](README.md#13-visibility-layers-urban-needs-both-robot-types)). Only the UGV can
+[Visibility layers](README.md#13-visibility-layers-urban-needs-both-robot-types)); a UAV at street
+level (`fleet.uav_viewpoints`, e.g. the near scout) sees what the UGV sees. With occlusion that
+chance is per cell as well as per layer (`core.detection_map`: the canopy, the street canyons,
+the target class), and the planners weigh each cell's belief by it (`SortiePlanner.p_ugv` and
+`p_air` are per layer and cell). Only the UGV can
 end the mission, so a UAV sighting is worth something only once the UGV drives over to confirm it,
 unless the near scout's own sighting ends it (`sim.confirm_by: [uav0]`): then it can verify a
 sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*).
@@ -217,6 +221,11 @@ route is re-planned on the current belief every 60 s.
   the UGV drives back); a call it books no landing for is withdrawn and not repeated at that node.
   On the line map with the road cut 150 m before the target (`tests/test_scouts.py`), the near
   scout confirms it 21 s after it takes off, in each of the three missions there.
+- *Passes* (`pursue_passes`). With `sim.confirm_test: sighting`, the UGV's look at a sighting may
+  miss it (through trees, with occlusion). It then drives past again once out of sensor range of
+  it, and the near scout flies to it again once back on the dock, up to 3 passes each, while its
+  chance of detecting the target there (over the layers a UAV may have sighted it in) is above
+  0; a verifier with no chance there (a roof, from street level) is not called.
 - *A missing UAV:* the UGV drops a landing 120 s after the UAV's slack runs out, or 120 s after a
   landing that started should have ended (the UAV ran out of energy on the way down: it sends
   nothing more).
@@ -335,7 +344,9 @@ during one full sortie.
 With all three on, the gain drops to −6.1 ± 8.0 min (30 large maps). New scores for picking the
 next tour node go in `uav_far_scout.py` (`_tour_mass`).
 
-**`uav_near_scout`** is a standby UAV (see dock booking above) that flies low, next to the UGV:
+**`uav_near_scout`** is a standby UAV (see dock booking above) that flies low, next to the UGV. In
+the scout configs it flies at street level with a front-facing camera (`fleet.uav_viewpoints:
+{uav0: ground}`): it sees what the UGV sees, street level and under the trees but never a roof:
 
 1. **Making room.** It lands at the first route index where the dock is free (after the other
    UAV has left it) and that it can reach. Its tour is the `uav_greedy_tour` chain tour, on
@@ -494,10 +505,14 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
   UGV sees a blocked node from the node before it, so going round it is short, and the UAVs find
   most blockages before the UGV gets there (86 % on `small` with the car prior, which puts the
   belief on the roads). It pays off now and then where a blockage cuts off part of the network.
-  - *Blockage model* (`ctp.BlockageModel`). A road node is open once a robot has seen it: the UGV
-    from where it drives, a UAV from where its status says it was (a UAV's sensor finds a blockage
-    in range, and its status carries it: a position heard means what the UAV found there is heard
-    too, while one not heard counts as unseen). So is a node whose blockage would cut off more of
+  - *Blockage model* (`ctp.BlockageModel`). A road node is open once a robot has seen it for sure:
+    the UGV from where it drives, a UAV from where its status says it was (a UAV's sensor finds a
+    blockage in range, and its status carries it: a position heard means what the UAV found there
+    is heard too, while one not heard counts as unseen). With occlusion, a UAV's look at a node
+    under trees (or deep in a street) sees a blockage only with probability `o`
+    (`core.road_observability`), once per pass: after looks that found nothing with
+    `Π (1 − o) = q`, the node is blocked with `r q / (r q + 1 − r)`, `r` the blocked share below,
+    and a look counts `1 − q` of a node found open towards that share. So is a node whose blockage would cut off more of
     the map than blockages may still cut off (`max_cutoff_fraction`, the generator's
     `road_cutoff_fraction`; by default 0: no node the map needs to stay in one piece is ever
     blocked), and a node missing from the map. Every other node is blocked with the share of the

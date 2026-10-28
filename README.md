@@ -52,13 +52,15 @@ python scripts/compare.py --scenario small --maps 0 1 2 --teams joint_planner \
 
 ```
 marsupial_search/
-  core/          portable: messages, graph, grid, belief map, controller interface
+  core/          portable: messages, graph, grid, belief map, visibility (occlusion), controller interface
   controllers/   portable: policies and the oracle (depend only on marsupial_search.core + numpy/scipy)
   sim/           research only: scenario generator, simulator, evaluation
   viz/           research only: matplotlib plots / GIF
 configs/         YAML experiment files (example.yaml documents the format; small_car_mismatch.yaml: a wrong road map;
                  small_car_ctp.yaml: the UGV planning round blockages not yet seen; small_car_cutoff.yaml: blockages
-                 that cut off parts of the network; small_car_scout.yaml: a near and a far scout)
+                 that cut off parts of the network; small_car_scout.yaml: a near and a far scout;
+                 small_car_verify.yaml: the near scout verifying sightings the UGV cannot reach;
+                 small_hiker_occluded.yaml: tree cover and street canyons hiding the target and the roads)
 scripts/
   run_mission.py one mission + plots + GIF
   compare.py     teams x map seeds x target seeds -> CSV + summary + plot
@@ -80,7 +82,7 @@ any scenario without exactly one UGV.
 |---|---|---|
 | start | a random non-urban road node | `uav0` docked on the UGV; `uav1` hovering over it |
 | motion | road graph only, 5 m/s; road nodes at most 55 m apart (the sensor range) | free, 10 m/s, between nodes of an 85 m UAV grid (√2 × the sensor range: the widest square grid whose footprints leave no gaps) or to any point |
-| sensor | 55 m disk; ground and shared layers | 60 m disk; aerial and shared layers (per UAV: `fleet.uav_sensor_ranges`, e.g. `{uav0: 20, uav1: 50}` for a low and a high UAV; the UAV grid then follows the smaller), and street level with probability `fleet.uav_ground_p_detect` per pass (default 0; per UAV: `fleet.uav_ground_p_detects`) |
+| sensor | 55 m disk; ground and shared layers | 60 m disk; aerial and shared layers (per UAV: `fleet.uav_sensor_ranges`, e.g. `{uav0: 20, uav1: 50}` for a low and a high UAV; the UAV grid then follows the smaller), and street level with probability `fleet.uav_ground_p_detect` per pass (default 0; per UAV: `fleet.uav_ground_p_detects`). A UAV with the `ground` viewpoint (`fleet.uav_viewpoints`, e.g. `{uav0: ground}`) flies at street level with a front-facing camera instead: it sees the ground and shared layers, as the UGV does (§1.3) |
 | energy | 250 000 units; 2.0 /s + 1.0 /m | 2000 units; 1.0 /s (hovering included) + 0.04 /m, so 1.4 /s at full speed |
 | endurance | about 10 h of driving (`small` base: 17 000 units, about 40 min) | about 24 min flying (14 km), 33 min hovering |
 
@@ -120,8 +122,8 @@ mission there (`ugv_timed_route` sends the near scout to verify such a sighting;
 | Docking | UAV within `dock_tolerance_m` of the UGV, which has not moved this step and has its dock free. Landing takes `dock_duration_s`; the dock **aborts** if the UGV moves during it. One UAV at a time. |
 | Docked | UAV rides with the UGV and draws no power. Its battery is swapped for a full one in `swap_duration_s`, while the UGV drives or (with `swap_while_moving: false`) only while it stands still. A docked UAV's `mode_time_remaining` is what is left of its swap. |
 | Undocking | take-off takes `undock_duration_s`; it **aborts** if the UGV moves during it, and is rejected while the swap is in progress |
-| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Each pass over a cell is one look: a layer seen with probability `p < 1` gets its look when the cell enters the footprint, not again while it stays in view, and the target is rolled for once per pass (hovering over it does not help). Road-map mismatches in range come as a `TraversabilityUpdate`. |
-| Termination | `TARGET_FOUND` when the target is inside the sensor range of a robot whose type is in `SimConfig.terminate_on` (default: UGV only; perfect, distance-only test), or when a robot in `SimConfig.confirm_by` (by id, e.g. the near scout `uav0`) sights it (with its layer's `p_detect`, as any sighting). Other robots report `TARGET_SIGHTED`. The controllers are told who ends the mission (`MissionSetup.confirmers`). Other outcomes: `ugv_depleted` (`stop_when_ugv_depleted`, on by default), `all_depleted`, `controller_done`, `timeout`. |
+| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Each pass over a cell is one look: a layer seen with probability `p < 1` gets its look when the cell enters the footprint, not again while it stays in view, and the target is rolled for once per pass (hovering over it does not help). The probability is per layer and cell: the sensor's own, times what occlusion lets it see from its viewpoint (§1.3). Road-map mismatches in range come as a `TraversabilityUpdate`, each seen once per pass with the chance occlusion leaves it (1 without occlusion). |
+| Termination | `TARGET_FOUND` when the target is inside the sensor range of a robot whose type is in `SimConfig.terminate_on` (default: UGV only; perfect, distance-only test; with `confirm_test: sighting`, when it sights it instead, so occlusion applies to it too), or when a robot in `SimConfig.confirm_by` (by id, e.g. the near scout `uav0`) sights it (with its layer's `p_detect`, as any sighting). Other robots report `TARGET_SIGHTED`. The controllers are told who ends the mission (`MissionSetup.confirmers`). Other outcomes: `ugv_depleted` (`stop_when_ugv_depleted`, on by default), `all_depleted`, `controller_done`, `timeout`. |
 
 ### 1.3 Visibility layers ("urban needs both robot types")
 
@@ -137,6 +139,37 @@ once the UGV has also passed within range. The belief update is Bayesian:
 `mass *= 1 - p_detect` over the footprint, per layer (`SensorSpec.layer_p()`). With
 `uav_ground_p_detect: 0.3`, a UAV pass leaves 35 % of an urban cell's mass (its street-level
 half × 0.7) instead of 50 %.
+
+**Occlusion** (`scenario.occlusion: true`; `marsupial_search/core/visibility.py`). What hides
+the target and the roads comes with the prior map, so every robot knows it: tree cover per cell
+(`canopy`: smooth noise over vegetation, `canopy_mean` 0.4; `road_canopy` 50 % of the trees
+round a road over it) and, in each town, the building height over street width (`canyon`,
+drawn from `urban_canyon`, 0.5 to 2). The layers then hold what hides the target for good,
+by target class (`TARGET_VISIBILITY` in the generator):
+
+| | outside towns | in a town |
+|---|---|---|
+| `SHARED` | the open: 1 − canopy | in the open (`building`: all) |
+| `AERIAL` | – | on a roof (`hiker`: 20 %) |
+| `GROUND` | under the trees: canopy | at street level (the rest) |
+
+What varies from look to look is the detection probability, per viewpoint:
+
+| viewpoint | who | per look |
+|---|---|---|
+| `air` | a UAV (default) | roofs and the open; street level only near overhead, `min(1, 1 / (2·canyon))` (the share of a 45° camera's footprint from which the street floor clears the buildings either side, the same at any altitude); never under the trees; times the class's `air_p` (`hiker`: 0.8) |
+| `ground` | the UGV, and a UAV with `uav_viewpoints: {uav0: ground}` (street level, front-facing camera) | street level and under the trees, but through them only `1 − ground_veg_occlusion · canopy` (0.3 · canopy hidden); never a roof; times `ground_p` |
+
+Each is times the sensor's own probability (with occlusion, `uav_ground_p_detect` defaults to 1:
+the canyon sets the chance). A road node's blockage (or a road missing from the map) is seen
+from the air with probability `1 − canopy` (times the street term in town), once per pass,
+and always from the ground; roads under trees are also more often missing from the map. With
+the default `confirm_test: range` the UGV still finds the target by range alone; use
+`confirm_test: sighting` so its looks are occluded too (a missed pass is then tried again,
+`ugv_timed_route`'s `pursue_passes`). A confirmable target (`target_ugv_confirmable`) is then
+also in a layer the UGV can detect. With `occlusion: false` (the default) every look detects
+with the sensor's own probability, and missions are as before. `configs/small_hiker_occluded.yaml`
+runs it.
 
 ### 1.4 Radio channel
 

@@ -13,8 +13,12 @@ Per step (``dt`` seconds), in order:
    :class:`TraversabilityUpdate` per robot that sees road-map mismatches it had not seen. Each
    pass is one look: for a layer seen with probability < 1 the update covers only the cells that
    entered the footprint this step, and a sighting is rolled once per pass over the target and
-   holds while it stays in view. A robot of a ``terminate_on`` type ends the mission with the
-   target in range; one in ``confirm_by`` (a UAV flying low to verify a sighting) on sighting it;
+   holds while it stays in view. The probability is per layer and cell: the sensor's own, times
+   what occlusion lets it see from its viewpoint (``core.visibility``). A robot of a
+   ``terminate_on`` type ends the mission with the target in range (``confirm_test: "range"``) or
+   on sighting it (``"sighting"``); one in ``confirm_by`` (a UAV flying low to verify a
+   sighting) on sighting it. A road-map mismatch is seen once per pass too, with the chance
+   occlusion leaves its node (its own random stream, so it does not depend on the target);
 8. radio: queue this step's ``Transmit`` commands and deliver messages that are due.
 
 Robots are given the prior road map (``Scenario.graphs``); the UGV drives on the true one
@@ -57,6 +61,8 @@ from marsupial_search.core import (
     TraversabilityGraph,
     TraversabilityUpdate,
     Undock,
+    detection_map,
+    road_observability,
 )
 
 from .radio import _SIZE_KEYS as _RADIO_SIZE_KEYS
@@ -77,6 +83,9 @@ class SimConfig:
     # Robots (by id) whose sighting also ends the mission, e.g. the near scout (uav0), flying low
     # to verify one. The controllers are told who ends it (MissionSetup.confirmers).
     confirm_by: tuple[str, ...] = ()
+    # How a terminate_on robot ends the mission: "range" (the target in its sensor range, any layer: a
+    # perfect test) or "sighting" (it sights the target, with its own detection probability there)
+    confirm_test: str = "range"
     energy_noise_std: float = 0.0  # std of the energy estimate error, fraction of capacity
     log_interval_s: float = 10.0
     belief_snapshot_interval_s: Optional[float] = None  # store posterior snapshots for animation
@@ -233,13 +242,15 @@ class Simulator:
             ranges = dict(radio.range_m)
         else:
             ranges = {t: float("inf") for t in RobotType}  # ideal channel: unlimited range
+        if self.config.confirm_test not in ("range", "sighting"):
+            raise ValueError(f"confirm_test must be 'range' or 'sighting', got {self.config.confirm_test!r}")
         unknown = set(self.config.confirm_by) - set(scenario.robots)
         if unknown:
             raise ValueError(f"confirm_by: no robots {sorted(unknown)} in scenario {scenario.name!r}")
         confirmers = tuple(rid for rid, spec in scenario.robots.items()
                            if spec.robot_type in self.config.terminate_on or rid in self.config.confirm_by)
         self.setup: MissionSetup = dataclasses.replace(scenario.mission_setup(self.config.dt), radio_range_m=ranges,
-                                                       confirmers=confirmers)
+                                                       confirmers=confirmers, confirm_test=self.config.confirm_test)
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -274,6 +285,11 @@ class Simulator:
         self._blocked = set(mm.blocked)
         self._mismatch_seen: dict[str, set[int]] = {rid: set() for rid in self.robots}
         self._bumped: dict[str, set[int]] = {rid: set() for rid in self.robots}
+        self._map_view: dict[str, set[int]] = {rid: set() for rid in self.robots}  # mismatches in range last step
+        self._map_obs = {rid: dict(zip(self._mismatch_ids.tolist(), road_observability(
+            spec, sc.grid, sc.terrain, sc.occlusion, road.positions[self._mismatch_ids]).tolist())) if mm else {}
+            for rid, spec in sc.robots.items()}  # per mismatch node: the chance a look sees it
+        self._map_rng = np.random.default_rng([cfg.seed, 3])
         for rid, init in sc.init.items():
             r = self.robots[rid]
             if init.node is not None:
@@ -290,7 +306,8 @@ class Simulator:
                 uav.pos = ugv.pos.copy()
                 uav.last_node = uav.graph.nearest_node(uav.pos)
 
-        self._layer_vis = {rid: spec.sensor.layer_p() for rid, spec in sc.robots.items()}
+        # Per robot, layer and cell: the chance a look detects the target (true terrain and occlusion).
+        self._layer_vis = {rid: detection_map(spec, sc.terrain, sc.occlusion) for rid, spec in sc.robots.items()}
         # One look per pass: a cell gets a look when it enters a footprint, and the target one
         # roll per pass, whose outcome holds while it stays in view. Layers seen for certain are
         # looked at every step, as repeating a certain look changes nothing: a robot that missed
@@ -571,14 +588,15 @@ class Simulator:
             rng_m = r.spec.sensor.range_m
             row0, col0, mask = grid.disk_window(r.pos[0], r.pos[1], rng_m)
             new = mask & ~self._in_view_last_step(r.rid, row0, col0, mask)
-            vis = self._layer_vis[r.rid][:, None, None]
+            h, w = mask.shape
+            vis = self._layer_vis[r.rid][:, row0:row0 + h, col0:col0 + w]
             p = vis * np.where(vis >= 1, mask, new)  # a certain look may repeat: it cannot double-count
             in_range = np.hypot(*(self._target_center - r.pos)) <= rng_m
             entering = in_range and not self._target_in_view[r.rid]
             self._target_in_view[r.rid] = in_range
             detected = False
             if in_range:
-                if r.spec.robot_type in self.config.terminate_on:
+                if r.spec.robot_type in self.config.terminate_on and self.config.confirm_test == "range":
                     detected = True
                     if not self.done:
                         self.found_by = r.rid
@@ -586,12 +604,13 @@ class Simulator:
                         self._finish("found")
                 else:
                     if entering:
-                        pd = self._layer_vis[r.rid][int(sc.target_layer)]
+                        pd = self._layer_vis[r.rid][(int(sc.target_layer),) + self.target_cell]
                         self._target_seen[r.rid] = pd >= 1 or (pd > 0 and self._detect_rng.random() < pd)
                     if self._target_seen[r.rid]:
                         detected = True
                         self._emit(EventType.TARGET_SIGHTED, r.rid)
-                        if r.rid in self.config.confirm_by and not self.done:
+                        ends = r.rid in self.config.confirm_by or r.spec.robot_type in self.config.terminate_on
+                        if ends and not self.done:
                             self.found_by = r.rid
                             self._emit(EventType.TARGET_FOUND, r.rid)
                             self._finish("found")
@@ -627,15 +646,21 @@ class Simulator:
 
     def _sense_map(self) -> list[TraversabilityUpdate]:
         """Road-map mismatches each active robot sees (or ran into) for the first time: blocked nodes,
-        and nodes missing from the map with their edges."""
+        and nodes missing from the map with their edges. A node coming into range is seen with the
+        chance occlusion leaves it (``road_observability``), once per pass."""
         if self._mismatch_tree is None:
             return []
         out = []
         for r in self.robots.values():
             if r.mode != RobotMode.ACTIVE:
+                self._map_view[r.rid] = set()
                 continue
-            near = self._mismatch_ids[self._mismatch_tree.query_ball_point(r.pos, r.spec.sensor.range_m)]
-            new = (set(near.tolist()) | self._bumped[r.rid]) - self._mismatch_seen[r.rid]
+            near = set(self._mismatch_ids[self._mismatch_tree.query_ball_point(r.pos, r.spec.sensor.range_m)].tolist())
+            obs = self._map_obs[r.rid]
+            looked = {n for n in sorted(near - self._map_view[r.rid] - self._mismatch_seen[r.rid])
+                      if obs[n] >= 1 or self._map_rng.random() < obs[n]}
+            self._map_view[r.rid] = near
+            new = (looked | self._bumped[r.rid]) - self._mismatch_seen[r.rid]
             self._bumped[r.rid].clear()
             if not new:
                 continue

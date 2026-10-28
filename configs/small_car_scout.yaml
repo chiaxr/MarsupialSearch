@@ -1,5 +1,6 @@
 # The small map with a wrong road map (as small_car_mismatch.yaml), and UAVs with different roles
-# and sensors. uav0 flies low (20 m sensor) and stays docked until the UGV calls it: to make room
+# and sensors. uav0 flies low, at street level (20 m sensor, a front-facing camera: it sees what the
+# UGV sees), and stays docked until the UGV calls it: to make room
 # for uav1's landings, or to scout a blocked node the UGV runs into (controllers.md, uav_near_scout).
 # uav1 flies high (50 m sensor) and searches the wider area on sorties it books itself (uav_far_scout).
 # python scripts/compare.py     --config configs/small_car_scout.yaml
@@ -17,6 +18,7 @@ scenario:
   road_blocked_fraction: 0.05
   fleet:
     uav_sensor_ranges: {uav0: 20, uav1: 50}  # the UAV grid follows the smaller one (28 m spacing)
+    uav_viewpoints: {uav0: ground}  # uav0 at street level with a front-facing camera: it sees what the UGV sees
 
 sim:
   radio:

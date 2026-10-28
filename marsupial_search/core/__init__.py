@@ -34,3 +34,4 @@ from .decentralized import DecentralizedTeam, RobotController, RobotControllerFa
 from .radio import PayloadCodec, PickleCodec
 from .relay import Relay
 from .types import N_LAYERS, Layer, RobotMode, RobotType, Terrain
+from .visibility import AIR, GROUND, Occlusion, detection_map, road_observability, viewpoint

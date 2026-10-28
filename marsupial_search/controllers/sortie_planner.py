@@ -22,7 +22,7 @@ from typing import Optional
 
 import numpy as np
 
-from marsupial_search.core import BeliefMap, MissionSetup, RobotSpec, RobotType, TraversabilityGraph
+from marsupial_search.core import BeliefMap, MissionSetup, RobotSpec, RobotType, TraversabilityGraph, detection_map
 
 from .common import PathFn, SearchConfig, dist, footprint_matrix
 
@@ -43,10 +43,18 @@ class SortiePlanner:
         self._road_cells: dict[int, np.ndarray] = {}
         self.set_road(setup.graphs[RobotType.UGV])
         self.F_air = footprint_matrix(setup.grid, self.air, uav.sensor.range_m)
-        self.p_ugv, self.p_air = ugv.sensor.layer_p(), uav.sensor.layer_p()  # detection per look, per layer
-        air = uav.sensor.seen_layers
-        self.common_layers = [l for l in air if self.p_ugv[l] > 0]  # seen by either robot
-        self.own_layers = [l for l in air if self.p_ugv[l] == 0]  # seen only from the air
+        self.p_ugv, self.p_air = self.detection(setup, ugv), self.detection(setup, uav)  # per look: (layers, cells)
+        air = np.flatnonzero((self.p_air > 0).any(1))
+        seen_ugv = (self.p_ugv > 0).any(1)
+        self.common_layers = [int(l) for l in air if seen_ugv[l]]  # seen by either robot
+        self.own_layers = [int(l) for l in air if not seen_ugv[l]]  # seen only by the UAV
+
+    @staticmethod
+    def detection(setup: MissionSetup, spec: RobotSpec) -> np.ndarray:
+        """Per layer and cell (flat), the chance a look by ``spec`` detects the target
+        (``core.detection_map``): shape (layers, cells)."""
+        p = detection_map(spec, setup.terrain, setup.occlusion)
+        return p.reshape(len(p), -1)
 
     def for_uav(self, uav: RobotSpec) -> "SortiePlanner":
         """This planner for another UAV (its own sensor footprints and energy model); itself if the
@@ -81,19 +89,19 @@ class SortiePlanner:
     # ---------------------------------------------------------------- sweeping
     @staticmethod
     def sweep(m: np.ndarray, F, node: int, p: np.ndarray) -> float:
-        """Apply one look from ``node`` (detection ``p`` per layer) to ``m`` in place; returns the
-        belief swept."""
+        """Apply one look from ``node`` (detection ``p`` per layer and cell) to ``m`` in place;
+        returns the belief swept."""
         cells = F.indices[F.indptr[node]:F.indptr[node + 1]]
-        layers = np.flatnonzero(p > 0)
-        win = m[np.ix_(layers, cells)] * p[layers, None]
+        layers = np.flatnonzero((p > 0).any(1))
+        win = m[np.ix_(layers, cells)] * p[np.ix_(layers, cells)]
         m[np.ix_(layers, cells)] -= win
         return float(win.sum())
 
     @staticmethod
     def seen(m: np.ndarray, p: np.ndarray) -> np.ndarray:
-        """Belief per cell one look would sweep: ``Σ_l p[l] m[l]``."""
-        layers = np.flatnonzero(p > 0)
-        return (m[layers] * p[layers, None]).sum(0)
+        """Belief per cell one look would sweep: ``Σ_l p[l] m[l]`` (``p`` per layer and cell)."""
+        layers = np.flatnonzero((p > 0).any(1))
+        return (m[layers] * p[layers]).sum(0)
 
     def searchable_mass(self, belief: BeliefMap) -> np.ndarray:
         """Belief per (layer, cell) a sortie may search: a sighting keeps its mass, but a
@@ -202,8 +210,8 @@ class SortiePlanner:
             return None
         rate = self._rate(tau, ugv_value)
         own, common = m[self.own_layers], m[self.common_layers]  # per layer: (layers, cells)
-        p_own, p_com = self.p_air[self.own_layers, None], self.p_air[self.common_layers, None]
-        p_both = p_com * self.p_ugv[self.common_layers, None]  # swept by both: counted twice
+        p_own, p_com = self.p_air[self.own_layers], self.p_air[self.common_layers]
+        p_both = p_com * self.p_ugv[self.common_layers]  # swept by both: counted twice
         t_ugv = np.where(t_ugv <= tau, t_ugv, np.inf)  # the UGV stops at k
         value = self.F_air @ ((own * p_own).sum(0) + (common * p_com).sum(0))
         pos = self.air.positions
@@ -228,9 +236,10 @@ class SortiePlanner:
             cur = pts[c]
             cells = Fc.indices[Fc.indptr[c]:Fc.indptr[c + 1]]
             later = t_ugv[cells] > flown / v
-            overlap += float((common[:, cells[later & np.isfinite(t_ugv[cells])]] * p_both).sum())
-            own[:, cells] *= 1.0 - p_own
-            common[:, cells] = np.where(later, common[:, cells] * (1.0 - p_com), common[:, cells])
+            both = cells[later & np.isfinite(t_ugv[cells])]
+            overlap += float((common[:, both] * p_both[:, both]).sum())
+            own[:, cells] *= 1.0 - p_own[:, cells]
+            common[:, cells] = np.where(later, common[:, cells] * (1.0 - p_com[:, cells]), common[:, cells])
             vals = Fc @ ((own * p_own).sum(0) + (common * p_com).sum(0) * (t_ugv > flown / v))
             length = flown + float(to_end[c])
             r = rate(length, uav_value - overlap)

@@ -3,20 +3,24 @@
 The environment is the simulator during research and a deployment adapter (e.g. a
 ROS node translating topics to/from these dataclasses) on hardware. Controllers
 must only depend on this module, :mod:`marsupial_search.core.graph`, :mod:`marsupial_search.core.grid`,
-:mod:`marsupial_search.core.belief` and :mod:`marsupial_search.core.types`.
+:mod:`marsupial_search.core.belief`, :mod:`marsupial_search.core.visibility` and
+:mod:`marsupial_search.core.types`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import numpy as np
 
 from .graph import TraversabilityGraph
 from .grid import GridSpec
 from .types import N_LAYERS, Layer, RobotMode, RobotType
+
+if TYPE_CHECKING:  # (visibility imports this module)
+    from .visibility import Occlusion
 
 # --------------------------------------------------------------------------- specs
 
@@ -49,6 +53,8 @@ class SensorSpec:
     visible_layers: tuple[Layer, ...]
     p_detect: float = 1.0  # detection probability per look in visible_layers (1 = perfect)
     layer_p_detect: tuple[tuple[Layer, float], ...] = ()  # per-layer overrides, e.g. ((Layer.GROUND, 0.3),)
+    # Where it looks from (core.visibility): "air" or "ground" ("": ground for a UGV, air for a UAV)
+    viewpoint: str = ""
 
     def layer_p(self) -> np.ndarray:
         """Detection probability per look, per layer: shape (N_LAYERS,)."""
@@ -104,6 +110,11 @@ class MissionSetup:
     # Robots that end the mission on the target: by having it in sensor range (the UGV), or (a UAV
     # flying low to verify a sighting) by sighting it. Empty: no information (the UGV, as before).
     confirmers: tuple[str, ...] = ()
+    # "range": a confirmer ends the mission once the target is in its sensor range (any layer);
+    # "sighting": once it sights the target, a look detecting with its probability there.
+    confirm_test: str = "range"
+    # What hides the target and the roads, per cell (core.visibility; None: nothing).
+    occlusion: Optional["Occlusion"] = None
 
     def robots_of(self, robot_type: RobotType) -> list[str]:
         return [rid for rid, spec in self.robots.items() if spec.robot_type == robot_type]

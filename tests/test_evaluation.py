@@ -109,3 +109,12 @@ def test_a_confirming_uavs_sighting_is_predicted_to_end_the_mission_there_and_th
     s = int(Layer.SHARED)
     mine = (first["uav0"] < first["ugv0"]) & (first["uav0"] < first["uav1"])
     assert mine.any() and np.array_equal(T[s][mine], first["uav0"][mine])
+
+
+def test_the_sighting_test_predicts_as_the_range_test_where_the_ugv_sees_for_certain(small):
+    sc, cfg, free = small
+    T = evaluation.predicted_find_times(sc, free, cfg)
+    Ts = evaluation.predicted_find_times(sc, free, dataclasses.replace(cfg, confirm_test="sighting"))
+    assert np.allclose(Ts[[Layer.SHARED, Layer.GROUND]], T[[Layer.SHARED, Layer.GROUND]])
+    roofs = sc.layer_fractions[Layer.AERIAL] > 0  # the UGV never sees a roof: only the range test finds it there
+    assert (Ts[Layer.AERIAL][roofs] >= T[Layer.AERIAL][roofs]).all() and (Ts[Layer.AERIAL][roofs] > T[Layer.AERIAL][roofs]).any()

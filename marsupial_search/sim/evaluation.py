@@ -6,13 +6,15 @@ cell. So a mission follows the same trajectory as a run with no target at all, u
 detection. One target-free run per map therefore gives, for every target cell and layer:
 
 * when the target would be **found** directly: the first time a robot whose type ends the
-  mission (``SimConfig.terminate_on``, the UGV) is within range. This part is exact;
+  mission (``SimConfig.terminate_on``, the UGV) is within range (``confirm_test: "range"``).
+  This part is exact;
 * or when it would be **sighted** first: by a robot whose sighting ends the mission
-  (``SimConfig.confirm_by``), then; by one that only reports it, at the sighting time plus the
+  (``SimConfig.confirm_by``, or a ``terminate_on`` robot with ``confirm_test: "sighting"``), then; by one that only reports it, at the sighting time plus the
   UGV's drive from where it is to the target (none if the target is out of its reach).
   This part is an estimate: how quickly a team confirms a sighting depends on the team. A
   sensor that detects a layer with probability ``p < 1`` per look (per pass over the cell)
-  sights it on its k-th look with probability ``p_k Π_{i<k} (1 − p_i)``; ``T̂`` is the
+  sights it on its k-th look with probability ``p_k Π_{i<k} (1 − p_i)``, ``p_i`` that look's
+  probability in that cell (``core.detection_map``: with occlusion, it varies per cell); ``T̂`` is the
   expectation over which look, if any before the find, sights it.
 
 The prediction ``T̂`` is averaged over the whole target distribution, ``E[T̂]``, and its error is
@@ -28,7 +30,7 @@ from __future__ import annotations
 import dataclasses
 
 import numpy as np
-from marsupial_search.core import N_LAYERS, RobotMode, RobotType
+from marsupial_search.core import N_LAYERS, RobotMode, RobotType, detection_map
 
 from .scenario import Scenario
 from .simulator import MissionResult, SimConfig
@@ -44,9 +46,10 @@ def target_free(cfg: SimConfig) -> SimConfig:
 def target_weights(scenario: Scenario) -> np.ndarray:
     """P(target in layer l of cell), shape (layers, H, W): what ``resample_target`` draws from."""
     m = scenario.meta
-    q = m["target_distribution"] * m.get("target_mask", m["confirmable_mask"])
+    mask = m.get("target_mask", m["confirmable_mask"])  # (H, W), or per layer
+    q = m["target_distribution"] * mask
     lf = scenario.layer_fractions
-    w = q[None] * lf / np.maximum(lf.sum(0, keepdims=True), 1e-300)
+    w = (q if q.ndim == 3 else q[None]) * lf / np.maximum(lf.sum(0, keepdims=True), 1e-300)
     return w / w.sum()
 
 
@@ -108,34 +111,41 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
     ugv = next(r for r, s in scenario.robots.items() if s.robot_type == RobotType.UGV)
     contact = {rid: first_contact(scenario, result, rid) for rid in scenario.robots}
     found = np.full(grid.shape, np.inf)
-    for rid, spec in scenario.robots.items():
-        if spec.robot_type in cfg.terminate_on:
-            found = np.minimum(found, contact[rid])
+    by_range = [rid for rid, spec in scenario.robots.items()
+                if spec.robot_type in cfg.terminate_on and cfg.confirm_test == "range"]
+    for rid in by_range:
+        found = np.minimum(found, contact[rid])
     end = result.time_s
     T = np.empty((N_LAYERS,) + grid.shape)
     road = scenario.true_road()  # the UGV drives the roads as they are, not as mapped
     X, Y = grid.cell_centers()
     cell_node = road.nearest_nodes(np.stack([X.ravel(), Y.ravel()], 1)).reshape(grid.shape)
     traj, speed = result.trajectories[ugv], scenario.robots[ugv].speed
-    seers = [rid for rid, spec in scenario.robots.items() if spec.robot_type not in cfg.terminate_on]
+    seers = [rid for rid in scenario.robots if rid not in by_range]
     looks = {rid: look_events(scenario, result, rid) for rid in seers}
+    detect = {rid: detection_map(scenario.robots[rid], scenario.terrain, scenario.occlusion) for rid in seers}
     found_flat, cell_node_flat = found.ravel(), cell_node.ravel()
     dist_cache: dict[int, np.ndarray] = {}
     for layer in range(N_LAYERS):
-        Tl = np.where(np.isfinite(found), found, end).ravel()
+        found_l = found_flat.copy()  # (with a certain look that ends the mission, also the first such)
         cells, times, pd, ends = [], [], [], []
         for rid in seers:
-            q = scenario.robots[rid].sensor.layer_p()[layer]
-            if q > 0:
+            q = detect[rid][layer].ravel()
+            if (q > 0).any():
                 c, t = looks[rid]
+                c, t = c[q[c] > 0], t[q[c] > 0]
                 cells.append(c)
                 times.append(t)
-                pd.append(np.full(len(c), q))
-                ends.append(np.full(len(c), rid in cfg.confirm_by))  # its sighting ends the mission
+                pd.append(q[c])
+                ends.append(np.full(len(c), rid in cfg.confirm_by  # its sighting ends the mission
+                                    or scenario.robots[rid].robot_type in cfg.terminate_on))
         if cells:
             cells, times, pd, ends = map(np.concatenate, (cells, times, pd, ends))
-            keep = times < found_flat[cells]  # sighted before the UGV gets there
+            sure = ends & (pd >= 1)  # found on that look, as by range
+            np.minimum.at(found_l, cells[sure], times[sure])
+            keep = times < found_l[cells]  # sighted before the UGV gets there
             cells, times, pd, ends = cells[keep], times[keep], pd[keep], ends[keep]
+        if len(cells):
             o = np.lexsort((times, cells))
             cells, times, pd, ends = cells[o], times[o], pd[o], ends[o]
             # P(this look is the first to sight it): p_k Π_{i<k} (1 − p_i) over the cell's looks so far
@@ -148,6 +158,7 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
             prob = pd * missed
             live = prob > 0  # looks after a certain sighting cannot be the first
             cells, times, prob, ends = cells[live], times[live], prob[live], ends[live]
+        Tl = np.where(np.isfinite(found_l), found_l, end)
         if len(cells):  # sighted first: the UGV drives from where it is to the target
             steps = np.searchsorted(result.traj_t, times)
             src = np.array([road.nearest_node(traj[min(i, len(traj) - 1)]) for i in steps])
@@ -159,7 +170,7 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
                 sel = src == n
                 drive[sel] = dist_cache[n][dst[sel]]
             drive[ends] = 0.0
-            Tk = np.minimum(np.minimum(times + drive / speed, found_flat[cells]), cfg.max_time_s)
+            Tk = np.minimum(np.minimum(times + drive / speed, found_l[cells]), cfg.max_time_s)
             p_sight = np.bincount(cells, prob, minlength=Tl.size)
             Tl = np.bincount(cells, prob * Tk, minlength=Tl.size) + (1.0 - p_sight) * Tl
         T[layer] = Tl.reshape(grid.shape)

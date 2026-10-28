@@ -62,6 +62,7 @@ controller_params:
     verify: true                   # a sighting the UGV cannot get within sensor range of: a standby UAV whose sighting ends the mission (sim.confirm_by) verifies it ...
     verify_radius_m: 500.0         # ... called from the road node nearest it, or from where the UGV is if this close to it ...
     verify_detour_m: 300.0         # ... once a blockage makes the UGV's drive there this much longer (or cuts it off)
+    pursue_passes: 3               # sim.confirm_test sighting: a missed pass at a sighting is tried again, up to this many passes
     # road planner (controllers.md#road-map-mismatch)
     road_planner: optimistic       # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
     ctp_samples: 16                # ctp: blockage scenarios per decision
@@ -104,6 +105,7 @@ controller_params:
     verify: true                   # a sighting the UGV cannot get within sensor range of: a standby UAV whose sighting ends the mission (sim.confirm_by) verifies it ...
     verify_radius_m: 500.0         # ... called from the road node nearest it, or from where the UGV is if this close to it ...
     verify_detour_m: 300.0         # ... once a blockage makes the UGV's drive there this much longer (or cuts it off)
+    pursue_passes: 3               # sim.confirm_test sighting: a missed pass at a sighting is tried again, up to this many passes
     # road planner (controllers.md#road-map-mismatch)
     road_planner: ctp              # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
     ctp_samples: 16                # ctp: blockage scenarios per decision
@@ -253,6 +255,14 @@ scenario:
   road_blocked_fraction: 0.0         # share of mapped road nodes that cannot be traversed
   road_cutoff_fraction: 0.0          # blocked nodes may cut off at most this share of the road nodes from the rest (0: never)
   # UAV grid
+  # occlusion (README §1.3): what hides the target and the roads from the sensors
+  occlusion: false                   # true: tree cover and street canyons (below) set what each look can see
+  canopy_mean: 0.4                   # tree cover over vegetation: its mean ...
+  canopy_spread: 0.3                 # ... its spread (smooth noise, clipped to [0, 1]) ...
+  canopy_smoothing_m: 150.0          # ... and the scale it varies over
+  road_canopy: 0.5                   # a road through trees is covered by this share of their canopy
+  urban_canyon: [0.5, 2.0]           # per town, drawn from this range: building height over street width
+  ground_veg_occlusion: 0.3          # from the ground, trees hide a look with this share of their canopy
   uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the smallest UAV sensor range, the widest gap-free grid)
   # prior (README §1.5)
   prior_model: semantic              # semantic (LMPath proxy) | gaussian_mixture
@@ -275,8 +285,9 @@ scenario:
     uav_energy: {capacity: 2000, idle_power: 1.0, energy_per_m: 0.04}
     uav_sensor_range: 60.0           # m; sees the aerial and shared layers
     uav_sensor_ranges: {}            # per UAV, overriding uav_sensor_range, e.g. {uav0: 20, uav1: 50} (a UAV flying lower sees less)
-    uav_ground_p_detect: 0.0         # chance per pass that a UAV sees a target at urban street level (0: never)
+    uav_ground_p_detect: null        # chance per pass that a UAV sees a target at urban street level (null: 0, never; with occlusion, 1: the street canyon sets the chance)
     uav_ground_p_detects: {}         # per UAV, overriding uav_ground_p_detect, e.g. {uav0: 0.5, uav1: 0.2}
+    uav_viewpoints: {}               # per UAV: air (default) or ground (flies at street level with a front-facing camera: sees what the UGV sees), e.g. {uav0: ground}
   # dock
   docking:
     dock_duration_s: 30.0            # landing; the UGV must stand still
@@ -291,6 +302,7 @@ sim:
   max_time_s: 21600.0      # time limit (6 h)
   terminate_on: [ugv]      # robot types whose sensor range on the target ends the mission (others only sight it)
   confirm_by: []           # robots (by id) whose sighting also ends the mission, e.g. [uav0] for the near scout flying low
+  confirm_test: range      # how a terminate_on robot ends it: range (target in sensor range, any layer) | sighting (it sights it, with its detection probability there)
   energy_noise_std: 0.0    # noise on the energy estimates controllers see, as a fraction of capacity
   log_interval_s: 10.0     # how often the coverage and searched-probability curves are recorded
   belief_snapshot_interval_s: null   # belief snapshots for the GIF (null: chosen by run_mission.py when animating)

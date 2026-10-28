@@ -30,6 +30,12 @@ Verifying a sighting (``verify``)
     ``verify_radius_m`` of the sighting. A verifier away from the dock is called once it is back,
     if the UGV is still that close (else the UGV drives back); a call it could not book a landing
     for is not repeated at that node.
+Passes (``pursue_passes``)
+    With ``MissionSetup.confirm_test`` ``"sighting"``, a pass may miss the target (e.g. through
+    trees). The UGV then drives past again once out of sensor range of it, and the verifier flies
+    again once back on the dock, up to ``pursue_passes`` each, if its chance of detecting the
+    target there (over the layers a UAV may have sighted it in) is above 0. The verifier is only
+    called if that chance is.
 Road-map changes
     Found by the UGV or reported by a UAV. New roads are used from the next re-plan. If the
     route runs into a blocked node, it goes round it at once: by the shortest way back to the
@@ -82,6 +88,7 @@ from marsupial_search.core import (
     RobotType,
     Transmit,
     TraversabilityGraph,
+    road_observability,
 )
 
 from .common import bypass, dist, pursuit_path
@@ -108,6 +115,7 @@ class UgvTimedRouteConfig(DockBookingConfig):
     verify: bool = True  # a sighting the UGV cannot get within sensor range of: a standby UAV whose sighting ends the mission verifies it ...
     verify_radius_m: float = 500.0  # ... called from the road node nearest it, or from where the UGV is if this close to it ...
     verify_detour_m: float = 300.0  # ... once a blockage makes the UGV's drive there this much longer (or cuts it off)
+    pursue_passes: int = 3  # confirm_test "sighting": a missed pass at a sighting is tried again, up to this many passes
     road_planner: str = "optimistic"  # optimistic: shortest paths on the map as known | ctp: Canadian Traveller's Problem
     ctp_samples: int = 16  # ctp: blockage scenarios per decision
     ctp_search_legs: bool = False  # ctp: also the ways between the search route's nodes (else: detours, pursuits, moved landings)
@@ -162,6 +170,8 @@ class TimedRouteUgv(BookingRobot):
         self.verify_call: Optional[dict] = None  # the take-off stop it is called to
         self.verify_flown = False  # it took off to verify the sighting
         self.verify_failed: set[int] = set()  # road nodes where a call to verify was withdrawn
+        self.passes = {"ugv": 0, "verify": 0}  # passes at the sighting so far: the UGV's, the verifier's flights
+        self.detect: dict[str, np.ndarray] = {}  # per robot: SortiePlanner.detection
         self.swap_until = -np.inf  # a docked UAV's battery swap ends then (held for, without swap_while_moving)
         self.swap_end: dict[str, float] = {}  # UAV -> when the battery swap after its last landing ends
         self.standby: set[str] = set()  # UAVs that stay on the dock until called (they say so in their status)
@@ -172,10 +182,12 @@ class TimedRouteUgv(BookingRobot):
         self.blockage = BlockageModel(self.roads, self.cfg.block_prior, self.cfg.block_prior_weight,
                                       self.cfg.max_cutoff_fraction) if self.cfg.road_planner == "ctp" else None
         self.ctp: Optional[CtpPlanner] = None
+        self.observe: dict[tuple[str, int], np.ndarray] = {}  # (robot, road nodes): per node, the chance its look sees it
         self.ctp_paths: dict[tuple, tuple[float, list[int], float]] = {}  # (src, dst, search leg) -> (when, path, cost)
         self.detour_cache: dict = {}  # (prev, node, next) -> would its blockage send the UGV the long way round?
         self.detour_road: Optional[TraversabilityGraph] = None  # the road map detour_cache is for
         self.now = 0.0
+        self.uav_planners: Optional[list[SortiePlanner]] = None  # per UAV, for when the search is done
 
     def _start(self, s: RobotState) -> None:
         self._look(s.position, self.spec.sensor.range_m)
@@ -299,14 +311,22 @@ class TimedRouteUgv(BookingRobot):
         """``_path`` for the shared planners when it is the CTP (None: their own shortest paths)."""
         return self._path if self.blockage is not None else None
 
-    def _look(self, xy, radius: float) -> None:
-        if self.blockage is not None:
-            self.blockage.look(self.road, xy, radius - 1.0)  # (a margin for where it was when it looked)
+    def _look(self, xy, radius: float, rid: str = "") -> None:
+        """Robot ``rid`` (default: the UGV) looked at the road round ``xy`` (``BlockageModel.look``,
+        with the chance occlusion leaves it to see each node)."""
+        if self.blockage is None:
+            return
+        rid = rid or self.rid
+        key = (rid, self.road.n_nodes)
+        if key not in self.observe:
+            s = self.setup
+            self.observe[key] = road_observability(s.robots[rid], s.grid, s.terrain, s.occlusion, self.road.positions)
+        self.blockage.look(self.road, xy, radius - 1.0, self.observe[key], rid)  # (a margin for where it was)
 
     def _ingest(self, sender: str, p: dict, t: float) -> None:
         super()._ingest(sender, p, t)
         if p["type"] == RobotType.UAV.value and sender in self.setup.robots:  # what that UAV has seen
-            self._look(p["pos"], self.setup.robots[sender].sensor.range_m)
+            self._look(p["pos"], self.setup.robots[sender].sensor.range_m, sender)
 
     def _map_changed(self, s: RobotState, now: float) -> None:
         """Re-route at once if the route runs into a blocked node; new roads wait for the next re-plan."""
@@ -714,7 +734,7 @@ class TimedRouteUgv(BookingRobot):
         cut = near[d1[near] - d0[near] >= cfg.call_gain_m]
         if not len(cut):
             return None
-        m = P.seen(P.searchable_mass(self.belief), uav.sensor.layer_p())
+        m = P.seen(P.searchable_mass(self.belief), P.detection(self.setup, uav))
 
         def mass(nodes):
             return float(m[np.unique(P.F_road[nodes].indices)].sum()) if len(nodes) else 0.0
@@ -727,7 +747,20 @@ class TimedRouteUgv(BookingRobot):
         """The standby UAV whose sighting ends the mission, to verify a sighting with (None: none)."""
         if not self.cfg.verify:
             return None
-        return next((u for u in sorted(self.standby - self.lost) if u in self.setup.confirmers), None)
+        xy = self.belief.detection_xy
+        return next((u for u in sorted(self.standby - self.lost) if u in self.setup.confirmers
+                     and (xy is None or self._chance(u, xy) > 0)), None)
+
+    def _chance(self, rid: str, xy) -> float:
+        """The chance a look by robot ``rid`` detects a target sighted at ``xy``: its detection
+        there, over the layers weighed by the prior and by the best a UAV detects each."""
+        for r in [rid] + self.uavs:
+            if r not in self.detect:
+                self.detect[r] = SortiePlanner.detection(self.setup, self.setup.robots[r])
+        r, c = self.setup.grid.world_to_cell(*xy)
+        k = r * self.setup.grid.cols + c
+        w = self.belief.initial_mass[:, r, c] * np.max([self.detect[u][:, k] for u in self.uavs], axis=0)
+        return float(w @ self.detect[rid][:, k] / w.sum()) if w.sum() > 0 else 0.0
 
     def _pursuit_path(self, src: int, xy) -> list[int]:
         """The way from node ``src`` past a sighting (``pursuit_path``), or, with a verifier and no
@@ -766,12 +799,19 @@ class TimedRouteUgv(BookingRobot):
         d1 = self.road.distances_from(src)[0][goal]
         return bool(d1 - d0 >= self.cfg.verify_detour_m)
 
+    def _again(self, who: str) -> bool:
+        """May the UGV (``"ugv"``) or the verifier (``"verify"``) try the sighting again after a missed pass?"""
+        return self.setup.confirm_test == "sighting" and self.passes[who] < self.cfg.pursue_passes
+
     def _check_verify(self, s: RobotState, now: float) -> None:
         """Call the verifier (``verify``) at the node the UGV is at or driving to: at the end of a
         pursuit to the road node nearest the sighting, or after a long detour (``_long_detour``).
         It must be on the dock; until it is, the call waits while the UGV stays that close to the
         sighting (else the UGV drives back). A withdrawn call is not repeated at that node."""
         xy, u = self.belief.detection_xy, self._verifier()
+        if xy is not None and u is not None and self.verify_flown and s.docked_uav == u and self._again("verify") \
+                and not any(st["uav"] == u and "started" in st for sts in self.stops.values() for st in sts):
+            self.verify_flown, self.verify_call, self.verify_due = False, None, True  # back: its pass missed
         if xy is None or u is None or self.verify_flown:
             return
         if self.verify_call is not None:
@@ -868,7 +908,10 @@ class TimedRouteUgv(BookingRobot):
             # no searchable belief left for either type (UAVs may still be flying)
             P = self.planner
             m = P.searchable_mass(self.belief)
-            self._done = not any((F @ P.seen(m, p) > 0).any() for F, p in ((P.F_road, P.p_ugv), (P.F_air, P.p_air)))
+            if self.uav_planners is None:  # each UAV's own sensor (e.g. one at street level, one high)
+                self.uav_planners = [P.for_uav(self.setup.robots[u]) for u in self.uavs]
+            self._done = not ((P.F_road @ P.seen(m, P.p_ugv) > 0).any()
+                              or any((Q.F_air @ Q.seen(m, Q.p_air) > 0).any() for Q in self.uav_planners))
         else:
             self._done = False
 
@@ -895,6 +938,7 @@ class TimedRouteUgv(BookingRobot):
                 here.pop(0)
                 if stop.get("verify") is not None:
                     self.verify_flown = True
+                    self.passes["verify"] += 1
                 if stop["kind"] == LAND:  # the booking is spent; its take-off stop remains
                     self.bookings.pop(stop["uav"], None)
                     self.swap_until = self.swap_end[stop["uav"]] = now + self.setup.docking.swap_duration_s
@@ -927,6 +971,11 @@ class TimedRouteUgv(BookingRobot):
         if self.pursuit == "planned" and self.cur >= self.pursuit_end:
             self.pursuit = "done"  # drove past it without confirming
             self.verify_due |= self.pursuit_verify  # (or got to where it calls the verifier)
+            self.passes["ugv"] += not self.pursuit_verify
+        xy = self.belief.detection_xy
+        if self.pursuit == "done" and xy is not None and not self.pursuit_verify and self._again("ugv") \
+                and dist(s.position, xy) > self.spec.sensor.range_m and self._chance(self.rid, xy) > 0:
+            self.pursuit = "none"  # the pass missed it: once out of range, another
         if not self.cfg.pursue_sightings or self.belief.detection_xy is None or self.pursuit == "done":
             return
         if self.pursuit == "planned" and self.pursuit_check is None:

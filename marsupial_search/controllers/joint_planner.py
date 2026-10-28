@@ -552,11 +552,11 @@ class JointPlannerController(MissionController):
             if not len(nodes):
                 continue
             rep, cells = _gather(F, nodes)
-            for l in np.flatnonzero(pd > 0):
+            for l in np.flatnonzero((pd > 0).any(1)):
                 keys.append(l * self.n_cells + cells)
                 order_t.append(t[rep])
                 w.append(h_end - found[rep])
-                p.append(np.full(len(cells), min(pd[l], 1 - 1e-12)))
+                p.append(np.minimum(pd[l, cells], 1 - 1e-12))
         if not keys:
             return 0.0
         keys, order_t, w, p = map(np.concatenate, (keys, order_t, w, p))

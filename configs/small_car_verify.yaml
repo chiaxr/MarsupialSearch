@@ -1,7 +1,7 @@
 # The small map with a wrong road map whose blockages may cut off parts of the road network (as
 # small_car_cutoff.yaml), and a target that may lie anywhere, also where the UGV cannot get within
 # sensor range of it (target_ugv_confirmable: false). The near scout (uav0, 20 m sensor, flying
-# low) ends the mission when it sights the target (sim.confirm_by), so the UGV sends it to verify
+# at street level) ends the mission when it sights the target (sim.confirm_by), so the UGV sends it to verify
 # a sighting it cannot reach (controllers.md, ugv_timed_route: verifying a sighting). To compare,
 # set controller_params: {ugv_timed_route: {verify: false}}: such a target is then found only if
 # the near scout happens to sight it.
@@ -20,6 +20,7 @@ scenario:
   road_cutoff_fraction: 0.1
   fleet:
     uav_sensor_ranges: {uav0: 20, uav1: 50}
+    uav_viewpoints: {uav0: ground}  # uav0 at street level with a front-facing camera: it sees what the UGV sees
 
 sim:
   confirm_by: [uav0]       # the near scout's sighting ends the mission
