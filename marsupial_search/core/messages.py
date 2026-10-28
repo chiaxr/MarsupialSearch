@@ -101,6 +101,9 @@ class MissionSetup:
     dt: float
     # Radio link range per robot type; a link needs both ends in range (None: no radio info).
     radio_range_m: Optional[dict[RobotType, float]] = None
+    # Robots that end the mission on the target: by having it in sensor range (the UGV), or (a UAV
+    # flying low to verify a sighting) by sighting it. Empty: no information (the UGV, as before).
+    confirmers: tuple[str, ...] = ()
 
     def robots_of(self, robot_type: RobotType) -> list[str]:
         return [rid for rid, spec in self.robots.items() if spec.robot_type == robot_type]

@@ -33,16 +33,17 @@ def test_each_uav_can_have_its_own_sensor_range():
 
 
 # ------------------------------------------------------------------- the UGV's side
-def _ugv(radio_m=1000.0, ladder=False):
+def _ugv(radio_m=1000.0, ladder=False, confirm_by=()):
     """A ``ugv_timed_route`` controller at node 0 of a straight road (nodes 0-19, 50 m apart; with
-    ``ladder``, and a parallel road 50 m above it), with ``uav0`` docked and on standby."""
+    ``ladder``, and a parallel road 50 m above it), with ``uav0`` docked and on standby (and the
+    robots in ``confirm_by`` ending the mission on a sighting)."""
     sc = make_line_scenario(n_uav=2)
     if ladder:
         top = sc.graphs[RobotType.UGV]
         pos = np.concatenate([top.positions, top.positions + [0.0, 50.0]])
         edges = np.concatenate([top.edges, top.edges + 20, np.stack([np.arange(20), np.arange(20, 40)], 1)])
         sc = dataclasses.replace(sc, graphs={**sc.graphs, RobotType.UGV: TraversabilityGraph(pos, edges, "road")})
-    sim = Simulator(sc, SimConfig(radio=RadioConfig(range_m={t: radio_m for t in RobotType})))
+    sim = Simulator(sc, SimConfig(radio=RadioConfig(range_m={t: radio_m for t in RobotType}), confirm_by=confirm_by))
     ugv = TimedRouteUgv()
     ugv.reset("ugv0", sim.setup)
     ugv.nodes, ugv.extend_failed = list(range(20)), True  # keep the route as given
@@ -69,7 +70,7 @@ def test_a_standby_uav_leaves_the_dock_just_before_another_uav_lands():
     lead = ugv.setup.docking.undock_duration_s + ugv.cfg.stop_margin_s
     assert off["ready"] == pytest.approx(t_land - lead)  # not as soon as the UGV gets there
     p = ugv._plan_payload(s, 0.0)
-    assert p["calls"] == {"uav0": {"for": "uav1", "xy": None, "near": None, "deliver": None}} and p["takeoffs"]["uav0"][0] == 10
+    assert p["calls"] == {"uav0": {"for": "uav1", "xy": None, "near": None, "deliver": None, "verify": None}} and p["takeoffs"]["uav0"][0] == 10
     o = ugv.bookings["uav1"]["off_idx"]
     assert p["busy"] == [(0, 10), (10, o)] and p["standby"] == ["uav0"]  # route indices each UAV is on the dock
     # uav0 lands where the dock is free: not while uav1 is on it, and it stays (no take-off).
@@ -299,3 +300,158 @@ def test_a_messenger_waits_there_until_it_hears_the_other_uav():
     # Not heard, but it must leave now to land on time.
     uav.delivered, uav.relay.neighbours = False, {}
     assert not uav._wait_to_deliver(s, 1000.0 - 30.0, []) and uav.delivered
+
+
+# --------------------------------------------------------------- verifying a sighting
+# On the line map, the road is cut at node 14 (x = 725 m): nodes 15-19 are a pocket the UGV cannot
+# reach. The target is 25 m off the road in the pocket, out of reach of the UGV's 50 m sensor.
+POCKET_XY, CUT = (875.0, 525.0), 14
+
+
+def _at(ugv, s, i):
+    """The UGV at route index ``i``."""
+    ugv.cur, ugv.arrived = i, 0.0
+    node = ugv.nodes[i]
+    return dataclasses.replace(s, node=node, last_node=node, position=tuple(ugv.road.positions[node]))
+
+
+def _verify_calls(ugv):
+    return {i: st for i, sts in ugv.stops.items() for st in sts if st.get("verify") is not None}
+
+
+def test_a_near_scouts_sighting_ends_the_mission():
+    from marsupial_search.core import GoToPoint, Undock
+    sc = make_line_scenario(target_xy=(225.0, 625.0))  # 125 m off the road: out of the UGV's reach
+    with pytest.raises(ValueError, match="uav7"):
+        Simulator(sc, SimConfig(confirm_by=("uav7",)))
+    for confirm_by, found in (((), False), (("uav0",), True)):
+        sim = Simulator(sc, SimConfig(confirm_by=confirm_by))
+        assert sim.setup.confirmers == ("ugv0",) + confirm_by
+        sim.step({"uav0": Undock()})
+        for _ in range(5):  # its take-off
+            sim.step({})
+        cmds = {"uav0": GoToPoint((225.0, 625.0))}
+        for _ in range(60):
+            if sim.done:
+                break
+            sim.step(cmds)
+            cmds = {}
+        assert EventType.TARGET_SIGHTED in [e.type for e in sim.events]
+        assert sim.done is found and (sim.found_by == "uav0") is found
+
+
+@pytest.mark.parametrize("verifier", [True, False])
+def test_a_sighting_the_ugv_cannot_reach_is_verified_from_the_road_node_nearest_it(verifier):
+    ugv, s = _ugv(confirm_by=("uav0",) if verifier else ())
+    ugv._call_standby(s, 0.0)
+    ugv.roads.add(blocked=[CUT])  # on the map already
+    ugv._check_map(s, 1.0)
+    ugv.belief.detection_xy = POCKET_XY
+    ugv._maybe_pursue(s, 2.0)
+    assert ugv.pursuit == "planned" and ugv.pursuit_verify is verifier
+    if not verifier:  # as before: past the road edge nearest it (the UGV never gets in range)
+        assert ugv.nodes[ugv.pursuit_end] in (12, 13)
+        return
+    assert ugv.nodes[ugv.pursuit_end] == 13  # the reachable node nearest the sighting, 200 m from it
+    ugv._check_verify(s, 2.0)
+    assert not _verify_calls(ugv)  # not there yet
+    s = _at(ugv, s, ugv.pursuit_end)
+    ugv._check_verify(s, 3.0)
+    (i, call), = _verify_calls(ugv).items()
+    assert i == ugv.cur and (call["kind"], call["uav"], call["verify"]) == (TAKEOFF, "uav0", POCKET_XY)
+    assert ugv.pursuit == "done" and ugv._plan_payload(s, 3.0)["calls"]["uav0"]["verify"] == POCKET_XY
+
+
+def test_the_verifier_is_called_once_back_on_the_dock_and_not_again_where_its_call_failed():
+    ugv, s = _ugv(confirm_by=("uav0",))
+    ugv._call_standby(s, 0.0)
+    ugv.roads.add(blocked=[CUT])
+    ugv._check_map(s, 1.0)
+    ugv.belief.detection_xy = POCKET_XY
+    ugv._maybe_pursue(s, 2.0)
+    s = _at(ugv, dataclasses.replace(s, docked_uav=None), ugv.pursuit_end)  # it is out
+    ugv._check_verify(s, 3.0)
+    assert not _verify_calls(ugv) and ugv.verify_due  # waits for it
+    s = dataclasses.replace(s, docked_uav="uav0")
+    ugv._check_verify(s, 4.0)
+    (i, call), = _verify_calls(ugv).items()
+    ugv.stops[i].remove(call)  # withdrawn: it could not book a landing
+    ugv._check_verify(s, 5.0)
+    assert not _verify_calls(ugv) and ugv.verify_failed == {13}
+
+
+@pytest.mark.parametrize("case", ["cut off", "short detour", "too far"])
+def test_a_blockage_on_the_way_to_a_sighting_calls_the_verifier_from_where_the_ugv_is(case):
+    ugv, s = _ugv(confirm_by=("uav0",), ladder=case == "short detour")  # a second road 50 m above: 100 m longer
+    ugv._call_standby(s, 0.0)
+    ugv.belief.detection_xy = (900.0, 510.0)  # the UGV can see it from the road, as mapped (between rungs)
+    ugv._maybe_pursue(s, 1.0)
+    assert ugv.pursuit == "planned" and not ugv.pursuit_verify and ugv.nodes[ugv.pursuit_end] in (17, 18)
+    i = 6 if case == "too far" else 12  # 850 m or 250 m from the sighting (verify_radius_m = 500)
+    s = _at(ugv, s, i)
+    ugv.roads.add(blocked=[ugv.nodes[CUT]])  # the route's node at x = 725 m
+    ugv._check_map(s, 2.0)
+    ugv._check_verify(s, 2.0)
+    calls = _verify_calls(ugv)
+    if case != "cut off":  # it drives round (or on towards the blockage)
+        assert not calls and ugv.pursuit != "done"
+        return
+    assert list(calls) == [i] and calls[i]["uav"] == "uav0" and ugv.pursuit == "done"
+
+
+def test_the_near_scout_flies_to_the_sighting_itself_then_lands():
+    uav = _messenger(_plan())
+    xy = (333.0, 777.0)
+    uav.call = {"for": None, "xy": xy, "near": None, "deliver": None, "verify": xy}
+    sortie = uav.plan_sortie((0.0, 500.0), 5.0, 2000.0, 0.0)
+    air = uav.planner.air.positions
+    assert len(sortie.tour) == 1 and np.hypot(*(air[sortie.tour[0]] - xy)) == pytest.approx(np.hypot(*(air - xy).T).min())
+    land = uav.road.positions[sortie.land_idx]
+    assert sortie.t_land - 5.0 >= (np.hypot(*(np.subtract(xy, (0.0, 500.0)))) + np.hypot(*(land - xy))) / uav.spec.speed
+    uav.task = uav.call
+    uav._fly({"tour": sortie.tour, "land_node": sortie.land_idx})
+    assert uav.waypoints == [xy, tuple(land)]
+    # It could land nowhere in time: it stays.
+    uav = _messenger(_plan(arrive_from=1e5))
+    uav.call = {"for": None, "xy": xy, "near": None, "deliver": None, "verify": xy}
+    assert uav.plan_sortie((0.0, 500.0), 5.0, 2000.0, 0.0) is None
+
+
+def _pocket_mission(on_map: bool, sighted_at_start: bool, confirm_by=("uav0",), max_time_s=3600.0):
+    """The line map with the road cut at node 14 (on the map, or found by driving there), the near
+    scout (uav0, 20 m sensor) on the dock and the far scout (uav1) searching, or hovering over the
+    target from the start. Belief is on the right of the map."""
+    from marsupial_search.core import Layer, SensorSpec
+    from marsupial_search.sim.scenario import MapMismatch, RobotInit
+    sc = make_line_scenario(n_uav=2, target_xy=POCKET_XY)
+    robots = {**sc.robots, "uav0": dataclasses.replace(sc.robots["uav0"], sensor=SensorSpec(20.0, (Layer.SHARED, Layer.AERIAL)))}
+    prior = np.full(sc.grid.shape, 1e-4)
+    prior[:, 30:] = 1.0
+    sc = dataclasses.replace(sc, robots=robots, prior=prior / prior.sum())
+    if on_map:
+        sc = dataclasses.replace(sc, graphs={**sc.graphs, RobotType.UGV: sc.graphs[RobotType.UGV].with_changes([CUT])})
+    else:
+        sc = dataclasses.replace(sc, road_mismatch=MapMismatch(blocked=(CUT,)))
+    if sighted_at_start:
+        sc = dataclasses.replace(sc, init={**sc.init, "uav1": RobotInit(position=(875.0, 560.0))})
+    team = make_team(SCOUT_TEAM)
+    res = Simulator(sc, SimConfig(confirm_by=confirm_by, max_time_s=max_time_s)).run(team)
+    return res, team.robots["ugv0"]
+
+
+@pytest.mark.parametrize("on_map, sighted_at_start", [(True, False), (True, True), (False, True)])
+def test_the_near_scout_verifies_a_sighting_in_a_cut_off_pocket(on_map, sighted_at_start):
+    res, ugv = _pocket_mission(on_map, sighted_at_start)
+    assert res.outcome == "found" and res.found_by == "uav0" and res.summary()["rejected"] == 0
+    t = {(e.type, e.robot_id): e.time for e in reversed(res.events)}  # each first time
+    off = [e.time for e in res.events if e.type == EventType.UNDOCKED and e.robot_id == "uav0"]
+    assert t[EventType.TARGET_SIGHTED, "uav1"] < off[-1] < res.time_s <= off[-1] + 60.0  # sighted, sent, verified
+    assert ugv.verify_flown and ugv.verify_call["node"] == 13  # from the reachable node nearest it
+    assert res.trajectories["ugv0"][:, 0].max() <= 675.0 + 1e-6  # never drove to the blockage
+    if not on_map:  # sighted before the UGV ran into the blockage: the detour (cut off) called it
+        assert t[EventType.TARGET_SIGHTED, "uav1"] == 0.0 and ugv.roads.blocked == {CUT}
+
+
+def test_without_a_verifier_a_cut_off_target_is_never_found():
+    res, ugv = _pocket_mission(True, True, confirm_by=(), max_time_s=900.0)
+    assert res.outcome != "found" and not ugv.verify_flown and ugv.verify_call is None

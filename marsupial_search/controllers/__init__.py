@@ -58,8 +58,8 @@ POLICIES: dict[str, PolicyEntry] = {
     "uav_greedy_tour": PolicyEntry(GreedyTourUav, RobotType.UAV, BookingUavConfig,
                                    "books the next landing slot on the UGV's route, flies a greedy chain tour to it"),
     "uav_near_scout": PolicyEntry(NearScoutUav, RobotType.UAV, NearScoutUavConfig,
-                                  "flies low, on standby on the dock: the UGV calls it to make room for a landing "
-                                  "or to scout a blocked node"),
+                                  "flies low, on standby on the dock: the UGV calls it to make room for a landing, "
+                                  "to scout a blocked node, as a messenger, or to verify a sighting it cannot reach"),
     "uav_far_scout": PolicyEntry(FarScoutUav, RobotType.UAV, FarScoutUavConfig,
                                  "flies high, searching the wider area: books its own sorties (for now as "
                                  "uav_greedy_tour)"),

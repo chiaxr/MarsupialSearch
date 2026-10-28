@@ -7,8 +7,9 @@ detection. One target-free run per map therefore gives, for every target cell an
 
 * when the target would be **found** directly: the first time a robot whose type ends the
   mission (``SimConfig.terminate_on``, the UGV) is within range. This part is exact;
-* or when it would be **sighted** first, by a robot that only reports it: then the find time
-  is predicted as the sighting time plus the UGV's drive from where it is to the target.
+* or when it would be **sighted** first: by a robot whose sighting ends the mission
+  (``SimConfig.confirm_by``), then; by one that only reports it, at the sighting time plus the
+  UGV's drive from where it is to the target (none if the target is out of its reach).
   This part is an estimate: how quickly a team confirms a sighting depends on the team. A
   sensor that detects a layer with probability ``p < 1`` per look (per pass over the cell)
   sights it on its k-th look with probability ``p_k Π_{i<k} (1 − p_i)``; ``T̂`` is the
@@ -43,7 +44,7 @@ def target_free(cfg: SimConfig) -> SimConfig:
 def target_weights(scenario: Scenario) -> np.ndarray:
     """P(target in layer l of cell), shape (layers, H, W): what ``resample_target`` draws from."""
     m = scenario.meta
-    q = m["target_distribution"] * m["confirmable_mask"]
+    q = m["target_distribution"] * m.get("target_mask", m["confirmable_mask"])
     lf = scenario.layer_fractions
     w = q[None] * lf / np.maximum(lf.sum(0, keepdims=True), 1e-300)
     return w / w.sum()
@@ -122,7 +123,7 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
     dist_cache: dict[int, np.ndarray] = {}
     for layer in range(N_LAYERS):
         Tl = np.where(np.isfinite(found), found, end).ravel()
-        cells, times, pd = [], [], []
+        cells, times, pd, ends = [], [], [], []
         for rid in seers:
             q = scenario.robots[rid].sensor.layer_p()[layer]
             if q > 0:
@@ -130,12 +131,13 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
                 cells.append(c)
                 times.append(t)
                 pd.append(np.full(len(c), q))
+                ends.append(np.full(len(c), rid in cfg.confirm_by))  # its sighting ends the mission
         if cells:
-            cells, times, pd = map(np.concatenate, (cells, times, pd))
+            cells, times, pd, ends = map(np.concatenate, (cells, times, pd, ends))
             keep = times < found_flat[cells]  # sighted before the UGV gets there
-            cells, times, pd = cells[keep], times[keep], pd[keep]
+            cells, times, pd, ends = cells[keep], times[keep], pd[keep], ends[keep]
             o = np.lexsort((times, cells))
-            cells, times, pd = cells[o], times[o], pd[o]
+            cells, times, pd, ends = cells[o], times[o], pd[o], ends[o]
             # P(this look is the first to sight it): p_k Π_{i<k} (1 − p_i) over the cell's looks so far
             start = np.r_[True, cells[1:] != cells[:-1]]
             first = np.flatnonzero(start)[np.cumsum(start) - 1]  # per look: its cell's first look
@@ -145,7 +147,7 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
             missed = np.exp(lq_before - lq_before[first]) * (certain_before == certain_before[first])
             prob = pd * missed
             live = prob > 0  # looks after a certain sighting cannot be the first
-            cells, times, prob = cells[live], times[live], prob[live]
+            cells, times, prob, ends = cells[live], times[live], prob[live], ends[live]
         if len(cells):  # sighted first: the UGV drives from where it is to the target
             steps = np.searchsorted(result.traj_t, times)
             src = np.array([road.nearest_node(traj[min(i, len(traj) - 1)]) for i in steps])
@@ -156,6 +158,7 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
                     dist_cache[n] = road.distances_from(int(n))[0]
                 sel = src == n
                 drive[sel] = dist_cache[n][dst[sel]]
+            drive[ends] = 0.0
             Tk = np.minimum(np.minimum(times + drive / speed, found_flat[cells]), cfg.max_time_s)
             p_sight = np.bincount(cells, prob, minlength=Tl.size)
             Tl = np.bincount(cells, prob * Tk, minlength=Tl.size) + (1.0 - p_sight) * Tl

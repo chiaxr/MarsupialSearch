@@ -128,6 +128,10 @@ class ScenarioConfig:
     # prior
     prior_model: str = "semantic"  # "semantic" (LMPath-style) | "gaussian_mixture"
     target_object: str = "car"  # key into SEMANTIC_LABELS
+    # True: the target lies within UGV sensor range of the roads the UGV can reach. False: anywhere the
+    # target distribution allows, e.g. in a part of the road network blockages cut off, where only a
+    # UAV can confirm it (SimConfig.confirm_by)
+    target_ugv_confirmable: bool = True
     prior_labels: Optional[tuple[str, ...]] = None  # label names (see label_mask); overrides the object
     prior_segmentation_error: float = 0.1  # share of label area mislabelled (half missed, half spurious)
     prior_error_blob_m: float = 75.0  # spatial scale of segmentation errors
@@ -413,16 +417,18 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
     robots, init = _make_fleet(cfg, reachable, terrain, grid, rng)
 
     confirm_mask = _confirmable_mask(grid, reachable, cfg.fleet.ugv_sensor_range, init["ugv0"].node)
-    if not (target_dist * confirm_mask).any():
+    target_mask = confirm_mask if cfg.target_ugv_confirmable else np.ones(grid.shape, dtype=bool)
+    if not (target_dist * target_mask).any():
         raise ValueError("no cell is both a plausible target location and within UGV sensor range of a road")
     trng = np.random.default_rng(cfg.seed + 1 if cfg.target_seed is None else cfg.target_seed)
-    target_xy, target_layer = sample_target(grid, target_dist, layer_fractions, confirm_mask, trng)
+    target_xy, target_layer = sample_target(grid, target_dist, layer_fractions, target_mask, trng)
 
     meta = {
         "config": cfg,
-        "confirmable_mask": confirm_mask,
+        "confirmable_mask": confirm_mask,  # cells the UGV can get within sensor range of
         "confirmable_prior_mass": float(prior[confirm_mask].sum()),
-        "target_distribution": target_dist,  # what the hidden target is drawn from (x confirmable)
+        "target_mask": target_mask,  # where the target may be (confirmable_mask, or everywhere)
+        "target_distribution": target_dist,  # what the hidden target is drawn from (x target_mask)
         "label_mask": truth,  # true semantic label cells (semantic prior only)
         "road_length_m": float(full_road.lengths.sum()),
         "road_unmapped_nodes": len(mismatch.new_nodes),
@@ -678,9 +684,9 @@ def _confirmable_mask(grid: GridSpec, road: TraversabilityGraph, sensor_range: f
     return (d <= sensor_range).reshape(grid.shape)
 
 
-def sample_target(grid, dist, layer_fractions, confirm_mask, rng) -> tuple[tuple[float, float], Layer]:
-    """Draw a target cell from ``dist`` restricted to ``confirm_mask``, then its visibility layer."""
-    p = (dist * confirm_mask).ravel()
+def sample_target(grid, dist, layer_fractions, mask, rng) -> tuple[tuple[float, float], Layer]:
+    """Draw a target cell from ``dist`` restricted to ``mask``, then its visibility layer."""
+    p = (dist * mask).ravel()
     idx = rng.choice(p.size, p=p / p.sum())
     r, c = divmod(int(idx), grid.cols)
     lf = layer_fractions[:, r, c]
@@ -710,5 +716,5 @@ def resample_target(scenario: Scenario, rng) -> Scenario:
     """Copy of ``scenario`` with a new hidden target drawn the same way the generator does."""
     m = scenario.meta
     xy, layer = sample_target(scenario.grid, m["target_distribution"], scenario.layer_fractions,
-                              m["confirmable_mask"], rng)
+                              m.get("target_mask", m["confirmable_mask"]), rng)
     return scenario.with_target(xy, layer)

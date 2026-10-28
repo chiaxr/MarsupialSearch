@@ -99,8 +99,15 @@ take-off) is about 3 min, during which the other UAV cannot land.
 
 **The mission** ends when the hidden, stationary target is within sensor range of the UGV
 (`TARGET_FOUND`). UAVs only report it (`TARGET_SIGHTED`), so a sighting needs the UGV to drive over
-and confirm it. Sensors are perfect by default (`p_detect = 1`). A mission also ends when the UGV
-is depleted, or at the 6 h limit.
+and confirm it, unless a UAV's own sighting ends the mission (`sim.confirm_by`, e.g. `[uav0]`: the
+near scout, flying low to verify a sighting). Sensors are perfect by default (`p_detect = 1`). A
+mission also ends when the UGV is depleted, or at the 6 h limit.
+
+The target is drawn within UGV sensor range of the roads the UGV can reach on the map. With
+`scenario.target_ugv_confirmable: false` it may lie anywhere the target distribution allows, e.g.
+in a part of the road network blockages cut off: only a UAV in `confirm_by` can then end the
+mission there (`ugv_timed_route` sends the near scout to verify such a sighting; see
+[controllers.md](controllers.md#ugv_timed_route) and `configs/small_car_verify.yaml`).
 
 ### 1.2 Simulator model
 
@@ -114,7 +121,7 @@ is depleted, or at the 6 h limit.
 | Docked | UAV rides with the UGV and draws no power. Its battery is swapped for a full one in `swap_duration_s`, while the UGV drives or (with `swap_while_moving: false`) only while it stands still. A docked UAV's `mode_time_remaining` is what is left of its swap. |
 | Undocking | take-off takes `undock_duration_s`; it **aborts** if the UGV moves during it, and is rejected while the swap is in progress |
 | Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Each pass over a cell is one look: a layer seen with probability `p < 1` gets its look when the cell enters the footprint, not again while it stays in view, and the target is rolled for once per pass (hovering over it does not help). Road-map mismatches in range come as a `TraversabilityUpdate`. |
-| Termination | `TARGET_FOUND` when the target is inside the sensor range of a robot whose type is in `SimConfig.terminate_on` (default: UGV only; perfect, distance-only test). Other robots report `TARGET_SIGHTED`. Other outcomes: `ugv_depleted` (`stop_when_ugv_depleted`, on by default), `all_depleted`, `controller_done`, `timeout`. |
+| Termination | `TARGET_FOUND` when the target is inside the sensor range of a robot whose type is in `SimConfig.terminate_on` (default: UGV only; perfect, distance-only test), or when a robot in `SimConfig.confirm_by` (by id, e.g. the near scout `uav0`) sights it (with its layer's `p_detect`, as any sighting). Other robots report `TARGET_SIGHTED`. The controllers are told who ends the mission (`MissionSetup.confirmers`). Other outcomes: `ugv_depleted` (`stop_when_ugv_depleted`, on by default), `all_depleted`, `controller_done`, `timeout`. |
 
 ### 1.3 Visibility layers ("urban needs both robot types")
 

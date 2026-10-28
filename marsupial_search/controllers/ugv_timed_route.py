@@ -20,6 +20,16 @@ Sightings
     detour delays its next stops by no more than the hover slack of every UAV still to land.
     Otherwise it goes there straight after the pin, and re-checks the detour at every node it
     gets to (and once a stop there is done) while a stop still comes before the sighting.
+Verifying a sighting (``verify``)
+    With a standby UAV whose sighting ends the mission (``MissionSetup.confirmers``: the near
+    scout, flying low), a sighting the UGV cannot get within sensor range of on the road map (in
+    a part of it blockages cut off, or off the road) is verified from the air: the UGV drives to
+    the road node it can reach nearest the sighting and calls that UAV there to fly to it. A
+    blockage that makes the UGV's drive there ``verify_detour_m`` longer (or cuts it off) calls it
+    at once instead, from the node the UGV is at or driving to, if that is within
+    ``verify_radius_m`` of the sighting. A verifier away from the dock is called once it is back,
+    if the UGV is still that close (else the UGV drives back); a call it could not book a landing
+    for is not repeated at that node.
 Road-map changes
     Found by the UGV or reported by a UAV. New roads are used from the next re-plan. If the
     route runs into a blocked node, it goes round it at once: by the shortest way back to the
@@ -95,6 +105,9 @@ class UgvTimedRouteConfig(DockBookingConfig):
     pocket_weight: float = 2.0  # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: float = 15.0  # a standby UAV called to a blocked node that has not booked its landing by then stays docked
     messenger: bool = True  # a UAV out of touch can no longer be met in time: send the standby UAV to tell it where (with relay)
+    verify: bool = True  # a sighting the UGV cannot get within sensor range of: a standby UAV whose sighting ends the mission verifies it ...
+    verify_radius_m: float = 500.0  # ... called from the road node nearest it, or from where the UGV is if this close to it ...
+    verify_detour_m: float = 300.0  # ... once a blockage makes the UGV's drive there this much longer (or cuts it off)
     road_planner: str = "optimistic"  # optimistic: shortest paths on the map as known | ctp: Canadian Traveller's Problem
     ctp_samples: int = 16  # ctp: blockage scenarios per decision
     ctp_search_legs: bool = False  # ctp: also the ways between the search route's nodes (else: detours, pursuits, moved landings)
@@ -143,6 +156,12 @@ class TimedRouteUgv(BookingRobot):
         self.pursuit = "none"  # none -> planned (route goes past the sighting) -> done (passed it)
         self.pursuit_end = 0  # route index where the pursuit path ends
         self.pursuit_check: Optional[tuple] = None  # pursuit planned after the pin: where the detour was last checked
+        self.pursuit_verify = False  # the pursuit ends at the road node nearest the sighting, to call the verifier there
+        self.verify_reach = 0.0  # ... that node's distance from the sighting
+        self.verify_due = False  # call the verifier at the node the UGV is at or driving to
+        self.verify_call: Optional[dict] = None  # the take-off stop it is called to
+        self.verify_flown = False  # it took off to verify the sighting
+        self.verify_failed: set[int] = set()  # road nodes where a call to verify was withdrawn
         self.swap_until = -np.inf  # a docked UAV's battery swap ends then (held for, without swap_while_moving)
         self.swap_end: dict[str, float] = {}  # UAV -> when the battery swap after its last landing ends
         self.standby: set[str] = set()  # UAVs that stay on the dock until called (they say so in their status)
@@ -309,6 +328,8 @@ class TimedRouteUgv(BookingRobot):
         at_node = s.node is not None and s.node == self.nodes[self.cur]
         head = min(self.cur if at_node else self.cur + 1, len(self.nodes) - 1)  # the node it is at, or driving to
         hit = next((n for n in self.nodes[head:] if self.road.blocked[n]), None)
+        if old is not None and self._long_detour(head, old):
+            self.verify_due = True  # (_check_verify calls the verifier this step)
         ahead = [i - head for i, sts in self.stops.items() if i > head and any(st["kind"] == LAND for st in sts)]
         arr = self._times(s, now)
         spare = min((st["ready"] + st["slack"] - arr[i] for i, sts in self.stops.items() if i > head
@@ -334,7 +355,8 @@ class TimedRouteUgv(BookingRobot):
         self.version += 1
         self.revision += 1
         self.target, self.sent_path = head, None
-        if hit is not None and old is not None and dist(s.position, self.road.positions[hit]) <= self.cfg.call_radius_m:
+        if hit is not None and old is not None and not self.verify_due \
+                and dist(s.position, self.road.positions[hit]) <= self.cfg.call_radius_m:
             self._call_to_blocked(s, now, head, tuple(self.road.positions[hit]), old)
         self._check_landings(s, now, retime=True)
         self._pull_takeoffs(s, now)
@@ -700,6 +722,88 @@ class TimedRouteUgv(BookingRobot):
         value = mass(cut) + (cfg.pocket_weight - 1.0) * mass(pocket)
         return cut if value >= cfg.call_min_belief else None
 
+    # -------------------------------------------------------------- verify
+    def _verifier(self) -> Optional[str]:
+        """The standby UAV whose sighting ends the mission, to verify a sighting with (None: none)."""
+        if not self.cfg.verify:
+            return None
+        return next((u for u in sorted(self.standby - self.lost) if u in self.setup.confirmers), None)
+
+    def _pursuit_path(self, src: int, xy) -> list[int]:
+        """The way from node ``src`` past a sighting (``pursuit_path``), or, with a verifier and no
+        road the UGV can reach within sensor range of it, to the road node it can reach nearest it,
+        to call the verifier there (``pursuit_verify``)."""
+        path = [int(n) for n in pursuit_path(self.road, xy, src, self._path)]
+        self.pursuit_verify = False
+        if self._verifier() is None or self._sees(path, xy):
+            return path
+        d, _ = self.road.distances_from(src)
+        ok = np.flatnonzero(np.isfinite(d))
+        gap = np.hypot(*(self.road.positions[ok] - np.asarray(xy)).T)
+        near = int(ok[np.argmin(gap)])
+        self.pursuit_verify, self.verify_reach = True, float(gap.min())
+        return [int(n) for n in self._path(src, near)[0]] or [src]
+
+    def _sees(self, path: list[int], xy) -> bool:
+        """Does the UGV get within sensor range of ``xy`` on the last edge of ``path`` (with a step to spare)?"""
+        a, b = self.road.positions[path[-2:][0]], self.road.positions[path[-1]]
+        p, ab = np.asarray(xy, dtype=float), b - a
+        t = np.clip((p - a) @ ab / max(ab @ ab, 1e-12), 0.0, 1.0)
+        return dist(a + t * ab, p) <= self.spec.sensor.range_m - self.spec.speed * self.setup.dt
+
+    def _long_detour(self, head: int, old: TraversabilityGraph) -> bool:
+        """After a road-map change: does it make the UGV's drive from route index ``head`` to the
+        end of its pursuit ``verify_detour_m`` longer than on the map before (``old``), or cut it
+        off, with a verifier to call and the sighting within ``verify_radius_m`` of ``head``?"""
+        xy = self.belief.detection_xy
+        if self.pursuit != "planned" or xy is None or self.verify_flown or self.verify_call is not None \
+                or self._verifier() is None or not head <= self.pursuit_end < len(self.nodes):
+            return False
+        src, goal = self.nodes[head], self.nodes[self.pursuit_end]
+        if dist(self.road.positions[src], xy) > self.cfg.verify_radius_m or goal >= old.n_nodes:
+            return False
+        d0 = old.distances_from(src)[0][goal]
+        d1 = self.road.distances_from(src)[0][goal]
+        return bool(d1 - d0 >= self.cfg.verify_detour_m)
+
+    def _check_verify(self, s: RobotState, now: float) -> None:
+        """Call the verifier (``verify``) at the node the UGV is at or driving to: at the end of a
+        pursuit to the road node nearest the sighting, or after a long detour (``_long_detour``).
+        It must be on the dock; until it is, the call waits while the UGV stays that close to the
+        sighting (else the UGV drives back). A withdrawn call is not repeated at that node."""
+        xy, u = self.belief.detection_xy, self._verifier()
+        if xy is None or u is None or self.verify_flown:
+            return
+        if self.verify_call is not None:
+            if any(st is self.verify_call for sts in self.stops.values() for st in sts):
+                return  # waiting for it to take off
+            self.verify_failed.add(self.verify_call["node"])  # withdrawn: it could not book a landing
+            self.verify_call, self.verify_due = None, True
+        at_node = s.node is not None and s.node == self.nodes[self.cur]
+        head = min(self.cur if at_node else self.cur + 1, len(self.nodes) - 1)
+        if self.pursuit == "planned" and self.pursuit_verify and head >= self.pursuit_end:
+            self.pursuit, self.verify_due = "done", True  # at the road node nearest the sighting
+        if not self.verify_due:
+            return
+        node = self.nodes[head]
+        if dist(self.road.positions[node], xy) > max(self.cfg.verify_radius_m, self.verify_reach + 1.0):
+            self.verify_due = False  # it drove on without the verifier: go back (unless a call failed)
+            if self.pursuit == "done" and not self.verify_failed:
+                self.pursuit = "none"
+            return
+        if node in self.verify_failed or s.docked_uav != u \
+                or any(st["uav"] == u and "started" in st for sts in self.stops.values() for st in sts):
+            return
+        for i in list(self.stops):  # it leaves from here: its other take-offs (e.g. to make room) go
+            self.stops[i] = [st for st in self.stops[i] if not (st["uav"] == u and st["kind"] == TAKEOFF)]
+        xy = tuple(map(float, xy))
+        self.verify_call = {"kind": TAKEOFF, "uav": u, "ready": self.swap_end.get(u, 0.0), "call": None, "xy": xy,
+                            "near": None, "verify": xy, "node": node}
+        sts = self.stops.setdefault(head, [])
+        sts.insert(sum("started" in st for st in sts), self.verify_call)
+        self.verify_due, self.pursuit = False, "done"
+        self._replan_tail(now, s)  # (no need to drive on to the sighting)
+
     def _drop(self, u: str) -> None:
         """Forget every stop for ``u`` (lost, or never came)."""
         for i in list(self.stops):
@@ -717,7 +821,7 @@ class TimedRouteUgv(BookingRobot):
                     takeoffs[st["uav"]] = (i, st["ready"])
                     if "call" in st:
                         calls[st["uav"]] = {"for": st["call"], "xy": st.get("xy"), "near": st.get("near"),
-                                            "deliver": st.get("deliver")}
+                                            "deliver": st.get("deliver"), "verify": st.get("verify")}
         out = {"version": self.version, "cur": self.cur, "nodes": self.nodes[self.cur:],
                "arrive": arr[self.cur:].tolist(), "pin": self._pin(), "last_land": self.last_land,
                "queue": list(self.bookings.values()), "takeoffs": takeoffs, "lost": sorted(self.lost),
@@ -757,8 +861,10 @@ class TimedRouteUgv(BookingRobot):
         else:
             self._extend(now, s)
         self._maybe_pursue(s, now)
+        self._check_verify(s, now)
         self._drive(s, now, cmds)
-        if self.extend_failed and (self.belief.detection_xy is None or self.pursuit == "done"):
+        if self.extend_failed and (self.belief.detection_xy is None or self.pursuit == "done") \
+                and not self.verify_due and self.verify_call is None:
             # no searchable belief left for either type (UAVs may still be flying)
             P = self.planner
             m = P.searchable_mass(self.belief)
@@ -787,6 +893,8 @@ class TimedRouteUgv(BookingRobot):
             elif ev.type == EventType.DOCKED and stop["kind"] == LAND or \
                     ev.type == EventType.UNDOCKED and stop["kind"] == TAKEOFF:
                 here.pop(0)
+                if stop.get("verify") is not None:
+                    self.verify_flown = True
                 if stop["kind"] == LAND:  # the booking is spent; its take-off stop remains
                     self.bookings.pop(stop["uav"], None)
                     self.swap_until = self.swap_end[stop["uav"]] = now + self.setup.docking.swap_duration_s
@@ -818,6 +926,7 @@ class TimedRouteUgv(BookingRobot):
         re-checking the detour at every node it gets to while a stop still comes before it."""
         if self.pursuit == "planned" and self.cur >= self.pursuit_end:
             self.pursuit = "done"  # drove past it without confirming
+            self.verify_due |= self.pursuit_verify  # (or got to where it calls the verifier)
         if not self.cfg.pursue_sightings or self.belief.detection_xy is None or self.pursuit == "done":
             return
         if self.pursuit == "planned" and self.pursuit_check is None:
@@ -843,7 +952,7 @@ class TimedRouteUgv(BookingRobot):
         else:
             keep = max(self._pin(), self.cur + 1, self.target)
             del self.nodes[keep + 1:]
-            self.nodes += [int(n) for n in pursuit_path(self.road, xy, self.nodes[keep], self._path)[1:]]
+            self.nodes += self._pursuit_path(self.nodes[keep], xy)[1:]
             self.pursuit_end = len(self.nodes) - 1
             self.pursuit_check = ()  # check the detour from the next step on
         self.pursuit = "planned"
@@ -853,7 +962,7 @@ class TimedRouteUgv(BookingRobot):
     def _detour_now(self, at: int, xy) -> bool:
         """Drive from route index ``at`` via the sighting to the next stop, if no UAV still to
         land waits past its slack."""
-        path = [int(n) for n in pursuit_path(self.road, xy, self.nodes[at], self._path)]
+        path = self._pursuit_path(self.nodes[at], xy)
         nxt = min((i for i, st in self.stops.items() if st and i > at), default=None)
         if nxt is None:  # no stops ahead: the detour replaces the route
             self.nodes = self.nodes[:at] + path

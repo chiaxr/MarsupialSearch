@@ -1,12 +1,14 @@
 import ast
+import dataclasses
 import pathlib
 
 import numpy as np
 import pytest
 
 from marsupial_search.core import Layer, RobotType, SensorSpec, Terrain, TraversabilityGraph
-from marsupial_search.sim import SCENARIO_BASES, ScenarioConfig, generate_scenario
+from marsupial_search.sim import SCENARIO_BASES, ScenarioConfig, generate_scenario, resample_target
 from marsupial_search.sim.generator import FleetConfig
+from marsupial_search.sim.scenario_bases import small
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "marsupial_search"
 
@@ -142,3 +144,18 @@ def test_hiker_is_on_roadside_or_in_vegetation_seen_from_a_road_node():
             assert tree.query(s2.target_xy)[0] <= cfg.fleet.ugv_sensor_range
         kinds.add(int(t))
     assert kinds == {int(Terrain.ROAD), int(Terrain.VEGETATION)}
+
+
+def test_the_target_may_lie_where_the_ugv_cannot_confirm_it():
+    """With ``target_ugv_confirmable`` off, the target is drawn from the whole target distribution,
+    e.g. in parts of the road network that blockages cut off."""
+    cfg = dataclasses.replace(small(3), road_blocked_fraction=0.1, road_cutoff_fraction=0.2)
+    on = generate_scenario(cfg)
+    off = generate_scenario(dataclasses.replace(cfg, target_ugv_confirmable=False))
+    assert np.array_equal(on.meta["target_mask"], on.meta["confirmable_mask"]) and off.meta["target_mask"].all()
+    assert off.meta["road_cutoff_nodes"] > 0
+    rng = np.random.default_rng(0)
+    cells = [off.grid.world_to_cell(*resample_target(off, rng).target_xy) for _ in range(300)]
+    outside = [rc for rc in cells if not off.meta["confirmable_mask"][rc]]
+    assert outside and len(outside) < len(cells)
+    assert all(on.meta["confirmable_mask"][on.grid.world_to_cell(*resample_target(on, rng).target_xy)] for _ in range(50))

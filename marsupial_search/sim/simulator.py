@@ -13,7 +13,8 @@ Per step (``dt`` seconds), in order:
    :class:`TraversabilityUpdate` per robot that sees road-map mismatches it had not seen. Each
    pass is one look: for a layer seen with probability < 1 the update covers only the cells that
    entered the footprint this step, and a sighting is rolled once per pass over the target and
-   holds while it stays in view;
+   holds while it stays in view. A robot of a ``terminate_on`` type ends the mission with the
+   target in range; one in ``confirm_by`` (a UAV flying low to verify a sighting) on sighting it;
 8. radio: queue this step's ``Transmit`` commands and deliver messages that are due.
 
 Robots are given the prior road map (``Scenario.graphs``); the UGV drives on the true one
@@ -73,6 +74,9 @@ class SimConfig:
     # Robot types whose sensor range ending on the target ends the mission (perfect,
     # distance-only test). Other types report TARGET_SIGHTED via their belief update.
     terminate_on: tuple[RobotType, ...] = (RobotType.UGV,)
+    # Robots (by id) whose sighting also ends the mission, e.g. the near scout (uav0), flying low
+    # to verify one. The controllers are told who ends it (MissionSetup.confirmers).
+    confirm_by: tuple[str, ...] = ()
     energy_noise_std: float = 0.0  # std of the energy estimate error, fraction of capacity
     log_interval_s: float = 10.0
     belief_snapshot_interval_s: Optional[float] = None  # store posterior snapshots for animation
@@ -229,7 +233,13 @@ class Simulator:
             ranges = dict(radio.range_m)
         else:
             ranges = {t: float("inf") for t in RobotType}  # ideal channel: unlimited range
-        self.setup: MissionSetup = dataclasses.replace(scenario.mission_setup(self.config.dt), radio_range_m=ranges)
+        unknown = set(self.config.confirm_by) - set(scenario.robots)
+        if unknown:
+            raise ValueError(f"confirm_by: no robots {sorted(unknown)} in scenario {scenario.name!r}")
+        confirmers = tuple(rid for rid, spec in scenario.robots.items()
+                           if spec.robot_type in self.config.terminate_on or rid in self.config.confirm_by)
+        self.setup: MissionSetup = dataclasses.replace(scenario.mission_setup(self.config.dt), radio_range_m=ranges,
+                                                       confirmers=confirmers)
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -581,6 +591,10 @@ class Simulator:
                     if self._target_seen[r.rid]:
                         detected = True
                         self._emit(EventType.TARGET_SIGHTED, r.rid)
+                        if r.rid in self.config.confirm_by and not self.done:
+                            self.found_by = r.rid
+                            self._emit(EventType.TARGET_FOUND, r.rid)
+                            self._finish("found")
             # A sighting's update carries no looks (BeliefMap.apply skips it): the cells that came
             # into view get theirs on the next step without one.
             self._view[r.rid] = (row0, col0, mask & ~new if detected else mask)

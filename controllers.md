@@ -8,7 +8,7 @@ how they are combined into teams, are in the [README](README.md#2-controllers).
 | `ugv_timed_route` | policy | UGV | commits to a timed road route; UAVs book landings on it | `ugv_timed_route.py` |
 | `ugv_ctp_route` | policy | UGV | `ugv_timed_route`, planning its way on the road as a Canadian Traveller's Problem (`road_planner: ctp`) | `ugv_timed_route.py`, `ctp.py` |
 | `uav_greedy_tour` | policy | UAV | books the next landing slot on that route and flies a greedy tour to it | `uav_greedy_tour.py` |
-| `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing, to scout a blocked node, or as a messenger to a UAV out of touch | `uav_near_scout.py` |
+| `uav_near_scout` | policy | UAV | flies low, on standby on the dock: the UGV calls it to make room for another UAV's landing, to scout a blocked node, as a messenger to a UAV out of touch, or to verify a sighting the UGV cannot reach | `uav_near_scout.py` |
 | `uav_far_scout` | policy | UAV | flies high, searching the wider area on sorties it books itself (for now as `uav_greedy_tour`) | `uav_far_scout.py` |
 | `joint_planner` | centralised **oracle** | the whole team | plans the UGV route, the dock schedule and both UAVs' tours jointly, over a horizon, with perfect information | `joint_planner.py` |
 
@@ -24,7 +24,9 @@ not yet seen).
 detects it. The UGV sees the ground and shared layers; a UAV sees the aerial and shared layers,
 and street level with probability `fleet.uav_ground_p_detect` (default 0; see
 [Visibility layers](README.md#13-visibility-layers-urban-needs-both-robot-types)). Only the UGV can
-end the mission, so a UAV sighting is worth something only once the UGV drives over to confirm it.
+end the mission, so a UAV sighting is worth something only once the UGV drives over to confirm it,
+unless the near scout's own sighting ends it (`sim.confirm_by: [uav0]`): then it can verify a
+sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*).
 
 **What constrains them.** The dock shapes every plan. A UAV that is not docked has nowhere to wait
 except in the air, and a stay on the dock takes landing + swap + take-off (about 3 min), during
@@ -69,7 +71,9 @@ flight**.
    range, then to where it last heard the UGV. Once it hears the UGV again, it flies to its
    landing, wherever the UGV has it now (or books again if the UGV gave up on it). That is off
    by default: on `large` with blockages that cut off parts of the network, it did not save UAVs
-   (its reserve rarely takes it far enough), and without it the UAV keeps waiting. After
+   (at its reserve it has about 1 km of flight left, and the UGV was usually 1 to 1.6 km away on
+   its detour), and without it the UAV keeps waiting. Leaving earlier, once past its landing time
+   and slack, was tried too: better on one map, worse on another. After
    landing, it swaps belief maps with the UGV (`sync`), so the next tour includes what the other
    UAV reported.
 
@@ -120,6 +124,17 @@ a robot is *in touch* if the status it holds was sent within 10 s (`partner_stal
 (applying a belief update twice would count it twice); bookings and belief syncs are never
 relayed.
 
+*Why.* With blockages that send the UGV the long way round, its new plan moves the landings, and
+a UAV out of the 300 m radio range never heard it: it waited where it had booked and ran flat.
+Relaying is meant to be as simple as possible, as it is not the subject of this project. The
+period exists because the UGV's status changes every step: without it, a robot would forward the
+UGV's whole plan to a neighbour every step. Bookings stay direct because the UGV only accepts one
+planned on its current plan version, which a relayed booking would often have missed. A direct
+status's belief updates are applied even when a newer relayed copy of that robot's state came
+first. With three robots and a 300 m radio, few UAVs are reachable through another, so it saves
+some UAVs, not most (on 40 large maps with cut-offs, 27 lost against 24 with `ugv_timed_route`, 28
+against 22 with `ugv_ctp_route`).
+
 **Standby UAVs.** A UAV whose status says `standby` (`uav_near_scout`) does not book sorties of its
 own: it stays on the dock until the UGV *calls* it, with a take-off stop marked as a call in the
 plan (`calls`). The UGV calls it in three cases:
@@ -150,6 +165,26 @@ plan (`calls`). The UGV calls it in three cases:
   From the moment the messenger should get there, the UGV plans to meet the other UAV as if in
   touch: anywhere on its route that UAV can afford, not only within radio range of where it waits.
 
+  *Why.* With the scout team on 20 large maps with cut-offs (relaying on), the far scout was lost
+  in 7 of 40 missions, each time after one put-back of its landing by 5 to 8 min while it was out
+  of touch. Put-backs beyond its slack were common (116) but the short ones were nearly always
+  survived, so the trigger is the UGV finding no meeting the UAV can afford, not any put-back. At
+  those moments the near scout was on the dock and could get there in time in 6 of 7. The UGV
+  re-plans the meeting as if in touch before the messenger leaves, or the messenger would carry a
+  landing the UAV still could not afford. The rest came from testing:
+  - *Its other take-offs go, and the take-offs pull back.* At first the messenger booked a landing
+    41 min ahead: an old take-off of its own (to make room for that same UAV's original landing)
+    kept that UAV's take-off far down the route, so the dock looked taken until then.
+  - *No landing in reach, no sortie.* It used to book the first free landing anyway; in flight its
+    energy check then dropped the leg to the other UAV at once (it could not hover until that
+    landing), and it flew straight to its landing. On one map that lost a far scout that survived
+    without a messenger.
+  - *Not repeated for that landing.* The UGV holds at the call (up to 15 s) while the standby UAV
+    tries to book; calling again and again would stall it.
+  - *It waits at the point.* The other UAV may still be on its tour; flying past would miss it.
+
+  On 40 large maps with cut-offs it cut the UAVs lost from 18 to 6 ([results](README.md#34-results)).
+
 A called UAV books its landing wherever the dock is free, not only after the pin: the plan lists
 the route indices each UAV is on the dock (`busy`). The UGV adds no take-off after that landing.
 The other UAVs keep booking after the pin, and once their battery swap is done (`free_from`);
@@ -170,20 +205,41 @@ route is re-planned on the current belief every 60 s.
   to land would wait past its hover slack (60 s). Otherwise it goes straight after the pin, and
   checks the detour again at every node it gets to (and once a stop there is done) while a stop
   still comes before the sighting.
+- *Verifying a sighting* (`verify`). With a standby UAV whose sighting ends the mission
+  (`MissionSetup.confirmers`: the near scout with `sim.confirm_by: [uav0]`), a sighting the UGV
+  cannot get within sensor range of on its road map (in a part of it blockages cut off, or off
+  the road) is verified from the air. The UGV's pursuit goes to the road node it can reach that is
+  nearest the sighting, and there it calls the near scout to fly to the sighting itself. If a
+  blockage found on the way makes the drive to the end of its pursuit `verify_detour_m` (300 m)
+  longer, or cuts it off, the UGV calls it at once from the node it is at or driving to, if that
+  is within `verify_radius_m` (500 m) of the sighting; farther away, it drives round as before. A
+  near scout away from the dock is called once it is back, if the UGV is still that close (else
+  the UGV drives back); a call it books no landing for is withdrawn and not repeated at that node.
+  On the line map with the road cut 150 m before the target (`tests/test_scouts.py`), the near
+  scout confirms it 21 s after it takes off, in each of the three missions there.
 - *A missing UAV:* the UGV drops a landing 120 s after the UAV's slack runs out, or 120 s after a
-  landing that started should have ended (the UAV ran out of energy on the way down: it sends nothing more).
-- *Recovery (a landing the UGV can't make):* when the UAV can no longer afford to wait for the
-  UGV at its landing node (from the energy and tour end it reports, or as booked), when that node
-  turns out to be blocked, or when after a re-route the UGV would get there more than
-  `recover_gain_s` (60 s) late, the UGV moves the landing to where it best meets the UAV:
-  any node of its route between the stops around it, or of the shortest way to the landing node
-  (it then skips the route in between). The best meeting lands the UAV soonest with the least
-  waiting by the UGV, among those the UAV can afford to fly to. The take-off follows to the first
-  node the UGV reaches once the battery is swapped (a landing moved onto its own take-off's index
-  goes before it). A UAV out of touch (no status for `uav_stale_s`, 10 s, direct or relayed) is
-  only met within radio range of the end of its tour, where it waits, so it hears the UGV arrive;
-  if no meeting there is affordable, the UGV may send a standby UAV as a messenger (see standby
-  UAVs above), and from when it should get there plans to meet that UAV as if in touch.
+  landing that started should have ended (the UAV ran out of energy on the way down: it sends
+  nothing more).
+- *Recovery (a landing the UGV can't make):* when the UAV can no longer afford to wait for the UGV
+  at its landing node (from the energy and tour end it reports, or as booked), when that node turns
+  out to be blocked, or when after a re-route the UGV would get there more than `recover_gain_s` (60
+  s) late, the UGV moves the landing to where it best meets the UAV: any node of its route between
+  the stops around it, or of the shortest way to the landing node (it then skips the route in
+  between). The best meeting lands the UAV soonest with the least waiting by the UGV, among those
+  the UAV can afford to fly to. The take-off follows to the first node the UGV reaches once the
+  battery is swapped. A landing moved onto its own take-off's index goes before it: a re-route that
+  skips both can put them on one index, and with the take-off first the UGV waited for good for a
+  UAV not yet on the dock (on `large` with a mismatch, map 0 timed out with both planners until this
+  was fixed). A UAV out of touch (no status for `uav_stale_s`, 10 s, direct or relayed) is only met
+  within radio range of the end of its tour, where it waits, so it hears the UGV arrive; if no
+  meeting there is affordable, the UGV may send a standby UAV as a messenger (see standby UAVs
+  above), and from when it should get there plans to meet that UAV as if in touch. Two other answers
+  to a UAV out of touch were tried and dropped. A detour by the UGV to within radio range of where
+  the UAV waits was mixed in tests: it saved both UAVs in one mission and lost both in two others
+  that had lost none. A backup rendezvous agreed before take-off, on a node the UGV had already
+  driven (sure to be passable), would have saved 1 of 20 UAVs lost if it were the sortie's take-off
+  node, and 4 had every sortie kept 10 % of its battery for it: by the time the UGV is overdue, the
+  UAV is at its reserve, and the UGV was 0.4 to 5 km by road from that take-off node.
 
 ```mermaid
 stateDiagram-v2
@@ -300,6 +356,9 @@ next tour node go in `uav_far_scout.py` (`_tour_mass`).
    (else the first it can reach, and if it can reach none, it books nothing and stays on the
    dock). At that node it holds until it hears the other UAV directly (relaying then hands over
    the UGV's plan, and carries that UAV's status back), or until it must leave to land on time.
+5. **To verify a sighting** (`verify`, when its sighting ends the mission). It flies to the
+   sighting itself (booking the UAV-grid node nearest it as its tour), then lands at the first
+   route index it can reach in time; if it can reach none, it books nothing and stays on the dock.
 
 Each time, it lands only where the dock is free, and early enough that its battery is swapped
 before the other UAV's next landing.
@@ -309,6 +368,7 @@ stateDiagram-v2
     state "On the dock, standby" as OnDock
     state "Making room" as Room
     state "Scouting a blockage" as Scout
+    state "Verifying a sighting" as Verify
     state "Landing" as Landing
     state "Messenger" as Msg {
         state "To the far scout" as ToPoint
@@ -323,6 +383,9 @@ stateDiagram-v2
     OnDock --> Room : called, far scout about to land
     OnDock --> Scout : called to a blockage
     OnDock --> Msg : called as messenger
+    OnDock --> Verify : called to a sighting
+    Verify --> [*] : sights the target (mission found)
+    Verify --> Landing : UGV holds for it
     OnDock --> OnDock : no landing booked in time
     Room --> Landing : UGV holds for it
     Scout --> Landing : UGV holds for it
@@ -330,7 +393,7 @@ stateDiagram-v2
     Landing --> OnDock : docked
 ```
 
-A call to a blockage or as a messenger is withdrawn if it books no landing within
+A call to a blockage, as a messenger or to verify a sighting is withdrawn if it books no landing within
 `call_timeout_s` (15 s); called to make room, it leaves either way and books from the air.
 
 With a standby UAV on the team, the UGV holds at a call (highlighted) as at any take-off, until
@@ -415,22 +478,31 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
   or one the UGV now reaches too late, goes to where the UGV best meets that UAV (the recovery
   above); a UAV on its way flies to the new landing node once it hears the plan.
 - **`ugv_ctp_route` (`road_planner: ctp`).** The optimistic planner above takes the shortest way on
-  the map as known, as if every node not yet found blocked were passable. `ugv_ctp_route` plans
-  the ways it drives to get somewhere as a [Canadian Traveller's Problem](https://en.wikipedia.org/wiki/Canadian_traveller_problem)
-  instead: round a blocked node (to the node `bypass` rejoins at, and only if its way keeps the
-  landings within the hover slack left; else the shortest way), to a sighting and to a moved
-  landing. With `ctp_search_legs` it also plans the ways between the nodes the greedy route picks
-  (by shortest distance, as before), weighing the belief swept on the way. Distance alone would
-  favour the roads a robot has seen, which are those already searched. That is off by default:
-  it gained nothing in the [results](README.md#34-results), at up to 3× the compute.
+  the map as known, as if every node not yet found blocked were passable. `ugv_ctp_route` plans the
+  ways it drives to get somewhere as a [Canadian Traveller's
+  Problem](https://en.wikipedia.org/wiki/Canadian_traveller_problem) instead: round a blocked node
+  (to the node `bypass` rejoins at, and only if its way keeps the landings within the hover slack
+  left; else the shortest way), to a sighting and to a moved landing. The slack check came from
+  testing: `bypass` picks the node to rejoin by the shortest way, and driving the CTP's longer way
+  there made the landings later than the UAVs could wait, so more UAVs were lost. The optimistic
+  planner keeps its own shortest paths: routing it through the same hook would change which of
+  several equally short ways it takes, and so its missions. With `ctp_search_legs` it also plans the
+  ways between the nodes the greedy route picks (by shortest distance, as before), weighing the
+  belief swept on the way. Distance alone would favour the roads a robot has seen, which are those
+  already searched. That is off by default: it gained nothing in the
+  [results](README.md#34-results), at up to 3× the compute. On most maps the CTP gains little: the
+  UGV sees a blocked node from the node before it, so going round it is short, and the UAVs find
+  most blockages before the UGV gets there (86 % on `small` with the car prior, which puts the
+  belief on the roads). It pays off now and then where a blockage cuts off part of the network.
   - *Blockage model* (`ctp.BlockageModel`). A road node is open once a robot has seen it: the UGV
-    from where it drives, a UAV from where its status says it was (a UAV's sensor finds a
-    blockage in range, and its status carries it). So is a node whose blockage would cut off more
-    of the map than blockages may still cut off (`max_cutoff_fraction`, the generator's
+    from where it drives, a UAV from where its status says it was (a UAV's sensor finds a blockage
+    in range, and its status carries it: a position heard means what the UAV found there is heard
+    too, while one not heard counts as unseen). So is a node whose blockage would cut off more of
+    the map than blockages may still cut off (`max_cutoff_fraction`, the generator's
     `road_cutoff_fraction`; by default 0: no node the map needs to stay in one piece is ever
     blocked), and a node missing from the map. Every other node is blocked with the share of the
     nodes seen that were blocked, under a Beta prior (mean `block_prior`, 5 %, worth
-    `block_prior_weight`, 20, nodes).
+    `block_prior_weight`, 20, nodes): the controllers are not told how many nodes are blocked.
   - *Policy* (`ctp.CtpPlanner`): optimistic rollout (ORO; Eyerich, Keller and Helmert, AAAI 2010).
     At each junction the next node `v` minimises `len(u, v) + E[cost of the optimistic policy
     from v]`, averaged over `ctp_samples` (16) blockage scenarios drawn from the model. A rollout
@@ -440,7 +512,11 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
     the best rollout cost is skipped. When no node within sensor range of the shortest way may be
     blocked, that is the answer. The way stored in the route is what the policy drives if it
     finds no blockage: nodes passed within sensor range count as open from there on. A blockage
-    found later re-routes as above, again with the CTP.
+    found later re-routes as above, again with the CTP. Optimistic rollout was chosen over
+    hindsight optimisation, which plans as if it will know where the blockages are and so
+    undervalues the way back from one, and over tree search (UCT), which needs many more rollouts
+    per decision. Its rollouts drive the optimistic policy because that is what the UGV does once
+    it finds a blockage.
   - *Search legs* (`ctp_search_legs`). The leg minimises E[metres driven − μ · belief swept]. A
     road node's reward is its share of the belief left in its footprint (a cell seen from k road
     nodes gives each 1/k), and μ is the greedy route's own rate: `ctp_belief_weight` (1) / the
@@ -450,9 +526,14 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
     sweeps nothing new). The rollouts then use two optimistic policies, shortest at these costs
     and shortest by length, and a candidate scores the cheaper expectation (rollout with several
     base policies, Bertsekas). The first heads for the belief from wherever it starts, so on its
-    own a safe road without belief would never be valued.
+    own a safe road without belief would never be valued: in a test it chose a road blocked
+    somewhere 62 % of the time (expected 1485 m) over a known clear one (1000 m).
   - *Compute.* A way planned between the same two nodes is re-used for `ctp_reuse_s` (60 s),
-    or until the map changes: the greedy route re-plans the same ways every minute.
+    or until the map changes: the greedy route re-plans the same ways every minute. On `large`
+    the first version ran 6.5 times slower than the optimistic UGV (92 s against 14 s for a 6 h
+    mission), almost all in its rollouts and their path searches. Re-use halved the queries, and each
+    search stops at 3 times the shortest distance plus 500 m (a rollout that strays further counts
+    as cut off).
   - *Landing risk.* Its plan carries `clear`: per route index, the chance it gets there with no
     detour longer than the hover slack a UAV keeps (`rendezvous_slack_s` + `hover_margin_s`), from
     the blockage model and a capped search round each node that may be blocked

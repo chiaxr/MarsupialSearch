@@ -1,0 +1,37 @@
+# The small map with a wrong road map whose blockages may cut off parts of the road network (as
+# small_car_cutoff.yaml), and a target that may lie anywhere, also where the UGV cannot get within
+# sensor range of it (target_ugv_confirmable: false). The near scout (uav0, 20 m sensor, flying
+# low) ends the mission when it sights the target (sim.confirm_by), so the UGV sends it to verify
+# a sighting it cannot reach (controllers.md, ugv_timed_route: verifying a sighting). To compare,
+# set controller_params: {ugv_timed_route: {verify: false}}: such a target is then found only if
+# the near scout happens to sight it.
+# python scripts/compare.py     --config configs/small_car_verify.yaml
+# python scripts/run_mission.py --config configs/small_car_verify.yaml   # one mission per team
+teams:
+  - {ugv0: ugv_timed_route, uav0: uav_near_scout, uav1: uav_far_scout}
+out: outputs/small_car_verify
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: car       # car | building | hiker
+  target_ugv_confirmable: false
+  road_unmapped_fraction: 0.1
+  road_blocked_fraction: 0.05
+  road_cutoff_fraction: 0.1
+  fleet:
+    uav_sensor_ranges: {uav0: 20, uav1: 50}
+
+sim:
+  confirm_by: [uav0]       # the near scout's sighting ends the mission
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+  gif_speedup: 30          # small missions last minutes: play the GIF at 30x real time
+
+compare:
+  maps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  targets: 2
+  estimator: cv
+  workers: 10

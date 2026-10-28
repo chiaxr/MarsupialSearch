@@ -3,7 +3,7 @@
 Speaks :mod:`.dock_booking` as a *standby* UAV (it says so in its status). It is meant to fly
 low, next to the UGV, helping it search road nodes nearby that a blockage has suddenly put far
 away by road: give it a smaller sensor range than ``uav_far_scout``
-(``FleetConfig.uav_sensor_ranges``). The UGV (``ugv_timed_route``) calls it in two cases:
+(``FleetConfig.uav_sensor_ranges``). The UGV (``ugv_timed_route``) calls it in these cases:
 
 Making room
     The other UAV is about to land and the dock takes one UAV: it takes off just before that
@@ -25,6 +25,11 @@ A messenger
     waits (``ugv_timed_route``: ``messenger``). It flies to that point and waits there until it
     hears that UAV (relaying then gives it the UGV's plan, and brings its status back), or until
     it must leave to land on time; its landing leaves it ``deliver_wait_s`` for that.
+To verify a sighting
+    If its sighting ends the mission (``MissionSetup.confirmers``; ``SimConfig.confirm_by``), and
+    the UGV cannot get within sensor range of a sighting (``ugv_timed_route``: ``verify``): it
+    flies to the sighting itself from where the UGV calls it, then to the first landing it can
+    reach in time.
 
 Each time it lands at a route index where the dock is free (no other UAV on it), early
 enough that its battery is swapped before the next UAV lands, and stays there.
@@ -83,7 +88,7 @@ class NearScoutUav(GreedyTourUav):
 
     def _launched(self, now: float) -> None:
         call = self.call
-        self.task = call if call is not None and (call["near"] or call.get("deliver")) else None
+        self.task = call if call is not None and (call["near"] or call.get("deliver") or call.get("verify")) else None
         self.call, self.delivered = None, False
         super()._launched(now)
 
@@ -114,6 +119,8 @@ class NearScoutUav(GreedyTourUav):
         if not len(idx):
             return None
         reach = self._reach(start, t_start, P.energy_budget(energy))
+        if task is not None and task.get("verify") is not None:  # to the sighting
+            return self._verify(idx, reach, start, t_start, energy, now, task)
         if task is not None and task.get("deliver"):  # a messenger: to where the other UAV waits
             return self._deliver(idx, reach, start, t_start, energy, now, task)
         if task is not None and task["near"]:  # a blockage: the cut-off roads
@@ -157,6 +164,22 @@ class NearScoutUav(GreedyTourUav):
         pick = next((i for i in fits if arr[i] >= t_start + length[i] / v + self.cfg.deliver_wait_s), fits[0])
         return self._sortie(pick, start, t_start, energy, now, tour=(0.0, [g], length[pick], 0.0))
 
+    def _verify(self, idx, reach, start, t_start: float, energy: float, now: float, task: dict) -> Optional[Sortie]:
+        """A sortie to verify a sighting: to the sighting itself (``_fly``; it books the UAV-grid node
+        nearest it), then the first landing it can reach in time. None if it can reach none: it stays."""
+        air, nodes, xy = self.planner.air.positions, np.asarray(self.plan["nodes"], int), task["verify"]
+        g = int(np.argmin(np.hypot(*(air - np.asarray(xy)).T)))
+        length = {int(i): dist(start, xy) + dist(xy, self.road.positions[nodes[i]]) for i in idx}
+        fits = [i for i in length if reach(i) >= length[i]]
+        if not fits:
+            return None
+        return self._sortie(fits[0], start, t_start, energy, now, tour=(0.0, [g], length[fits[0]], 0.0))
+
+    def _fly(self, booking: dict) -> None:
+        super()._fly(booking)
+        if self.task is not None and self.task.get("verify") is not None and len(self.waypoints) > 1:
+            self.waypoints[0] = tuple(self.task["verify"])  # the sighting itself, not the UAV-grid node nearest it
+
     def _near(self, pts: np.ndarray, radius: float) -> np.ndarray:
         """Claims (``chain_tour``) that keep a tour to UAV-grid nodes within ``radius`` of ``pts``."""
         air = self.planner.air.positions
@@ -169,7 +192,7 @@ class NearScoutUav(GreedyTourUav):
         if self.task is not None and self.task.get("deliver"):
             if self._wait_to_deliver(s, now, cmds):
                 return
-        elif self.task is not None and self.cfg.trace_roads and self.booking is not None:
+        elif self.task is not None and self.task["near"] and self.cfg.trace_roads and self.booking is not None:
             self._trace(s, now)
         super()._step_sortie(s, now, gs, cmds)
 

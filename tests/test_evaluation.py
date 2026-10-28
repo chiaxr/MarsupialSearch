@@ -97,3 +97,15 @@ def test_compare_cv_runs(tmp_path):
                          check=True, capture_output=True, text=True, cwd=ROOT).stdout
     assert "expected time to find" in out
     assert (tmp_path / "maps.csv").exists() and (tmp_path / "runs.csv").exists()
+
+
+def test_a_confirming_uavs_sighting_is_predicted_to_end_the_mission_there_and_then(small):
+    sc, cfg, free = small
+    T0 = evaluation.predicted_find_times(sc, free, cfg)
+    T = evaluation.predicted_find_times(sc, free, dataclasses.replace(cfg, confirm_by=("uav0",)))
+    assert (T <= T0).all() and (T < T0).any()
+    # The shared layer, seen for certain: where uav0 looks first, it is found on that look.
+    first = {rid: evaluation.first_contact(sc, free, rid) for rid in sc.robots}
+    s = int(Layer.SHARED)
+    mine = (first["uav0"] < first["ugv0"]) & (first["uav0"] < first["uav1"])
+    assert mine.any() and np.array_equal(T[s][mine], first["uav0"][mine])

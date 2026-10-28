@@ -59,6 +59,9 @@ controller_params:
     pocket_weight: 2.0             # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: 15.0           # a called standby UAV that has not booked its landing by then stays docked
     messenger: true                # a UAV out of touch can no longer be met in time: send the standby UAV to tell it where (needs relay)
+    verify: true                   # a sighting the UGV cannot get within sensor range of: a standby UAV whose sighting ends the mission (sim.confirm_by) verifies it ...
+    verify_radius_m: 500.0         # ... called from the road node nearest it, or from where the UGV is if this close to it ...
+    verify_detour_m: 300.0         # ... once a blockage makes the UGV's drive there this much longer (or cuts it off)
     # road planner (controllers.md#road-map-mismatch)
     road_planner: optimistic       # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
     ctp_samples: 16                # ctp: blockage scenarios per decision
@@ -98,6 +101,9 @@ controller_params:
     pocket_weight: 2.0             # belief round nodes the blockage puts out of reach counts this many times
     call_timeout_s: 15.0           # a called standby UAV that has not booked its landing by then stays docked
     messenger: true                # a UAV out of touch can no longer be met in time: send the standby UAV to tell it where (needs relay)
+    verify: true                   # a sighting the UGV cannot get within sensor range of: a standby UAV whose sighting ends the mission (sim.confirm_by) verifies it ...
+    verify_radius_m: 500.0         # ... called from the road node nearest it, or from where the UGV is if this close to it ...
+    verify_detour_m: 300.0         # ... once a blockage makes the UGV's drive there this much longer (or cuts it off)
     # road planner (controllers.md#road-map-mismatch)
     road_planner: ctp              # optimistic: shortest paths on the road map as known | ctp: Canadian Traveller's Problem
     ctp_samples: 16                # ctp: blockage scenarios per decision
@@ -252,6 +258,7 @@ scenario:
   prior_model: semantic              # semantic (LMPath proxy) | gaussian_mixture
   target_object: hiker               # car | building | hiker (default: car)
   prior_labels: null                 # label names that override target_object's (road, urban, vegetation, road_near_vegetation, vegetation_near_road_node)
+  target_ugv_confirmable: true       # the target lies within UGV sensor range of the roads it can reach (false: anywhere, e.g. where blockages cut the road off)
   prior_segmentation_error: 0.1      # share of label area mislabelled (half missed, half spurious)
   prior_error_blob_m: 75.0           # spatial scale of the mislabelling
   prior_mask_blur_m: 25.0            # blur of the label masks
@@ -283,6 +290,7 @@ sim:
   dt: 1.0                  # time step [s]
   max_time_s: 21600.0      # time limit (6 h)
   terminate_on: [ugv]      # robot types whose sensor range on the target ends the mission (others only sight it)
+  confirm_by: []           # robots (by id) whose sighting also ends the mission, e.g. [uav0] for the near scout flying low
   energy_noise_std: 0.0    # noise on the energy estimates controllers see, as a fraction of capacity
   log_interval_s: 10.0     # how often the coverage and searched-probability curves are recorded
   belief_snapshot_interval_s: null   # belief snapshots for the GIF (null: chosen by run_mission.py when animating)
