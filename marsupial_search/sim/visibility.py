@@ -1,12 +1,16 @@
 """What occlusion lets a sensor see: per cell, the chance a look detects the target, and per road
 node, the chance a look sees whether it is blocked.
 
+Simulator-side: the robots never get the occlusion. The simulator gives each robot its
+:func:`detection_map` (``MissionSetup.detection``) to plan with, applies looks with it, and
+reports the road nodes a look could not make out (``TraversabilityUpdate.hidden``).
+
 A sensor looks from one of two *viewpoints*: ``"air"`` (a UAV flying high: it sees down onto
 roofs and open ground, into a street only from near overhead, and nothing under the canopy)
 or ``"ground"`` (the UGV, or a UAV flying at street level with a front-facing camera: it sees
 street level and under the canopy, through the trees with some loss, but never onto a roof).
 
-:class:`Occlusion` holds what hides things, per cell, as known from the prior map. Persistent
+:class:`Occlusion` holds what hides things, per cell (ground truth). Persistent
 occlusion (the target under a tree, on a roof, at street level) is in the belief's layers: the
 generator splits each cell's mass across them from the occlusion and the target class. What
 varies from look to look is here:
@@ -34,16 +38,14 @@ from typing import Optional
 
 import numpy as np
 
-from .grid import GridSpec
-from .messages import RobotSpec
-from .types import Layer, RobotType, Terrain
+from marsupial_search.core import GridSpec, Layer, RobotSpec, RobotType, Terrain
 
 AIR, GROUND = "air", "ground"
 
 
 @dataclass(frozen=True)
 class Occlusion:
-    """What hides the target and the roads, per cell (as the prior map shows it)."""
+    """What hides the target and the roads, per cell (ground truth)."""
 
     canopy: np.ndarray  # (H, W) tree cover in [0, 1]
     canyon: np.ndarray  # (H, W) in towns: building height over street width (0 elsewhere)

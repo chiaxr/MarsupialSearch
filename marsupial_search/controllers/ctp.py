@@ -6,14 +6,11 @@ node were passable (the *optimistic* policy) ignores what that costs: a long str
 unseen road may end in a blockage and a long way back.
 
 :class:`BlockageModel`
-    Per road node, the probability that it is blocked: 0 if its blockage would cut off more of
-    the road map than blockages ever cut off (``max_cutoff_fraction``: the generator's
-    ``road_cutoff_fraction``); otherwise the blocked share ``r`` of the nodes seen so far, under
-    a Beta prior, updated by the looks that found nothing there. A look sees whether a node is
-    blocked with probability ``o`` (1 from the ground; from the air, less under trees or deep in
-    a street: ``core.road_observability``), once per pass of each robot, so after looks that
-    missed with ``Π (1 - o) = q`` it is blocked with ``r q / (r q + 1 - r)`` (0 once a sure
-    look has seen it).
+    Per road node, the probability that it is blocked: 0 once a robot has seen it (a robot
+    within sensor range sees a blockage, unless it reports the node ``hidden``: it could not
+    make it out, e.g. under trees) or if its blockage would cut off more of the road map than
+    blockages ever cut off (``max_cutoff_fraction``: the generator's ``road_cutoff_fraction``);
+    otherwise the blocked share of the nodes seen so far, under a Beta prior.
 :class:`CtpPlanner`
     Optimistic rollout (ORO; Eyerich, Keller and Helmert, "High-quality policies for the
     Canadian Traveler's Problem", AAAI 2010). At a junction it takes the next node ``v`` with
@@ -129,50 +126,33 @@ def clear_probabilities(road: TraversabilityGraph, route, p: np.ndarray, max_det
 
 class BlockageModel:
     """What a robot knows of which road nodes are blocked. ``look`` records the nodes a sensor
-    has looked at; ``probabilities`` gives, per node of the current map, the chance it is blocked."""
+    has seen; ``probabilities`` gives, per node of the current map, the chance it is blocked."""
 
     def __init__(self, roads: GraphKnowledge, prior: float = 0.05, prior_weight: float = 20.0,
                  max_cutoff_fraction: float = 0.0):
         self.roads = roads
         self.alpha, self.beta = prior * prior_weight, (1.0 - prior) * prior_weight
         self.max_cutoff_fraction = max_cutoff_fraction  # blockages cut off at most this share of the mapped nodes (1: no limit)
-        self.miss = np.ones(roads.prior.n_nodes)  # per mapped node: the chance every look so far missed a blockage
-        self.in_view: dict[str, set[int]] = {}  # per viewer: the nodes it had in range at its last look
+        self.seen = np.zeros(roads.prior.n_nodes, dtype=bool)  # mapped nodes seen by a robot
         self.version = 0  # bumped whenever the probabilities may change
         self._cut, self._cut_version = None, -1
         self._p, self._p_key = None, None
 
-    @property
-    def seen(self) -> np.ndarray:
-        """Per mapped node: has a sure look seen it?"""
-        return self.miss <= 0.0
-
-    def look(self, graph: TraversabilityGraph, xy, radius: float, observe: Optional[np.ndarray] = None,
-             viewer: str = "") -> None:
-        """A sensor at ``xy`` looked at every road node within ``radius``, seeing whether it is
-        blocked with probability ``observe`` (per node of ``graph``; None: for sure). A
-        ``viewer`` (a robot) looks once per pass: only at the nodes it did not have in range at its
-        last look."""
-        nodes = [n for n in graph.nodes_within(xy, radius) if n < len(self.miss)]
-        if viewer:
-            prev, self.in_view[viewer] = self.in_view.get(viewer, set()), set(nodes)
-            nodes = [n for n in nodes if n not in prev]
-        if not nodes:
-            return
-        nodes = np.asarray(nodes)
-        o = 1.0 if observe is None else np.clip(observe[nodes], 0.0, 1.0)
-        before = self.miss[nodes].copy()
-        self.miss[nodes] *= 1.0 - o
-        if not np.array_equal(before, self.miss[nodes]):
+    def look(self, graph: TraversabilityGraph, xy, radius: float, hidden=()) -> None:
+        """A sensor at ``xy`` saw every road node within ``radius``, but those it reports
+        ``hidden`` (it could not make them out: they stay as unknown as before)."""
+        hidden = set(hidden)
+        nodes = [n for n in graph.nodes_within(xy, radius) if n < len(self.seen) and n not in hidden]
+        if nodes and not self.seen[nodes].all():
+            self.seen[nodes] = True
             self.version += 1
 
     def block_rate(self) -> float:
-        """Posterior mean of the blocked share of the mapped nodes that may be blocked: the
-        looks that found a node open count by how surely they would have seen a blockage."""
-        blocked = np.zeros(len(self.miss), dtype=bool)
+        """Posterior mean of the blocked share of the mapped nodes that may be blocked."""
+        blocked = np.zeros(len(self.seen), dtype=bool)
         blocked[sorted(self.roads.blocked)] = True
-        open_ = float((1.0 - self.miss)[~blocked & ~self._cuts()].sum())
-        return (self.alpha + blocked.sum()) / (self.alpha + self.beta + blocked.sum() + open_)
+        open_ = self.seen & ~blocked & ~self._cuts()
+        return (self.alpha + blocked.sum()) / (self.alpha + self.beta + blocked.sum() + open_.sum())
 
     def probabilities(self, graph: TraversabilityGraph) -> np.ndarray:
         """Per node of ``graph`` (the current map): the chance it is blocked. Known blocked nodes
@@ -180,10 +160,8 @@ class BlockageModel:
         key = (self.version, self.roads.version, graph.n_nodes)
         if key != self._p_key:
             p = np.zeros(graph.n_nodes)
-            m, r = len(self.miss), self.block_rate()
-            q = r * self.miss
-            soft = np.where(self.miss >= 1.0, r, q / np.maximum(q + 1.0 - r, 1e-300))  # (exactly r if never looked at)
-            p[:m] = np.where(self._cuts() | graph.blocked[:m] | (self.miss <= 0.0), 0.0, soft)
+            m = len(self.seen)
+            p[:m] = np.where(self.seen | self._cuts() | graph.blocked[:m], 0.0, self.block_rate())
             self._p, self._p_key = p, key
         return self._p
 
@@ -191,7 +169,7 @@ class BlockageModel:
         """The mapped nodes that cannot be blocked: their blockage would cut off more of the map
         (less the known blockages) than the blockages may still cut off. With no limit, none."""
         if self.max_cutoff_fraction >= 1.0:
-            return np.zeros(len(self.miss), dtype=bool)
+            return np.zeros(len(self.seen), dtype=bool)
         if self._cut_version != len(self.roads.blocked):
             g = self.roads.prior.with_changes(blocked=sorted(self.roads.blocked))
             _, comp = connected_components(g.csr, directed=False)

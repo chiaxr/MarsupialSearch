@@ -52,9 +52,9 @@ python scripts/compare.py --scenario small --maps 0 1 2 --teams joint_planner \
 
 ```
 marsupial_search/
-  core/          portable: messages, graph, grid, belief map, visibility (occlusion), controller interface
+  core/          portable: messages, graph, grid, belief map, controller interface
   controllers/   portable: policies and the oracle (depend only on marsupial_search.core + numpy/scipy)
-  sim/           research only: scenario generator, simulator, evaluation
+  sim/           research only: scenario generator, simulator (with what occlusion lets each sensor see), evaluation
   viz/           research only: matplotlib plots / GIF
 configs/         YAML experiment files (example.yaml documents the format; small_car_mismatch.yaml: a wrong road map;
                  small_car_ctp.yaml: the UGV planning round blockages not yet seen; small_car_cutoff.yaml: blockages
@@ -140,8 +140,8 @@ once the UGV has also passed within range. The belief update is Bayesian:
 `uav_ground_p_detect: 0.3`, a UAV pass leaves 35 % of an urban cell's mass (its street-level
 half × 0.7) instead of 50 %.
 
-**Occlusion** (`scenario.occlusion: true`; `marsupial_search/core/visibility.py`). What hides
-the target and the roads comes with the prior map, so every robot knows it: tree cover per cell
+**Occlusion** (`scenario.occlusion: true`; `marsupial_search/sim/visibility.py`). What hides
+the target and the roads is the simulator's ground truth, never shown to the robots: tree cover per cell
 (`canopy`: smooth noise over vegetation, `canopy_mean` 0.4; `road_canopy` 50 % of the trees
 round a road over it) and, in each town, the building height over street width (`canyon`,
 drawn from `urban_canyon`, 0.5 to 2). The layers then hold what hides the target for good,
@@ -163,7 +163,21 @@ What varies from look to look is the detection probability, per viewpoint:
 Each is times the sensor's own probability (with occlusion, `uav_ground_p_detect` defaults to 1:
 the canyon sets the chance). A road node's blockage (or a road missing from the map) is seen
 from the air with probability `1 − canopy` (times the street term in town), once per pass,
-and always from the ground; roads under trees are also more often missing from the map. With
+and always from the ground; roads under trees are also more often missing from the map.
+
+The robots get what this means for their sensors, not the occlusion itself:
+
+* the layer fractions in the prior (how much of a cell's mass hides under trees, on roofs, at
+  street level), as before;
+* `MissionSetup.detection`: per robot, layer and cell, the chance a look by its sensor detects
+  the target, which the planners weigh belief by (the belief updates after a look already carry
+  the simulator's probabilities);
+* `TraversabilityUpdate.hidden`: the prior-map road nodes in a robot's range now that its look
+  cannot make out. A robot passes them on in its `"status"`, and the UGV, which counts the road
+  nodes in a robot's range as seen open unless it reports a blockage, leaves those out: they
+  stay as unknown as before (`ctp.BlockageModel`).
+
+With
 the default `confirm_test: range` the UGV still finds the target by range alone; use
 `confirm_test: sighting` so its looks are occluded too (a missed pass is then tried again,
 `ugv_timed_route`'s `pursue_passes`). A confirmable target (`target_ugv_confirmable`) is then

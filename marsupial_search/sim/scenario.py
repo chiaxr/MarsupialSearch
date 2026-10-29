@@ -12,11 +12,12 @@ from marsupial_search.core import (
     GridSpec,
     Layer,
     MissionSetup,
-    Occlusion,
     RobotSpec,
     RobotType,
     TraversabilityGraph,
 )
+
+from .visibility import Occlusion
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class Scenario:
     road_mismatch: MapMismatch = field(default_factory=MapMismatch)
     # The terrain as the robots know it (None: ``terrain``): roads missing from the map are vegetation.
     map_terrain: Optional[np.ndarray] = None
-    # What hides the target and the roads from the sensors (known to the robots with the map; None: nothing).
+    # What hides the target and the roads from the sensors (the simulator's: never shown to the robots; None: nothing).
     occlusion: Optional[Occlusion] = None
 
     def true_road(self, blocked: bool = True) -> TraversabilityGraph:
@@ -78,7 +79,6 @@ class Scenario:
             robots=dict(self.robots),
             docking=self.docking,
             dt=dt,
-            occlusion=self.occlusion,
         )
 
     def with_target(self, target_xy: tuple[float, float], target_layer: Layer) -> "Scenario":

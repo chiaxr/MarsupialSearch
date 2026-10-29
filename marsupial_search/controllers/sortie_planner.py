@@ -22,7 +22,7 @@ from typing import Optional
 
 import numpy as np
 
-from marsupial_search.core import BeliefMap, MissionSetup, RobotSpec, RobotType, TraversabilityGraph, detection_map
+from marsupial_search.core import BeliefMap, MissionSetup, RobotSpec, RobotType, TraversabilityGraph
 
 from .common import PathFn, SearchConfig, dist, footprint_matrix
 
@@ -51,10 +51,13 @@ class SortiePlanner:
 
     @staticmethod
     def detection(setup: MissionSetup, spec: RobotSpec) -> np.ndarray:
-        """Per layer and cell (flat), the chance a look by ``spec`` detects the target
-        (``core.detection_map``): shape (layers, cells)."""
-        p = detection_map(spec, setup.terrain, setup.occlusion)
-        return p.reshape(len(p), -1)
+        """Per layer and cell (flat), the chance a look by ``spec`` detects the target, as the
+        environment gives it (``MissionSetup.detection``; else the sensor's ``layer_p()``
+        everywhere): shape (layers, cells)."""
+        p = setup.detection.get(spec.robot_id)
+        if p is None:
+            p = np.broadcast_to(spec.sensor.layer_p()[:, None], (len(spec.sensor.layer_p()), setup.grid.rows * setup.grid.cols))
+        return np.asarray(p, dtype=float).reshape(len(p), -1)
 
     def for_uav(self, uav: RobotSpec) -> "SortiePlanner":
         """This planner for another UAV (its own sensor footprints and energy model); itself if the

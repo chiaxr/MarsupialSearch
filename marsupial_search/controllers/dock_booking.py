@@ -164,6 +164,7 @@ class BookingRobot(RobotController):
         self.started = False
         self._new_visited: list[int] = []
         self._new_updates: list = []
+        self.hidden: tuple[int, ...] = ()  # road nodes in sensor range it cannot make out (TraversabilityUpdate.hidden)
         self._done = False
 
     def is_done(self) -> bool:
@@ -179,6 +180,7 @@ class BookingRobot(RobotController):
             self._new_updates.append(upd)
         for upd in obs.map_updates:
             self.roads.add(upd.blocked, upd.new_nodes, upd.new_edges)
+            self.hidden = upd.hidden
         if self.type == RobotType.UGV:
             reached = list(s.nodes_reached) + ([s.node] if s.node is not None else [])
             self._mark_visited(reached)
@@ -193,6 +195,8 @@ class BookingRobot(RobotController):
         report = self._map_report()
         if report is not None:
             status["map"] = report
+        if self.hidden:  # so a robot inferring from its position what it saw open leaves these out
+            status["hidden"] = list(self.hidden)
         if self.relay is not None:
             self.relay.update(self.rid, now, _relayable(status))
             status["clock"] = self.relay.clock()

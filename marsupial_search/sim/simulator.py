@@ -14,11 +14,14 @@ Per step (``dt`` seconds), in order:
    pass is one look: for a layer seen with probability < 1 the update covers only the cells that
    entered the footprint this step, and a sighting is rolled once per pass over the target and
    holds while it stays in view. The probability is per layer and cell: the sensor's own, times
-   what occlusion lets it see from its viewpoint (``core.visibility``). A robot of a
+   what occlusion lets it see from its viewpoint (:mod:`.visibility`; each robot is given its
+   own in ``MissionSetup.detection``, never the occlusion itself). A robot of a
    ``terminate_on`` type ends the mission with the target in range (``confirm_test: "range"``) or
    on sighting it (``"sighting"``); one in ``confirm_by`` (a UAV flying low to verify a
-   sighting) on sighting it. A road-map mismatch is seen once per pass too, with the chance
-   occlusion leaves its node (its own random stream, so it does not depend on the target);
+   sighting) on sighting it. A road node in range is made out once per pass too, with the chance
+   occlusion leaves it (its own random stream, so it does not depend on the target): a
+   mismatch is found only on a node made out, and the prior-map nodes in range not made out
+   are reported ``hidden``;
 8. radio: queue this step's ``Transmit`` commands and deliver messages that are due.
 
 Robots are given the prior road map (``Scenario.graphs``); the UGV drives on the true one
@@ -61,14 +64,13 @@ from marsupial_search.core import (
     TraversabilityGraph,
     TraversabilityUpdate,
     Undock,
-    detection_map,
-    road_observability,
 )
 
 from .radio import _SIZE_KEYS as _RADIO_SIZE_KEYS
 from .radio import _STAT_KEYS as _RADIO_STAT_KEYS
 from .radio import RadioChannel, RadioConfig
 from .scenario import Scenario
+from .visibility import detection_map, road_observability
 
 _EPS = 1e-9
 
@@ -249,8 +251,12 @@ class Simulator:
             raise ValueError(f"confirm_by: no robots {sorted(unknown)} in scenario {scenario.name!r}")
         confirmers = tuple(rid for rid, spec in scenario.robots.items()
                            if spec.robot_type in self.config.terminate_on or rid in self.config.confirm_by)
-        self.setup: MissionSetup = dataclasses.replace(scenario.mission_setup(self.config.dt), radio_range_m=ranges,
-                                                       confirmers=confirmers, confirm_test=self.config.confirm_test)
+        # Per robot, layer and cell: the chance a look detects the target (true terrain and occlusion).
+        self._detection = {rid: detection_map(spec, scenario.terrain, scenario.occlusion)
+                           for rid, spec in scenario.robots.items()}
+        self.setup: MissionSetup = dataclasses.replace(
+            scenario.mission_setup(self.config.dt), radio_range_m=ranges, confirmers=confirmers,
+            confirm_test=self.config.confirm_test, detection={rid: p.copy() for rid, p in self._detection.items()})
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -285,10 +291,17 @@ class Simulator:
         self._blocked = set(mm.blocked)
         self._mismatch_seen: dict[str, set[int]] = {rid: set() for rid in self.robots}
         self._bumped: dict[str, set[int]] = {rid: set() for rid in self.robots}
-        self._map_view: dict[str, set[int]] = {rid: set() for rid in self.robots}  # mismatches in range last step
-        self._map_obs = {rid: dict(zip(self._mismatch_ids.tolist(), road_observability(
-            spec, sc.grid, sc.terrain, sc.occlusion, road.positions[self._mismatch_ids]).tolist())) if mm else {}
-            for rid, spec in sc.robots.items()}  # per mismatch node: the chance a look sees it
+        # With occlusion, each look makes out a road node with the chance occlusion leaves it, once per pass:
+        # per robot, the chance per node of the true road, and the nodes in range with whether this pass made
+        # each out (no occlusion: every look makes out every node).
+        self._road_obs = None
+        if sc.occlusion is not None:
+            full = road if mm else sc.graphs[RobotType.UGV]
+            self._road_tree = cKDTree(full.positions)
+            self._road_obs = {rid: road_observability(spec, sc.grid, sc.terrain, sc.occlusion, full.positions)
+                              for rid, spec in sc.robots.items()}
+        self._road_vis: dict[str, dict[int, bool]] = {rid: {} for rid in self.robots}
+        self._hidden: dict[str, tuple[int, ...]] = {rid: () for rid in self.robots}  # as last reported
         self._map_rng = np.random.default_rng([cfg.seed, 3])
         for rid, init in sc.init.items():
             r = self.robots[rid]
@@ -306,8 +319,7 @@ class Simulator:
                 uav.pos = ugv.pos.copy()
                 uav.last_node = uav.graph.nearest_node(uav.pos)
 
-        # Per robot, layer and cell: the chance a look detects the target (true terrain and occlusion).
-        self._layer_vis = {rid: detection_map(spec, sc.terrain, sc.occlusion) for rid, spec in sc.robots.items()}
+        self._layer_vis = self._detection
         # One look per pass: a cell gets a look when it enters a footprint, and the target one
         # roll per pass, whose outcome holds while it stays in view. Layers seen for certain are
         # looked at every step, as repeating a certain look changes nothing: a robot that missed
@@ -646,23 +658,36 @@ class Simulator:
 
     def _sense_map(self) -> list[TraversabilityUpdate]:
         """Road-map mismatches each active robot sees (or ran into) for the first time: blocked nodes,
-        and nodes missing from the map with their edges. A node coming into range is seen with the
-        chance occlusion leaves it (``road_observability``), once per pass."""
-        if self._mismatch_tree is None:
+        and nodes missing from the map with their edges. With occlusion, a road node coming into
+        range is made out with the chance occlusion leaves it (``road_observability``), once per
+        pass: a mismatch is found only on a node made out, and the prior-map nodes in range not
+        made out are ``hidden`` (an update whenever that set changes)."""
+        if self._mismatch_tree is None and self._road_obs is None:
             return []
         out = []
         for r in self.robots.values():
+            hidden, new = (), set()
             if r.mode != RobotMode.ACTIVE:
-                self._map_view[r.rid] = set()
+                self._road_vis[r.rid] = {}
+            else:
+                rng_m = r.spec.sensor.range_m
+                vis = None
+                if self._road_obs is not None:
+                    last, obs = self._road_vis[r.rid], self._road_obs[r.rid]
+                    vis = {n: last[n] if n in last else bool(obs[n] >= 1 or self._map_rng.random() < obs[n])
+                           for n in sorted(self._road_tree.query_ball_point(r.pos, rng_m))}
+                    self._road_vis[r.rid] = vis
+                    hidden = tuple(n for n, seen in vis.items() if not seen and n < self._n_prior)
+                if self._mismatch_tree is not None:
+                    near = set(self._mismatch_ids[self._mismatch_tree.query_ball_point(r.pos, rng_m)].tolist())
+                    looked = near if vis is None else {n for n in near if vis.get(n, False)}
+                    new = (looked | self._bumped[r.rid]) - self._mismatch_seen[r.rid]
+                    self._bumped[r.rid].clear()
+            if not new and hidden == self._hidden[r.rid]:
                 continue
-            near = set(self._mismatch_ids[self._mismatch_tree.query_ball_point(r.pos, r.spec.sensor.range_m)].tolist())
-            obs = self._map_obs[r.rid]
-            looked = {n for n in sorted(near - self._map_view[r.rid] - self._mismatch_seen[r.rid])
-                      if obs[n] >= 1 or self._map_rng.random() < obs[n]}
-            self._map_view[r.rid] = near
-            new = (looked | self._bumped[r.rid]) - self._mismatch_seen[r.rid]
-            self._bumped[r.rid].clear()
+            self._hidden[r.rid] = hidden
             if not new:
+                out.append(TraversabilityUpdate(r.rid, self.time, RobotType.UGV, hidden=hidden))
                 continue
             self._mismatch_seen[r.rid] |= new
             self._stats[r.rid]["map_changes_found"] += len(new)
@@ -670,7 +695,7 @@ class Simulator:
             edges = sorted({(min(n, m), max(n, m)) for n in added for m, _ in self._road.neighbors(n)})
             nodes = {m: tuple(map(float, self._road.positions[m])) for e in edges for m in e if m >= self._n_prior}
             out.append(TraversabilityUpdate(r.rid, self.time, RobotType.UGV, tuple(sorted(new & self._blocked)),
-                                            nodes, tuple(edges)))
+                                            nodes, tuple(edges), hidden))
         return out
 
     # ------------------------------------------------------------ bookkeeping

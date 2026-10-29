@@ -14,7 +14,7 @@ detection. One target-free run per map therefore gives, for every target cell an
   This part is an estimate: how quickly a team confirms a sighting depends on the team. A
   sensor that detects a layer with probability ``p < 1`` per look (per pass over the cell)
   sights it on its k-th look with probability ``p_k Π_{i<k} (1 − p_i)``, ``p_i`` that look's
-  probability in that cell (``core.detection_map``: with occlusion, it varies per cell); ``T̂`` is the
+  probability in that cell (``visibility.detection_map``: with occlusion, it varies per cell); ``T̂`` is the
   expectation over which look, if any before the find, sights it.
 
 The prediction ``T̂`` is averaged over the whole target distribution, ``E[T̂]``, and its error is
@@ -30,10 +30,11 @@ from __future__ import annotations
 import dataclasses
 
 import numpy as np
-from marsupial_search.core import N_LAYERS, RobotMode, RobotType, detection_map
+from marsupial_search.core import N_LAYERS, RobotMode, RobotType
 
 from .scenario import Scenario
 from .simulator import MissionResult, SimConfig
+from .visibility import detection_map
 
 _ACTIVE = list(RobotMode).index(RobotMode.ACTIVE)
 

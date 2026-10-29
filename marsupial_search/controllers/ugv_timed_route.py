@@ -88,7 +88,6 @@ from marsupial_search.core import (
     RobotType,
     Transmit,
     TraversabilityGraph,
-    road_observability,
 )
 
 from .common import bypass, dist, pursuit_path
@@ -182,7 +181,6 @@ class TimedRouteUgv(BookingRobot):
         self.blockage = BlockageModel(self.roads, self.cfg.block_prior, self.cfg.block_prior_weight,
                                       self.cfg.max_cutoff_fraction) if self.cfg.road_planner == "ctp" else None
         self.ctp: Optional[CtpPlanner] = None
-        self.observe: dict[tuple[str, int], np.ndarray] = {}  # (robot, road nodes): per node, the chance its look sees it
         self.ctp_paths: dict[tuple, tuple[float, list[int], float]] = {}  # (src, dst, search leg) -> (when, path, cost)
         self.detour_cache: dict = {}  # (prev, node, next) -> would its blockage send the UGV the long way round?
         self.detour_road: Optional[TraversabilityGraph] = None  # the road map detour_cache is for
@@ -190,7 +188,7 @@ class TimedRouteUgv(BookingRobot):
         self.uav_planners: Optional[list[SortiePlanner]] = None  # per UAV, for when the search is done
 
     def _start(self, s: RobotState) -> None:
-        self._look(s.position, self.spec.sensor.range_m)
+        self._look(s.position, self.spec.sensor.range_m, self.hidden)
         self.nodes, self.arrived = [s.node if s.node is not None else s.last_node], 0.0
         if s.docked_uav is not None:  # it takes off first, from where the UGV stands
             self.stops[0] = [{"kind": TAKEOFF, "uav": s.docked_uav, "ready": 0.0}]
@@ -311,22 +309,15 @@ class TimedRouteUgv(BookingRobot):
         """``_path`` for the shared planners when it is the CTP (None: their own shortest paths)."""
         return self._path if self.blockage is not None else None
 
-    def _look(self, xy, radius: float, rid: str = "") -> None:
-        """Robot ``rid`` (default: the UGV) looked at the road round ``xy`` (``BlockageModel.look``,
-        with the chance occlusion leaves it to see each node)."""
-        if self.blockage is None:
-            return
-        rid = rid or self.rid
-        key = (rid, self.road.n_nodes)
-        if key not in self.observe:
-            s = self.setup
-            self.observe[key] = road_observability(s.robots[rid], s.grid, s.terrain, s.occlusion, self.road.positions)
-        self.blockage.look(self.road, xy, radius - 1.0, self.observe[key], rid)  # (a margin for where it was)
+    def _look(self, xy, radius: float, hidden=()) -> None:
+        """A robot at ``xy`` saw the road nodes within ``radius``, but those it could not make out."""
+        if self.blockage is not None:
+            self.blockage.look(self.road, xy, radius - 1.0, hidden)  # (a margin for where it was when it looked)
 
     def _ingest(self, sender: str, p: dict, t: float) -> None:
         super()._ingest(sender, p, t)
         if p["type"] == RobotType.UAV.value and sender in self.setup.robots:  # what that UAV has seen
-            self._look(p["pos"], self.setup.robots[sender].sensor.range_m, sender)
+            self._look(p["pos"], self.setup.robots[sender].sensor.range_m, p.get("hidden", ()))
 
     def _map_changed(self, s: RobotState, now: float) -> None:
         """Re-route at once if the route runs into a blocked node; new roads wait for the next re-plan."""
@@ -887,7 +878,7 @@ class TimedRouteUgv(BookingRobot):
         self._handle_messages(obs, s, now, cmds)
         self.standby |= {rid for rid, p in self.peers.items() if p.get("standby")}
         self._check_map(s, now)
-        self._look(s.position, self.spec.sensor.range_m)
+        self._look(s.position, self.spec.sensor.range_m, self.hidden)
         for rid, p in self.peers.items():
             if p["type"] == RobotType.UAV.value and p["mode"] == RobotMode.DEPLETED.value and rid not in self.lost:
                 self.lost.add(rid)

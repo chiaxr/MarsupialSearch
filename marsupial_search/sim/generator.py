@@ -13,7 +13,7 @@ UGV cannot drive on). Construction order:
 5. Merge near-duplicate nodes, subdivide long edges, keep the largest component,
    and rasterise the roads; every remaining non-urban cell is VEGETATION.
 6. Optionally (``occlusion``), what hides the target and the roads from the sensors
-   (:class:`~marsupial_search.core.Occlusion`): tree cover over vegetation (smooth noise,
+   (:class:`~.visibility.Occlusion`, the simulator's only): tree cover over vegetation (smooth noise,
    ``canopy_*``), part of it over the roads through it (``road_canopy``), and per town the
    building height over street width (``urban_canyon``).
 7. Optionally, a prior road map that differs from the true network (``MapMismatch``):
@@ -64,23 +64,20 @@ from scipy.sparse.csgraph import connected_components, minimum_spanning_tree
 from scipy.spatial import Delaunay, cKDTree
 
 from marsupial_search.core import (
-    AIR,
-    GROUND,
     N_LAYERS,
     DockingSpec,
     EnergySpec,
     GridSpec,
     Layer,
-    Occlusion,
     RobotSpec,
     RobotType,
     SensorSpec,
     Terrain,
     TraversabilityGraph,
-    detection_map,
 )
 
 from .scenario import MapMismatch, RobotInit, Scenario
+from .visibility import AIR, GROUND, Occlusion, detection_map
 
 
 UAV_IDS = ("uav0", "uav1")
@@ -103,11 +100,11 @@ class FleetConfig:
     uav_sensor_range: float = 60.0
     uav_sensor_ranges: dict[str, float] = field(default_factory=dict)  # per UAV (uav0, uav1): overrides uav_sensor_range
     # UAV detection probability per look at urban street level (None: 0, unseen; with occlusion, 1:
-    # the street canyon then sets the chance, core.visibility)
+    # the street canyon then sets the chance, sim.visibility)
     uav_ground_p_detect: Optional[float] = None
     uav_ground_p_detects: dict[str, float] = field(default_factory=dict)  # per UAV: overrides uav_ground_p_detect
     # per UAV: "air" (flies high: sees roofs, street level per uav_ground_p_detect) or "ground" (flies at
-    # street level with a front-facing camera: sees what the UGV sees, core.visibility)
+    # street level with a front-facing camera: sees what the UGV sees, sim.visibility)
     uav_viewpoints: dict[str, str] = field(default_factory=dict)
 
     def uav_range(self, rid: str) -> float:
@@ -149,7 +146,7 @@ class ScenarioConfig:
     road_unmapped_fraction: float = 0.0  # share of road nodes missing from the map (whole stretches of road)
     road_blocked_fraction: float = 0.0  # share of mapped road nodes that cannot be traversed
     road_cutoff_fraction: float = 0.0  # blocked nodes may cut off at most this share of the road nodes from the rest (0: never)
-    # occlusion (core.visibility): what hides the target and the roads from the sensors
+    # occlusion (sim.visibility): what hides the target and the roads from the sensors
     occlusion: bool = False  # False: nothing (a look detects with the sensor's own probability)
     canopy_mean: float = 0.4  # tree cover over vegetation: its mean ...
     canopy_spread: float = 0.3  # ... its spread (smooth noise, then clipped to [0, 1]) ...

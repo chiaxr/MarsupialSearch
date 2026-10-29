@@ -1,5 +1,7 @@
-"""Occlusion (``core.visibility``): what the canopy and the street canyons let each viewpoint see, of
-the target and of the road, and how the generator, simulator, planners and controllers use it."""
+"""Occlusion (``sim.visibility``): what the canopy and the street canyons let each viewpoint see, of
+the target and of the road, and how the generator and simulator use it. The robots never get the
+occlusion: the simulator gives each its detection probabilities (``MissionSetup.detection``) and
+reports the road nodes a look could not make out (``TraversabilityUpdate.hidden``)."""
 
 import dataclasses
 
@@ -16,18 +18,16 @@ from marsupial_search.core import (
     GoToPoint,
     GraphKnowledge,
     Layer,
-    Occlusion,
     RobotMode,
     RobotState,
     RobotType,
     SensorSpec,
     Terrain,
     Undock,
-    detection_map,
-    road_observability,
 )
 from marsupial_search.sim import SimConfig, Simulator, generate_scenario, resample_target
 from marsupial_search.sim.scenario import MapMismatch
+from marsupial_search.sim.visibility import Occlusion, detection_map, road_observability
 from marsupial_search.sim.scenario_bases import small
 
 S, A, G = int(Layer.SHARED), int(Layer.AERIAL), int(Layer.GROUND)
@@ -198,22 +198,63 @@ def test_the_planner_weighs_belief_by_what_each_robot_can_see():
     assert np.allclose(seen[urban], 0.8 + 0.8 + 0.2) and np.allclose(seen[~urban], 1.6)
 
 
-def test_a_blockage_belief_counts_how_surely_each_look_would_have_seen_it():
+def test_a_look_counts_the_road_nodes_in_range_as_seen_but_those_it_could_not_make_out():
     road = make_line_scenario().graphs[RobotType.UGV]
     model = BlockageModel(GraphKnowledge(road), prior=0.1, prior_weight=10.0, max_cutoff_fraction=1.0)
-    half = np.full(road.n_nodes, 0.5)
-    model.look(road, road.positions[5], 30.0, half, "uav0")
-    r = model.block_rate()  # (the look counts half a node found open)
-    q = 0.5 * r
-    assert model.miss[5] == 0.5 and model.probabilities(road)[5] == pytest.approx(q / (q + 1 - r), rel=1e-3)
-    model.look(road, road.positions[5], 30.0, half, "uav0")  # still in view: the same pass
-    assert model.miss[5] == 0.5
-    model.look(road, road.positions[15], 30.0, half, "uav0")
-    model.look(road, road.positions[5], 30.0, half, "uav0")  # back: another pass
-    assert model.miss[5] == 0.25
-    model.look(road, road.positions[5], 30.0)  # a sure look (the UGV's)
+    model.look(road, road.positions[5], 60.0, hidden=(5,))  # nodes 4-6 in range, 5 under trees
+    p = model.probabilities(road)
+    assert model.seen[[4, 6]].all() and not model.seen[5]
+    assert p[4] == p[6] == 0.0 and p[5] == pytest.approx(model.block_rate())  # as unknown as before
+    model.look(road, road.positions[5], 60.0)  # another pass makes it out
     assert model.seen[5] and model.probabilities(road)[5] == 0.0
-    assert model.probabilities(road)[10] == pytest.approx(model.block_rate())  # never looked at
+
+
+def test_the_robots_get_detection_probabilities_and_hidden_nodes_but_not_the_occlusion():
+    sc = dataclasses.replace(_occluded(canopy=1.0), road_mismatch=MapMismatch(blocked=(6,)))
+    sim = Simulator(sc, SimConfig(terminate_on=()))
+    assert not hasattr(sim.setup, "occlusion")
+    for rid, spec in sc.robots.items():  # the simulator's own, per robot
+        assert np.array_equal(sim.setup.detection[rid], detection_map(spec, sc.terrain, sc.occlusion))
+    # uav0 over the trees (canopy 1: no road node made out from the air) is told which it could not make out.
+    sim.step({"uav0": Undock()})
+    for _ in range(5):
+        sim.step({})
+    obs, cmds, hidden = None, {"uav0": GoToPoint((325.0, 500.0))}, ()
+    for _ in range(60):
+        obs = sim.step(cmds)
+        cmds = {}
+        for u in obs.map_updates:
+            if u.robot_id == "uav0":
+                assert not u.blocked  # the blockage at node 6 stays hidden
+                hidden = u.hidden
+    assert hidden == (5, 6, 7)  # nodes 50 m apart, 60 m sensor
+    assert not any(u.robot_id == "ugv0" and u.hidden for u in obs.map_updates)  # the ground sees them
+
+
+def test_without_occlusion_nothing_is_hidden():
+    sc = dataclasses.replace(make_line_scenario(), road_mismatch=MapMismatch(blocked=(6,)))
+    sim = Simulator(sc, SimConfig(terminate_on=()))
+    sim.step({"uav0": Undock()})
+    for _ in range(5):
+        sim.step({})
+    cmds, ups = {"uav0": GoToPoint((325.0, 500.0))}, []
+    for _ in range(60):
+        ups += sim.step(cmds).map_updates
+        cmds = {}
+    assert ups and all(not u.hidden for u in ups) and any(6 in u.blocked for u in ups)
+
+
+def test_the_ugv_counts_a_uavs_hidden_nodes_as_unknown():
+    sim = Simulator(_occluded(canopy=1.0), SimConfig(terminate_on=()))
+    from marsupial_search.controllers.ugv_timed_route import UgvCtpRouteConfig
+    ugv = TimedRouteUgv(UgvCtpRouteConfig(max_cutoff_fraction=1.0))
+    ugv.reset("ugv0", sim.setup)
+    pos = (325.0, 500.0)
+    ugv._ingest("uav0", {"type": "uav", "pos": pos, "updates": [], "visited": [], "sighting": None,
+                         "hidden": [5, 6, 7]}, 1.0)
+    assert not ugv.blockage.seen[[5, 6, 7]].any()
+    ugv._ingest("uav0", {"type": "uav", "pos": pos, "updates": [], "visited": [], "sighting": None}, 2.0)
+    assert ugv.blockage.seen[[6]].all()  # nothing hidden: all seen
 
 
 @pytest.mark.parametrize("test, passes, again", [("sighting", 0, True), ("sighting", 3, False), ("range", 0, False)])

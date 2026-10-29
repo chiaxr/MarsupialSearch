@@ -25,9 +25,10 @@ detects it. The UGV sees the ground and shared layers; a UAV sees the aerial and
 and street level with probability `fleet.uav_ground_p_detect` (default 0; see
 [Visibility layers](README.md#13-visibility-layers-urban-needs-both-robot-types)); a UAV at street
 level (`fleet.uav_viewpoints`, e.g. the near scout) sees what the UGV sees. With occlusion that
-chance is per cell as well as per layer (`core.detection_map`: the canopy, the street canyons,
-the target class), and the planners weigh each cell's belief by it (`SortiePlanner.p_ugv` and
-`p_air` are per layer and cell). Only the UGV can
+chance is per cell as well as per layer: the simulator, which knows the canopy, the street
+canyons and the target class, gives each robot its own (`MissionSetup.detection`), and the
+planners weigh each cell's belief by it (`SortiePlanner.p_ugv` and `p_air` are per layer and
+cell). The controllers never see the occlusion itself. Only the UGV can
 end the mission, so a UAV sighting is worth something only once the UGV drives over to confirm it,
 unless the near scout's own sighting ends it (`sim.confirm_by: [uav0]`): then it can verify a
 sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*).
@@ -508,11 +509,10 @@ current map, never on the true one. `common.bypass` takes a route round blocked 
   - *Blockage model* (`ctp.BlockageModel`). A road node is open once a robot has seen it for sure:
     the UGV from where it drives, a UAV from where its status says it was (a UAV's sensor finds a
     blockage in range, and its status carries it: a position heard means what the UAV found there
-    is heard too, while one not heard counts as unseen). With occlusion, a UAV's look at a node
-    under trees (or deep in a street) sees a blockage only with probability `o`
-    (`core.road_observability`), once per pass: after looks that found nothing with
-    `Π (1 − o) = q`, the node is blocked with `r q / (r q + 1 − r)`, `r` the blocked share below,
-    and a look counts `1 − q` of a node found open towards that share. So is a node whose blockage would cut off more of
+    is heard too, while one not heard counts as unseen). With occlusion, a look may not make out
+    a node (under trees, or deep in a street, from the air): the simulator says which
+    (`TraversabilityUpdate.hidden`), the robot passes them on in its status (`"hidden"`), and the
+    UGV leaves them out of what that look saw open, so they stay as unknown as before. So is a node whose blockage would cut off more of
     the map than blockages may still cut off (`max_cutoff_fraction`, the generator's
     `road_cutoff_fraction`; by default 0: no node the map needs to stay in one piece is ever
     blocked), and a node missing from the map. Every other node is blocked with the share of the
