@@ -16,6 +16,11 @@ Broadcast
     The route, its arrival times and the queue (with each booked tour) in its ``"status"``
     when they change, and every ``route_resend_s``.
 Sightings
+    The one pursued is the *lead* (``common.Lead``): a certain sighting, or an uncertain one (a
+    UAV flying high may sight things that are not the target) once the belief puts the target
+    near it with chance ``lead_pursue_p``, until looks that miss it bring that below
+    ``lead_drop_p`` (then the pursuit stops, and the search gets to it as the belief says). A
+    new lead starts the pursuit, its passes and its verifying afresh.
     The UGV drives past a sighting at once, from the node it is at or driving to, when the
     detour delays its next stops by no more than the hover slack of every UAV still to land.
     Otherwise it goes there straight after the pin, and re-checks the detour at every node it
@@ -90,7 +95,7 @@ from marsupial_search.core import (
     TraversabilityGraph,
 )
 
-from .common import bypass, dist, pursuit_path
+from .common import Lead, bypass, dist, pursuit_path
 from .ctp import BlockageModel, CtpPlanner, clear_probabilities
 from .dock_booking import BOOK, LAND, SYNC, TAKEOFF, Booking, BookingRobot, DockBookingConfig, slot_spacing
 from .sortie_planner import SortiePlanner
@@ -186,6 +191,11 @@ class TimedRouteUgv(BookingRobot):
         self.detour_road: Optional[TraversabilityGraph] = None  # the road map detour_cache is for
         self.now = 0.0
         self.uav_planners: Optional[list[SortiePlanner]] = None  # per UAV, for when the search is done
+        self.lead = Lead(self.cfg)  # the sighting pursued
+
+    def leads(self) -> list[dict]:
+        """Every sighting pursued (``Lead.log``)."""
+        return self.lead.log
 
     def _start(self, s: RobotState) -> None:
         self._look(s.position, self.spec.sensor.range_m, self.hidden)
@@ -738,7 +748,7 @@ class TimedRouteUgv(BookingRobot):
         """The standby UAV whose sighting ends the mission, to verify a sighting with (None: none)."""
         if not self.cfg.verify:
             return None
-        xy = self.belief.detection_xy
+        xy = self.lead.xy
         return next((u for u in sorted(self.standby - self.lost) if u in self.setup.confirmers
                      and (xy is None or self._chance(u, xy) > 0)), None)
 
@@ -779,7 +789,7 @@ class TimedRouteUgv(BookingRobot):
         """After a road-map change: does it make the UGV's drive from route index ``head`` to the
         end of its pursuit ``verify_detour_m`` longer than on the map before (``old``), or cut it
         off, with a verifier to call and the sighting within ``verify_radius_m`` of ``head``?"""
-        xy = self.belief.detection_xy
+        xy = self.lead.xy
         if self.pursuit != "planned" or xy is None or self.verify_flown or self.verify_call is not None \
                 or self._verifier() is None or not head <= self.pursuit_end < len(self.nodes):
             return False
@@ -799,7 +809,7 @@ class TimedRouteUgv(BookingRobot):
         pursuit to the road node nearest the sighting, or after a long detour (``_long_detour``).
         It must be on the dock; until it is, the call waits while the UGV stays that close to the
         sighting (else the UGV drives back). A withdrawn call is not repeated at that node."""
-        xy, u = self.belief.detection_xy, self._verifier()
+        xy, u = self.lead.xy, self._verifier()
         if xy is not None and u is not None and self.verify_flown and s.docked_uav == u and self._again("verify") \
                 and not any(st["uav"] == u and "started" in st for sts in self.stops.values() for st in sts):
             self.verify_flown, self.verify_call, self.verify_due = False, None, True  # back: its pass missed
@@ -876,6 +886,8 @@ class TimedRouteUgv(BookingRobot):
         self._track(s, now)
         self._handle_events(obs, now)
         self._handle_messages(obs, s, now, cmds)
+        if self.lead.update(self.belief, now):
+            self._new_lead()
         self.standby |= {rid for rid, p in self.peers.items() if p.get("standby")}
         self._check_map(s, now)
         self._look(s.position, self.spec.sensor.range_m, self.hidden)
@@ -894,7 +906,7 @@ class TimedRouteUgv(BookingRobot):
         self._maybe_pursue(s, now)
         self._check_verify(s, now)
         self._drive(s, now, cmds)
-        if self.extend_failed and (self.belief.detection_xy is None or self.pursuit == "done") \
+        if self.extend_failed and (self.lead.xy is None or self.pursuit == "done") \
                 and not self.verify_due and self.verify_call is None:
             # no searchable belief left for either type (UAVs may still be flying)
             P = self.planner
@@ -930,6 +942,7 @@ class TimedRouteUgv(BookingRobot):
                 if stop.get("verify") is not None:
                     self.verify_flown = True
                     self.passes["verify"] += 1
+                    self.lead.verified()
                 if stop["kind"] == LAND:  # the booking is spent; its take-off stop remains
                     self.bookings.pop(stop["uav"], None)
                     self.swap_until = self.swap_end[stop["uav"]] = now + self.setup.docking.swap_duration_s
@@ -938,8 +951,7 @@ class TimedRouteUgv(BookingRobot):
     def _handle_messages(self, obs: RobotObservation, s: RobotState, now: float, cmds: list) -> None:
         for msg in obs.messages(SYNC):
             self._fuse(msg.payload)
-            cmds.append(Transmit(SYNC, {"mass": self.belief.mass.astype(np.float32), "sighting": self.belief.detection_xy,
-                                        "ack": msg.sent_time}, to=(msg.sender,)))
+            cmds.append(Transmit(SYNC, {**self.belief.sync_payload(), "ack": msg.sent_time}, to=(msg.sender,)))
         for msg in sorted(obs.messages(BOOK), key=lambda m: m.sender):
             self._accept(msg.payload, s, now)
 
@@ -963,15 +975,14 @@ class TimedRouteUgv(BookingRobot):
             self.pursuit = "done"  # drove past it without confirming
             self.verify_due |= self.pursuit_verify  # (or got to where it calls the verifier)
             self.passes["ugv"] += not self.pursuit_verify
-        xy = self.belief.detection_xy
+        xy = self.lead.xy
         if self.pursuit == "done" and xy is not None and not self.pursuit_verify and self._again("ugv") \
                 and dist(s.position, xy) > self.spec.sensor.range_m and self._chance(self.rid, xy) > 0:
             self.pursuit = "none"  # the pass missed it: once out of range, another
-        if not self.cfg.pursue_sightings or self.belief.detection_xy is None or self.pursuit == "done":
+        if not self.cfg.pursue_sightings or xy is None or self.pursuit == "done":
             return
         if self.pursuit == "planned" and self.pursuit_check is None:
             return
-        xy = self.belief.detection_xy
         at_node = s.node is not None and s.node == self.nodes[self.cur]
         head = min(self.cur if at_node else self.cur + 1, len(self.nodes) - 1)  # the node it is at, or driving to
         free = not self.stops.get(head)
@@ -998,6 +1009,22 @@ class TimedRouteUgv(BookingRobot):
         self.pursuit = "planned"
         self.version += 1
         self.revision += 1
+
+    def _new_lead(self) -> None:
+        """A new lead, or none: pursue it afresh (its passes, verifying), and withdraw a call to
+        verify the last one that has not taken off; with none, re-plan the route's tail."""
+        self.pursuit, self.pursuit_check, self.pursuit_verify = "none", None, False
+        self.verify_due = self.verify_flown = False
+        self.verify_failed = set()
+        self.passes = {"ugv": 0, "verify": 0}
+        if self.verify_call is not None and "started" not in self.verify_call:
+            for i in self.stops:
+                self.stops[i] = [st for st in self.stops[i] if st is not self.verify_call]
+            self.version += 1
+            self.revision += 1
+        self.verify_call = None
+        if self.lead.xy is None:
+            self.last_replan = -np.inf  # the pursuit's way is no longer worth driving
 
     def _detour_now(self, at: int, xy) -> bool:
         """Drive from route index ``at`` via the sighting to the next stop, if no UAV still to

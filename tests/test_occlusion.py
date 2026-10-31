@@ -269,6 +269,7 @@ def test_the_ugv_drives_past_a_sighting_again_after_a_missed_pass(test, passes, 
         return RobotState("ugv0", RobotType.UGV, tuple(pos[ugv.nodes[i]]), RobotMode.ACTIVE, 1e5, 1e5, False,
                           ugv.nodes[i], ugv.nodes[i], (), (), None)
     ugv.belief.detection_xy = (475.0, 525.0)  # 25 m off node 9
+    ugv.lead.update(ugv.belief, 0.0)  # (as its step does)
     ugv._maybe_pursue(at(0), 1.0)
     assert ugv.pursuit == "planned"
     ugv.passes["ugv"] = passes

@@ -20,6 +20,10 @@ UGV cannot drive on). Construction order:
    stretches of road missing from the map (``road_unmapped_fraction``) and road nodes that
    cannot be traversed (``road_blocked_fraction``). The robots are given the prior map. With
    ``occlusion``, roads under trees are more likely to be missing from it.
+8. Optionally (``false_alarms``), what a UAV flying high mistakes for the target
+   (:class:`~.false_alarms.FalseAlarms`, the simulator's only): transient clutter
+   (``clutter_per_km2``) and decoys placed at random (``decoys_per_km2``), both weighted per
+   terrain by the target class (``TargetVisibility.clutter``: parked cars in a town for a car).
 
 Layers: without occlusion, a town cell's mass is split between the aerial layer (roofs, seen
 from the air only: ``urban_aerial_fraction``) and the ground layer (street level); elsewhere
@@ -76,6 +80,7 @@ from marsupial_search.core import (
     TraversabilityGraph,
 )
 
+from .false_alarms import FalseAlarms
 from .scenario import MapMismatch, RobotInit, Scenario
 from .visibility import AIR, GROUND, Occlusion, detection_map
 
@@ -154,6 +159,13 @@ class ScenarioConfig:
     road_canopy: float = 0.5  # a road through trees is covered by this share of their canopy
     urban_canyon: tuple[float, float] = (0.5, 2.0)  # per town, drawn from this range: building height over street width
     ground_veg_occlusion: float = 0.3  # from the ground, trees hide a look with this share of their canopy
+    # false alarms (sim.false_alarms): what a UAV flying high mistakes for the target (never a ground look)
+    false_alarms: bool = False  # False: a UAV sights only the target, exactly where it is
+    clutter_per_km2: float = 0.5  # transient false sightings per km² per look ...
+    decoys_per_km2: float = 0.5  # ... and things that look like the target from the air, per km² (both times the class's terrain weight)
+    decoy_p: float = 0.8  # a look sights a decoy with this times its chance of detecting the target there
+    sighting_sigma_m: float = 15.0  # a high sighting's position error, std per axis
+    air_max_p: float = 0.9  # nothing is certain from the air: a high look detects the target with at most this
     # UAV grid
     uav_grid_spacing_m: Optional[float] = None  # None: √2 · the smallest UAV sensor range, the widest square grid whose footprints leave no gaps
     # prior
@@ -195,12 +207,16 @@ class TargetVisibility:
     urban_open: float  # ... share in the open (seen from the air and the ground); the rest is at street level
     air_p: float  # per-look factor from the air
     ground_p: float  # per-look factor from the ground
+    # with ``false_alarms``: how much there is to mistake for it from the air, per Terrain (road, vegetation, urban)
+    clutter: tuple[float, float, float] = (1.0, 1.0, 1.0)
 
 
 TARGET_VISIBILITY: dict[str, TargetVisibility] = {
-    "car": TargetVisibility(urban_roof=0.0, urban_open=0.0, air_p=1.0, ground_p=1.0),  # on the street
-    "building": TargetVisibility(urban_roof=0.0, urban_open=1.0, air_p=1.0, ground_p=1.0),
-    "hiker": TargetVisibility(urban_roof=0.2, urban_open=0.0, air_p=0.8, ground_p=1.0),  # small from the air
+    "car": TargetVisibility(urban_roof=0.0, urban_open=0.0, air_p=1.0, ground_p=1.0,  # on the street
+                            clutter=(1.0, 0.1, 2.0)),  # other cars, parked ones in towns
+    "building": TargetVisibility(urban_roof=0.0, urban_open=1.0, air_p=1.0, ground_p=1.0, clutter=(0.1, 0.1, 1.0)),
+    "hiker": TargetVisibility(urban_roof=0.2, urban_open=0.0, air_p=0.8, ground_p=1.0,  # small from the air
+                              clutter=(0.5, 1.0, 1.0)),  # rocks, stumps, people
 }
 
 
@@ -478,6 +494,9 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         raise ValueError(f"unknown prior_model {cfg.prior_model!r}")
 
     robots, init = _make_fleet(cfg, reachable, terrain, grid, rng)
+    # 8. false alarms (their own random stream: the rest of the map is unchanged)
+    false_alarms = _false_alarms(cfg, grid, terrain, layer_fractions, np.random.default_rng([cfg.seed, 4])) \
+        if cfg.false_alarms else None
 
     confirm_mask = _confirmable_mask(grid, reachable, cfg.fleet.ugv_sensor_range, init["ugv0"].node)
     target_mask = confirm_mask if cfg.target_ugv_confirmable else np.ones(grid.shape, dtype=bool)
@@ -518,6 +537,7 @@ def generate_scenario(cfg: Optional[ScenarioConfig] = None) -> Scenario:
         road_mismatch=mismatch,
         map_terrain=None if map_terrain is terrain else map_terrain,
         occlusion=occlusion,
+        false_alarms=false_alarms,
     )
 
 
@@ -766,6 +786,26 @@ def _occlusion(cfg: ScenarioConfig, grid: GridSpec, terrain: np.ndarray, cities:
     tv = TARGET_VISIBILITY.get(cfg.target_object, TargetVisibility(0.0, 0.0, 1.0, 1.0))
     return Occlusion(canopy=canopy, canyon=canyon, ground_veg_occlusion=cfg.ground_veg_occlusion,
                      air_p=tv.air_p, ground_p=tv.ground_p)
+
+
+def _false_alarms(cfg: ScenarioConfig, grid: GridSpec, terrain: np.ndarray, layer_fractions: np.ndarray,
+                  rng) -> FalseAlarms:
+    """Clutter and decoy densities (per km², times the target class's weight for each terrain),
+    and the decoys: a Poisson count per cell, uniform in it, each in a layer drawn as the
+    target's would be."""
+    tv = TARGET_VISIBILITY.get(cfg.target_object, TargetVisibility(0.0, 0.0, 1.0, 1.0))
+    weight = np.asarray(tv.clutter, dtype=float)[terrain]
+    clutter, density = cfg.clutter_per_km2 * 1e-6 * weight, cfg.decoys_per_km2 * 1e-6 * weight
+    n = rng.poisson(density * cfg.cell_m ** 2)
+    rr, cc = np.nonzero(n)
+    rr, cc = np.repeat(rr, n[rr, cc]), np.repeat(cc, n[rr, cc])
+    X, Y = grid.cell_centers()
+    xy = np.stack([X[rr, cc], Y[rr, cc]], axis=1) + rng.uniform(-0.5, 0.5, (len(rr), 2)) * cfg.cell_m
+    lf = layer_fractions[:, rr, cc].T
+    cum = np.cumsum(lf / np.maximum(lf.sum(1, keepdims=True), 1e-300), axis=1)
+    layers = np.minimum((rng.random((len(rr), 1)) > cum).sum(1), N_LAYERS - 1)
+    return FalseAlarms(clutter=clutter, decoy_density=density, decoys=xy.reshape(-1, 2), decoy_layers=layers,
+                       decoy_p=cfg.decoy_p, sigma_m=cfg.sighting_sigma_m, max_p=cfg.air_max_p)
 
 
 def _at(grid: GridSpec, field_: np.ndarray, xy: np.ndarray) -> np.ndarray:

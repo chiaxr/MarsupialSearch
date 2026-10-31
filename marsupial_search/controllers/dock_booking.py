@@ -25,8 +25,8 @@ Messages
         the pin; accepting bumps the version, so bookings planned on the old route are
         refused and those UAVs plan again. Bookings only append: an accepted one never moves.
     ``"sync"`` (UAV → UGV after landing, and back): the UAV's belief map; the UGV fuses it
-        (element-wise minimum) and returns the fused map, so the next tour is planned on
-        what every UAV has reported.
+        (``BeliefMap.fuse``: the looks by element-wise minimum, the uncertain sightings by union)
+        and returns the fused map, so the next tour is planned on what every UAV has reported.
 
 Standby UAVs
     A UAV whose status says ``"standby"`` (``uav_near_scout``) stays on the dock until the UGV calls
@@ -155,7 +155,7 @@ class BookingRobot(RobotController):
         self.spec = setup.robots[robot_id]
         self.type = self.spec.robot_type
         self.graph = setup.graphs[self.type]
-        self.belief = BeliefMap(setup.grid, setup.prior, setup.layer_fractions)
+        self.belief = BeliefMap(setup.grid, setup.prior, setup.layer_fractions, setup.sightings)
         self.roads = GraphKnowledge(setup.graphs[RobotType.UGV])  # the road map and the changes found to it
         self.road = self.roads.graph  # the current road map
         self.road_visited = np.zeros(self.road.n_nodes, dtype=bool)
@@ -234,10 +234,8 @@ class BookingRobot(RobotController):
             self.belief.detection_xy = tuple(p["sighting"])
 
     def _fuse(self, payload: dict) -> None:
-        """Fuse a ``"sync"`` belief map and sighting into this robot's belief."""
-        np.minimum(self.belief.mass, payload["mass"], out=self.belief.mass)
-        if payload["sighting"] is not None and self.belief.detection_xy is None:
-            self.belief.detection_xy = tuple(payload["sighting"])
+        """Fuse a ``"sync"`` belief map and sightings into this robot's belief."""
+        self.belief.fuse(payload)
 
     def _mark_visited(self, nodes: list[int]) -> None:
         if nodes and max(nodes) >= len(self.road_visited):
@@ -438,8 +436,7 @@ class BookingUav(BookingRobot):
                 self._fuse(msg.payload)
                 self.synced = True
         if not self.synced and now - self.last_sync >= self.cfg.sync_resend_s:
-            cmds.append(Transmit(SYNC, {"mass": self.belief.mass.astype(np.float32),
-                                        "sighting": self.belief.detection_xy}, to=(self.ugv,)))
+            cmds.append(Transmit(SYNC, self.belief.sync_payload(), to=(self.ugv,)))
             self.last_sync = now
         p = self.plan
         if p is None or now - p["t"] > self.cfg.partner_stale_s:

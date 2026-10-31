@@ -1,0 +1,38 @@
+# The small map searched for a car, with false sightings (README §1.3, False sightings): a UAV
+# flying high (uav1) mistakes other cars for it, parked ones in town above all, and sights
+# everything off by 15 m. Its sightings raise the belief by how rare such cars are where it
+# sighted them; the UGV pursues one only while the belief makes the target likely there, and
+# drops it once its own pass, or the near scout's (uav0, at street level, whose sighting ends the
+# mission), sees nothing.
+# python scripts/compare.py     --config configs/small_car_false_alarms.yaml
+# python scripts/run_mission.py --config configs/small_car_false_alarms.yaml   # one mission per team
+teams:
+  - {ugv0: ugv_timed_route, uav0: uav_near_scout, uav1: uav_far_scout}
+  - {ugv0: ugv_timed_route, uav0: uav_greedy_tour, uav1: uav_greedy_tour}
+  - joint_planner
+out: outputs/small_car_false_alarms
+
+scenario:
+  base: small              # large: 5 km x 5 km, 3 towns | small: 1.5 km x 1.5 km, 1 town
+  target_object: car       # car | building | hiker
+  false_alarms: true
+  clutter_per_km2: 0.5     # transient false sightings per km² per look ...
+  decoys_per_km2: 2.0      # ... and other cars, per km² (both twice that in town, a tenth in vegetation)
+  fleet:
+    uav_sensor_ranges: {uav0: 20, uav1: 50}
+    uav_viewpoints: {uav0: ground}  # uav0 at street level with a front-facing camera: it never sights wrongly
+
+sim:
+  confirm_by: [uav0]       # the near scout's sighting ends the mission
+  radio:
+    range_m: {ugv: 300, uav: 300}
+
+mission:
+  seed: 0
+  gif_speedup: 30          # small missions last minutes: play the GIF at 30x real time
+
+compare:
+  maps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  targets: 2
+  estimator: cv
+  workers: 10

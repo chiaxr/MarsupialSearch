@@ -54,13 +54,15 @@ python scripts/compare.py --scenario small --maps 0 1 2 --teams joint_planner \
 marsupial_search/
   core/          portable: messages, graph, grid, belief map, controller interface
   controllers/   portable: policies and the oracle (depend only on marsupial_search.core + numpy/scipy)
-  sim/           research only: scenario generator, simulator (with what occlusion lets each sensor see), evaluation
+  sim/           research only: scenario generator, simulator (with what occlusion lets each sensor see, and what a
+                 high UAV mistakes for the target), evaluation
   viz/           research only: matplotlib plots / GIF
 configs/         YAML experiment files (example.yaml documents the format; small_car_mismatch.yaml: a wrong road map;
                  small_car_ctp.yaml: the UGV planning round blockages not yet seen; small_car_cutoff.yaml: blockages
                  that cut off parts of the network; small_car_scout.yaml: a near and a far scout;
                  small_car_verify.yaml: the near scout verifying sightings the UGV cannot reach;
-                 small_hiker_occluded.yaml: tree cover and street canyons hiding the target and the roads)
+                 small_hiker_occluded.yaml: tree cover and street canyons hiding the target and the roads;
+                 small_car_false_alarms.yaml: decoys and clutter a high UAV mistakes for the target)
 scripts/
   run_mission.py one mission + plots + GIF
   compare.py     teams x map seeds x target seeds -> CSV + summary + plot
@@ -122,7 +124,7 @@ mission there (`ugv_timed_route` sends the near scout to verify such a sighting;
 | Docking | UAV within `dock_tolerance_m` of the UGV, which has not moved this step and has its dock free. Landing takes `dock_duration_s`; the dock **aborts** if the UGV moves during it. One UAV at a time. |
 | Docked | UAV rides with the UGV and draws no power. Its battery is swapped for a full one in `swap_duration_s`, while the UGV drives or (with `swap_while_moving: false`) only while it stands still. A docked UAV's `mode_time_remaining` is what is left of its swap. |
 | Undocking | take-off takes `undock_duration_s`; it **aborts** if the UGV moves during it, and is rejected while the swap is in progress |
-| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Each pass over a cell is one look: a layer seen with probability `p < 1` gets its look when the cell enters the footprint, not again while it stays in view, and the target is rolled for once per pass (hovering over it does not help). The probability is per layer and cell: the sensor's own, times what occlusion lets it see from its viewpoint (§1.3). Road-map mismatches in range come as a `TraversabilityUpdate`, each seen once per pass with the chance occlusion leaves it (1 without occlusion). |
+| Sensing | disk footprint per robot, sent to the controller each step as a `LocalBeliefUpdate`: a window of per-layer detection probabilities. Each pass over a cell is one look: a layer seen with probability `p < 1` gets its look when the cell enters the footprint, not again while it stays in view, and the target is rolled for once per pass (hovering over it does not help). The probability is per layer and cell: the sensor's own, times what occlusion lets it see from its viewpoint (§1.3). Road-map mismatches in range come as a `TraversabilityUpdate`, each seen once per pass with the chance occlusion leaves it (1 without occlusion). A UAV flying high may also sight things that are not the target, and sights all of them off by a position error (§1.3, *False sightings*). |
 | Termination | `TARGET_FOUND` when the target is inside the sensor range of a robot whose type is in `SimConfig.terminate_on` (default: UGV only; perfect, distance-only test; with `confirm_test: sighting`, when it sights it instead, so occlusion applies to it too), or when a robot in `SimConfig.confirm_by` (by id, e.g. the near scout `uav0`) sights it (with its layer's `p_detect`, as any sighting). Other robots report `TARGET_SIGHTED`. The controllers are told who ends the mission (`MissionSetup.confirmers`). Other outcomes: `ugv_depleted` (`stop_when_ugv_depleted`, on by default), `all_depleted`, `controller_done`, `timeout`. |
 
 ### 1.3 Visibility layers ("urban needs both robot types")
@@ -184,6 +186,43 @@ the default `confirm_test: range` the UGV still finds the target by range alone;
 also in a layer the UGV can detect. With `occlusion: false` (the default) every look detects
 with the sensor's own probability, and missions are as before. `configs/small_hiker_occluded.yaml`
 runs it.
+
+**False sightings** (`scenario.false_alarms: true`; `marsupial_search/sim/false_alarms.py`). A UAV
+flying high (the `air` viewpoint) mistakes things for the target: transient clutter (a shadow, a
+glint: `clutter_per_km2` per look, drawn afresh on every pass over a cell) and decoys (a parked car
+like the one sought, a rock like a hiker: `decoys_per_km2`, placed at random, each sighted on a pass
+with `decoy_p` times the chance the look would detect the target there, so the next pass may well
+sight it again). Both are weighted per terrain by the target class (`TargetVisibility.clutter`:
+for a car, twice as many in town, a tenth in vegetation). Every air sighting, true or not, is off
+by Gaussian error `sighting_sigma_m` (15 m) per axis, and nothing is certain from the air: an air
+look detects the target with at most `air_max_p` (0.9). Ground looks (the UGV, a UAV at street
+level) and the robots whose sighting ends the mission (`confirm_by`) never sight wrongly: they
+are the check. False sightings never end the mission, and they come from their own random
+streams, so a target-free run makes the same ones (§3.3).
+
+The robots get, per robot that may sight wrongly, a `SightingModel` (`MissionSetup.sightings`):
+the position error, and per cell the false sightings to expect per look (the clutter, plus the
+decoy density times the chance a look sights one; not where the decoys are). Such a robot's
+sightings come in `LocalBeliefUpdate.sightings`, each once, with the update's looks. The belief
+weighs each by its likelihood ratio, per cell `c` of the look:
+
+| looks at `c` | multiplies the cell's mass by |
+|---|---|
+| sights nothing | `1 − p(c)`, as before |
+| sights `z` | `(1 − p(c)) + p(c) · g(z; c) / λ(z)`: `g` the position error's density round `c`, `λ` the false sightings per m² |
+| sights `z` within `3σ + one cell` of an earlier sighting (a repeat) | `1` within that gate: a thing mistaken for the target once is mistaken again, so it says nothing new |
+
+A sighting thus raises the belief near it as far as the false sightings it could be allow: where
+they are rare, one sighting makes the target likely there; in a town full of parked cars, much
+less. A later pass that misses it lowers it again; only a pass that misses it (or a ground look)
+clears it. Beliefs fuse as before: the looks by element-wise minimum and the sightings by union
+(`BeliefMap.fuse`). The controllers pursue a sighting (the *lead*, `controllers.common.Lead`) once the
+belief puts the target within the gate of it with chance `lead_pursue_p` (0.5), until it falls
+below `lead_drop_p` (0.1); in between, the search gets to it as the belief says. The run summary
+counts `sightings_target`, `sightings_decoy`, `sightings_clutter` (and `false_sightings`, the
+last two), `leads`, `false_leads` (pursued with no target there), `false_lead_s` (for how long) and
+`false_verify_flights`. With `false_alarms: false` (the default), sightings are certain and
+missions are as before. `configs/small_car_false_alarms.yaml` runs it.
 
 ### 1.4 Radio channel
 

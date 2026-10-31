@@ -31,7 +31,13 @@ planners weigh each cell's belief by it (`SortiePlanner.p_ugv` and `p_air` are p
 cell). The controllers never see the occlusion itself. Only the UGV can
 end the mission, so a UAV sighting is worth something only once the UGV drives over to confirm it,
 unless the near scout's own sighting ends it (`sim.confirm_by: [uav0]`): then it can verify a
-sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*).
+sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*). A UAV flying high may
+sight things that are not the target ([False sightings](README.md#13-visibility-layers-urban-needs-both-robot-types)):
+its sighting raises the belief near it, by how rare false sightings are there, and a pass that
+misses it lowers it again. A controller pursues a sighting (its *lead*, `common.Lead`) only while
+the belief makes the target likely near it: once that chance reaches `lead_pursue_p` (0.5), until
+it falls below `lead_drop_p` (0.1). Below that, the search gets to it, or not, as the belief says,
+as it does any belief. A sighting by a robot that never sights wrongly is a lead for good.
 
 **What constrains them.** The dock shapes every plan. A UAV that is not docked has nowhere to wait
 except in the air, and a stay on the dock takes landing + swap + take-off (about 3 min), during
@@ -206,7 +212,13 @@ within 1.5 km, else the nearest road node with belief left) and keeps it planned
 at least one landing slot per UAV, plus one, plus a full UAV flight ahead. After the pin, the
 route is re-planned on the current belief every 60 s.
 
-- *Sightings:* the UGV detours at once, from the node it is at or driving to, if no UAV still
+- *Sightings:* the UGV pursues its lead (above): a new lead starts the pursuit, its passes and
+  its verifying afresh (a call to verify the old one that has not taken off is withdrawn), and a
+  dropped one leaves the route to the next re-plan. On the line map with a decoy under a UAV at
+  the start (`tests/test_false_alarms.py`), the UGV takes it up at once and drops it 13 to 20 s
+  later, once it has driven within sensor range of it and seen nothing; the UAVs' later sightings
+  of it are repeats and do not take it up again.
+  The UGV detours at once, from the node it is at or driving to, if no UAV still
   to land would wait past its hover slack (60 s). Otherwise it goes straight after the pin, and
   checks the detour again at every node it gets to (and once a stop there is done) while a stop
   still comes before the sighting.
@@ -456,7 +468,7 @@ plans better, by optimising one plan for the whole team over a horizon of severa
   UAV landing first). Moves edit tours (insert, remove, replace, reverse, rebuild), shift dock
   events along the route, add or remove a dock visit, and re-route the UGV between stops.
   Infeasible plans are repaired by trimming tours, or rejected.
-- **Re-planning** every `replan_s` (120 s), after every dock event, on a sighting, and when a UAV
+- **Re-planning** every `replan_s` (120 s), after every dock event, on a new lead (or a dropped one), and when a UAV
   on an open sortie runs out of tour. Dock manoeuvres in progress are kept; everything else may
   change, including a UAV's tour and landing in flight. After a sighting the route starts with the
   pursuit path; dock events go after it unless a UAV could not wait. If no plan is feasible it

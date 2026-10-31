@@ -36,6 +36,8 @@ controller_params:
     belief_radius_m: 1500.0        # the next road node is chosen within this radius
     belief_distance_offset_m: 100.0  # a node scores belief in footprint / (distance + offset)
     pursue_sightings: true         # drive over to confirm UAV sightings
+    lead_pursue_p: 0.5             # an uncertain sighting (UAV flying high) is pursued once the target is this likely near it ...
+    lead_drop_p: 0.1               # ... and dropped once below this (in between: the search gets to it as the belief says)
     relocation_radius_m: 800.0     # roads covered: drive to the most UAV belief within this radius
     fill_tours: true               # unused
     rendezvous_slack_s: 60.0       # unused
@@ -79,6 +81,8 @@ controller_params:
     belief_radius_m: 1500.0        # the next road node is chosen within this radius
     belief_distance_offset_m: 100.0  # a node scores belief in footprint / (distance + offset)
     pursue_sightings: true         # drive over to confirm UAV sightings
+    lead_pursue_p: 0.5             # an uncertain sighting (UAV flying high) is pursued once the target is this likely near it ...
+    lead_drop_p: 0.1               # ... and dropped once below this (in between: the search gets to it as the belief says)
     relocation_radius_m: 800.0     # roads covered: drive to the most UAV belief within this radius
     fill_tours: true               # unused
     rendezvous_slack_s: 60.0       # unused
@@ -122,6 +126,8 @@ controller_params:
     belief_radius_m: 1500.0        # unused
     belief_distance_offset_m: 100.0  # the next tour node scores belief in footprint / (distance + offset)
     pursue_sightings: true         # unused
+    lead_pursue_p: 0.5             # unused
+    lead_drop_p: 0.1               # unused
     relocation_radius_m: 800.0     # unused
     fill_tours: true               # true: use the whole energy budget; false: keep the best-rate part of the tour
     rendezvous_slack_s: 60.0       # spare hover kept at the landing, so the UGV can divert to a sighting
@@ -145,6 +151,8 @@ controller_params:
     belief_radius_m: 1500.0        # unused
     belief_distance_offset_m: 100.0  # the next tour node scores belief in footprint / (distance + offset)
     pursue_sightings: true         # unused
+    lead_pursue_p: 0.5             # unused
+    lead_drop_p: 0.1               # unused
     relocation_radius_m: 800.0     # unused
     fill_tours: true               # true: use the whole energy budget; false: keep the best-rate part of the tour
     rendezvous_slack_s: 60.0       # spare hover kept at the landing, so the UGV can divert to a sighting
@@ -175,6 +183,8 @@ controller_params:
     belief_radius_m: 1500.0        # unused
     belief_distance_offset_m: 100.0  # the next tour node scores belief in footprint / (distance + offset)
     pursue_sightings: true         # unused
+    lead_pursue_p: 0.5             # unused
+    lead_drop_p: 0.1               # unused
     relocation_radius_m: 800.0     # unused
     fill_tours: true               # true: use the whole energy budget; false: keep the best-rate part of the tour
     rendezvous_slack_s: 60.0       # spare hover kept at the landing, so the UGV can divert to a sighting
@@ -205,6 +215,8 @@ controller_params:
     belief_radius_m: 1500.0        # greedy starting routes: next road node within this radius
     belief_distance_offset_m: 100.0  # greedy starts: belief in footprint / (distance + offset)
     pursue_sightings: true         # route the UGV to confirm UAV sightings
+    lead_pursue_p: 0.5             # an uncertain sighting (UAV flying high) is pursued once the target is this likely near it ...
+    lead_drop_p: 0.1               # ... and dropped once below this (in between: the search gets to it as the belief says)
     relocation_radius_m: 800.0     # greedy starts: roads covered, drive to the most UAV belief within this radius
     fill_tours: true               # greedy starts: use each sortie's whole energy budget
     rendezvous_slack_s: 60.0       # spare hover budgeted at each landing
@@ -263,6 +275,13 @@ scenario:
   road_canopy: 0.5                   # a road through trees is covered by this share of their canopy
   urban_canyon: [0.5, 2.0]           # per town, drawn from this range: building height over street width
   ground_veg_occlusion: 0.3          # from the ground, trees hide a look with this share of their canopy
+  # false alarms (sim.false_alarms): what a UAV flying high mistakes for the target (never a ground look)
+  false_alarms: false                # false: a UAV sights only the target, exactly where it is
+  clutter_per_km2: 0.5               # transient false sightings per km² per look ...
+  decoys_per_km2: 0.5                # ... and things that look like the target from the air, per km² (both times the class's terrain weight)
+  decoy_p: 0.8                       # a look sights a decoy with this times its chance of detecting the target there
+  sighting_sigma_m: 15.0             # a high sighting's position error, std per axis
+  air_max_p: 0.9                     # nothing is certain from the air: a high look detects the target with at most this
   uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the smallest UAV sensor range, the widest gap-free grid)
   # prior (README §1.5)
   prior_model: semantic              # semantic (LMPath proxy) | gaussian_mixture

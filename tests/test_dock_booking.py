@@ -145,6 +145,7 @@ def test_a_pursuit_put_after_the_pin_takes_the_detour_once_it_fits(scenario):
     nxt = ahead()[0]
     sighting = ugv.nodes[nxt - 2]  # on the route before the next stop: the detour costs nothing
     ugv.belief.detection_xy = tuple(ugv.road.positions[sighting])
+    ugv.lead.update(ugv.belief, 0.0)  # (as its step does)
     calls, detour_now = [], ugv._detour_now
     ugv._detour_now = lambda at, xy: calls.append(at) is None and len(calls) > 1 and detour_now(at, xy)
     obs = sim.step(team.step(obs))  # the first check fails: it goes after the pin

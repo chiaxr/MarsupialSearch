@@ -91,6 +91,21 @@ class DockingSpec:
 
 
 @dataclass(frozen=True)
+class SightingModel:
+    """How a robot's sightings may be wrong, as the environment models them (a robot not given one
+    sights only the target, exactly where it is).
+
+    A look that would detect the target in a cell reports it at a position off by Gaussian error
+    ``sigma_m`` (per axis); and every look also reports, with no target there, sightings at
+    ``false_alarms`` per square metre of the cells it covers (things a camera mistakes for it).
+    :class:`~marsupial_search.core.belief.BeliefMap` weighs a sighting with them.
+    """
+
+    false_alarms: np.ndarray  # (H, W): expected false sightings per m² per look
+    sigma_m: float  # std of a sighting's position error, per axis
+
+
+@dataclass(frozen=True)
 class MissionSetup:
     """Static information available to the team at mission start."""
 
@@ -113,6 +128,9 @@ class MissionSetup:
     # Per robot, shape (N_LAYERS, H, W): the chance a look by its sensor detects the target there, as
     # the environment knows it (e.g. with what hides it). A robot not in it: ``layer_p()`` everywhere.
     detection: dict[str, np.ndarray] = field(default_factory=dict)
+    # Per robot whose sightings may be false or off (a UAV flying high): how (SightingModel). Its sightings
+    # come as LocalBeliefUpdate.sightings. A robot not in it: a sighting is certain (``detected``).
+    sightings: dict[str, SightingModel] = field(default_factory=dict)
 
     def robots_of(self, robot_type: RobotType) -> list[str]:
         return [rid for rid, spec in self.robots.items() if spec.robot_type == robot_type]
@@ -155,6 +173,10 @@ class LocalBeliefUpdate:
     ``p_detect[l, i, j]`` is the probability that the sensor would have detected a
     target located in layer ``l`` of cell ``(row0 + i, col0 + j)``. If nothing was
     detected the Bayesian update is ``mass *= 1 - p_detect`` over the window.
+
+    A robot with a :class:`SightingModel` reports what it sights in ``sightings`` (positions,
+    each once, on the step it is made out), true or not, and the update keeps its looks; one
+    without reports the target as certain: ``detected`` (every step it stays in view, with no looks).
     """
 
     robot_id: str
@@ -165,6 +187,7 @@ class LocalBeliefUpdate:
     p_detect: np.ndarray  # (N_LAYERS, h, w)
     detected: bool = False
     detection_xy: Optional[tuple[float, float]] = None
+    sightings: tuple[tuple[float, float], ...] = ()  # uncertain sightings made this step (SightingModel)
 
 
 @dataclass(frozen=True)

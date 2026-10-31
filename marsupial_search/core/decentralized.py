@@ -74,6 +74,10 @@ class DecentralizedTeam(MissionController):
         """Per robot: total time in ``step``, number of steps, and the fastest and slowest step."""
         return {rid: dict(t) for rid, t in self._timing.items()}
 
+    def leads(self) -> list[dict]:
+        """The sightings the robots pursued, from those that keep them (a ``leads()`` method)."""
+        return [ld for ctl in self.robots.values() if hasattr(ctl, "leads") for ld in ctl.leads()]
+
     def step(self, obs: Observation) -> dict[str, RobotCommands]:
         out: dict[str, RobotCommands] = {}
         self._alive = [rid for rid in self.robots if obs.robots[rid].mode != RobotMode.DEPLETED]

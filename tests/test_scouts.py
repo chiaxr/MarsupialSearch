@@ -347,6 +347,7 @@ def test_a_sighting_the_ugv_cannot_reach_is_verified_from_the_road_node_nearest_
     ugv.roads.add(blocked=[CUT])  # on the map already
     ugv._check_map(s, 1.0)
     ugv.belief.detection_xy = POCKET_XY
+    ugv.lead.update(ugv.belief, 0.0)  # (as its step does)
     ugv._maybe_pursue(s, 2.0)
     assert ugv.pursuit == "planned" and ugv.pursuit_verify is verifier
     if not verifier:  # as before: past the road edge nearest it (the UGV never gets in range)
@@ -368,6 +369,7 @@ def test_the_verifier_is_called_once_back_on_the_dock_and_not_again_where_its_ca
     ugv.roads.add(blocked=[CUT])
     ugv._check_map(s, 1.0)
     ugv.belief.detection_xy = POCKET_XY
+    ugv.lead.update(ugv.belief, 0.0)  # (as its step does)
     ugv._maybe_pursue(s, 2.0)
     s = _at(ugv, dataclasses.replace(s, docked_uav=None), ugv.pursuit_end)  # it is out
     ugv._check_verify(s, 3.0)
@@ -385,6 +387,7 @@ def test_a_blockage_on_the_way_to_a_sighting_calls_the_verifier_from_where_the_u
     ugv, s = _ugv(confirm_by=("uav0",), ladder=case == "short detour")  # a second road 50 m above: 100 m longer
     ugv._call_standby(s, 0.0)
     ugv.belief.detection_xy = (900.0, 510.0)  # the UGV can see it from the road, as mapped (between rungs)
+    ugv.lead.update(ugv.belief, 0.0)  # (as its step does)
     ugv._maybe_pursue(s, 1.0)
     assert ugv.pursuit == "planned" and not ugv.pursuit_verify and ugv.nodes[ugv.pursuit_end] in (17, 18)
     i = 6 if case == "too far" else 12  # 850 m or 250 m from the sighting (verify_radius_m = 500)

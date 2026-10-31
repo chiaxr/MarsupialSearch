@@ -39,8 +39,9 @@ Search
 Re-planning
     Every ``replan_s``, after every dock event and abort, on a new sighting, and when a robot
     finds a blocked node on the route. Dock manoeuvres in progress are kept; everything else
-    may change, including the tour and landing of a UAV in flight. After a sighting the route
-    starts with the pursuit path, and dock events go after it unless a UAV could not otherwise
+    may change, including the tour and landing of a UAV in flight. The sighting pursued is the
+    *lead* (``common.Lead``: a certain one, or an uncertain one the belief makes likely enough,
+    until it no longer does). After a new lead the route starts with the pursuit path, and dock events go after it unless a UAV could not otherwise
     land. It plans on the road map as the robots have found it so far (roads missing from it
     are used from the next re-plan), never on the true one.
 """
@@ -71,7 +72,7 @@ from marsupial_search.core import (
     Undock,
 )
 
-from .common import bypass, dist, pursuit_path
+from .common import Lead, bypass, dist, pursuit_path
 from .dock_booking import LAND, TAKEOFF, DockBookingConfig, slot_spacing
 from .sortie_planner import SortiePlanner
 
@@ -181,7 +182,7 @@ class JointPlannerController(MissionController):
         self.ugv_spec = setup.robots[self.ugv]
         self.roads = GraphKnowledge(setup.graphs[RobotType.UGV])  # the road map and the changes found to it
         self.road, self.air_graph = self.roads.graph, setup.graphs[RobotType.UAV]
-        self.belief = BeliefMap(setup.grid, setup.prior, setup.layer_fractions)
+        self.belief = BeliefMap(setup.grid, setup.prior, setup.layer_fractions, setup.sightings)
         self.road_visited = np.zeros(self.road.n_nodes, dtype=bool)
         uav_spec = setup.robots[self.uavs[0]] if self.uavs else self.ugv_spec
         self.P = SortiePlanner(setup, self.ugv_spec, uav_spec, self.cfg)
@@ -201,7 +202,7 @@ class JointPlannerController(MissionController):
         self.waiting: set[str] = set()
         self.last_plan = -np.inf
         self.replan_now = True
-        self.sighting = None
+        self.lead = Lead(self.cfg)  # the sighting pursued
         self.pursuit_goal: Optional[int] = None
         self.pursuit_done = False
         self.held: dict[str, float] = {}  # UAV -> when its dock manoeuvre ends
@@ -210,6 +211,10 @@ class JointPlannerController(MissionController):
 
     def is_done(self) -> bool:
         return self._done
+
+    def leads(self) -> list[dict]:
+        """Every sighting pursued (``Lead.log``)."""
+        return self.lead.log
 
     # ------------------------------------------------------------------- step
     def step(self, obs: Observation) -> dict[str, list[Command]]:
@@ -225,8 +230,8 @@ class JointPlannerController(MissionController):
         if self.sent is not None:
             self.cur = max(self.cur, self.sent[0] - len(g.path_remaining))
         self._handle_events(obs)
-        if self.belief.detection_xy is not None and self.sighting is None:
-            self.sighting, self.replan_now = self.belief.detection_xy, True
+        if self.lead.update(self.belief, now):  # a new lead (or none): pursue it afresh
+            self.pursuit_done, self.replan_now = False, True
         if self.pursuit_goal is not None and not self.pursuit_done and g.node == self.pursuit_goal:
             self.pursuit_done, self.replan_now = True, True  # drove past it without confirming
         if g.mode == RobotMode.DEPLETED:
@@ -341,7 +346,7 @@ class JointPlannerController(MissionController):
         P = self.P
         if not ((P.F_road @ P.seen(ctx.m0, P.p_ugv) > 0).any()
                 or (P.F_air @ P.seen(ctx.m0, P.p_air) > 0).any()):
-            self._done = self.sighting is None or self.pursuit_done  # no searchable belief left
+            self._done = self.lead.xy is None or self.pursuit_done  # no searchable belief left
         starts = self._starts(ctx)
         warm = self._advance(ctx)
         if warm is not None:
@@ -378,8 +383,8 @@ class JointPlannerController(MissionController):
             hold = max([hold] + [t for t, _ in docked.values()])
         t0, min_lock = max(t0, hold), lock
         self.pursuit_goal = None
-        if self.sighting is not None and self.cfg.pursue_sightings and not self.pursuit_done:
-            path = pursuit_path(self.road, self.sighting, prefix[-1])
+        if self.lead.xy is not None and self.cfg.pursue_sightings and not self.pursuit_done:
+            path = pursuit_path(self.road, self.lead.xy, prefix[-1])
             prefix = prefix + [int(n) for n in path[1:]]
             lock, self.pursuit_goal = len(prefix) - 1, prefix[-1]
         return _Context(now, now + self.cfg.horizon_s, prefix, t0, lock, min_lock, g.energy, docked, air,

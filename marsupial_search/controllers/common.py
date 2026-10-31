@@ -1,4 +1,5 @@
-"""Building blocks shared by the controllers: search settings, footprints, distances, pursuit paths and detours."""
+"""Building blocks shared by the controllers: search settings, footprints, distances, the sighting to pursue,
+pursuit paths and detours."""
 
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 from scipy.sparse import csr_matrix
 
-from marsupial_search.core import GridSpec, TraversabilityGraph
+from marsupial_search.core import BeliefMap, GridSpec, TraversabilityGraph
 
 # (src, dst) -> (path, cost), as TraversabilityGraph.shortest_path; a search leg may also pass a per-node reward (metres)
 PathFn = Callable[..., tuple[list[int], float]]
@@ -21,6 +22,10 @@ class SearchConfig:
     belief_radius_m: float = 1500.0  # candidate search radius for the next node
     belief_distance_offset_m: float = 100.0  # score = belief in footprint / (distance + offset)
     pursue_sightings: bool = True  # send the UGV to confirm UAV sightings
+    # An uncertain sighting (a UAV flying high may sight things that are not the target) is pursued once the
+    # target is this likely near it (BeliefMap.p_near) ...
+    lead_pursue_p: float = 0.5
+    lead_drop_p: float = 0.1  # ... and dropped once below this. In between the search gets to it as the belief says
 
 
 def dist(a, b) -> float:
@@ -44,6 +49,51 @@ def footprint_matrix(grid: GridSpec, graph: TraversabilityGraph, radius: float,
         cols.append(cells)
     rows, cols = np.concatenate(rows), np.concatenate(cols)
     return csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(graph.n_nodes, grid.rows * grid.cols))
+
+
+class Lead:
+    """The sighting a controller pursues (``xy``; None: none). A certain one
+    (``BeliefMap.detection_xy``) is pursued for good. Otherwise the uncertain one most likely to be
+    the target (``BeliefMap.hypotheses``), once the chance it is near is ``lead_pursue_p``, until
+    the looks that miss it bring that below ``lead_drop_p``. ``log`` keeps each lead: when it
+    started and ended (``"t0"``, ``"t1"``: None while pursued), where, whether it was certain,
+    and the flights to verify it (``"verify"``, counted by the controller)."""
+
+    def __init__(self, cfg: SearchConfig):
+        self.cfg = cfg
+        self.xy: Optional[tuple[float, float]] = None
+        self.hard = False
+        self.log: list[dict] = []
+
+    def update(self, belief: BeliefMap, now: float) -> bool:
+        """Follow the belief: True if the lead changed (a new one, or dropped)."""
+        if belief.detection_xy is not None:
+            if self.hard:
+                return False
+            self._set(tuple(belief.detection_xy), True, now)
+            return True
+        changed = False
+        if self.xy is not None and belief.p_near(self.xy) < self.cfg.lead_drop_p:
+            self._set(None, False, now)
+            changed = True
+        if self.xy is None and belief.anchors:
+            hyp = belief.hypotheses()
+            if hyp[0][1] >= self.cfg.lead_pursue_p:
+                self._set(tuple(hyp[0][0]), False, now)
+                changed = True
+        return changed
+
+    def _set(self, xy, hard: bool, now: float) -> None:
+        if self.log and self.log[-1]["t1"] is None:
+            self.log[-1]["t1"] = now
+        self.xy, self.hard = xy, hard
+        if xy is not None:
+            self.log.append({"t0": now, "t1": None, "xy": xy, "hard": hard, "verify": 0})
+
+    def verified(self) -> None:
+        """A flight to verify the lead took off."""
+        if self.log and self.log[-1]["t1"] is None:
+            self.log[-1]["verify"] += 1
 
 
 def pursuit_path(road: TraversabilityGraph, sighting_xy, src: int, path_fn: Optional[PathFn] = None) -> list[int]:

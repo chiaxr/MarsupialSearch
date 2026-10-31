@@ -14,8 +14,14 @@ detection. One target-free run per map therefore gives, for every target cell an
   This part is an estimate: how quickly a team confirms a sighting depends on the team. A
   sensor that detects a layer with probability ``p < 1`` per look (per pass over the cell)
   sights it on its k-th look with probability ``p_k Π_{i<k} (1 − p_i)``, ``p_i`` that look's
-  probability in that cell (``visibility.detection_map``: with occlusion, it varies per cell); ``T̂`` is the
+  probability in that cell (``simulator.robot_sensing``: with occlusion, it varies per cell); ``T̂`` is the
   expectation over which look, if any before the find, sights it.
+
+False sightings (``Scenario.false_alarms``) do not depend on the target (their own random
+streams), so a target-free run makes the same ones, and the team chases them the same way, up
+to the first true sighting. A true one by a UAV flying high is an uncertain sighting the team may
+or may not pursue at once; ``T̂`` counts it as sighted (the UGV's drive from there), part of the
+estimate's error.
 
 The prediction ``T̂`` is averaged over the whole target distribution, ``E[T̂]``, and its error is
 measured on a few real missions with sampled targets. The estimate of the expected time to
@@ -33,8 +39,7 @@ import numpy as np
 from marsupial_search.core import N_LAYERS, RobotMode, RobotType
 
 from .scenario import Scenario
-from .simulator import MissionResult, SimConfig
-from .visibility import detection_map
+from .simulator import MissionResult, SimConfig, confirmers_of, robot_sensing
 
 _ACTIVE = list(RobotMode).index(RobotMode.ACTIVE)
 
@@ -124,7 +129,7 @@ def predicted_find_times(scenario: Scenario, result: MissionResult, cfg: SimConf
     traj, speed = result.trajectories[ugv], scenario.robots[ugv].speed
     seers = [rid for rid in scenario.robots if rid not in by_range]
     looks = {rid: look_events(scenario, result, rid) for rid in seers}
-    detect = {rid: detection_map(scenario.robots[rid], scenario.terrain, scenario.occlusion) for rid in seers}
+    detect = robot_sensing(scenario, confirmers_of(scenario, cfg))[0]
     found_flat, cell_node_flat = found.ravel(), cell_node.ravel()
     dist_cache: dict[int, np.ndarray] = {}
     for layer in range(N_LAYERS):

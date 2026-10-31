@@ -21,7 +21,11 @@ Per step (``dt`` seconds), in order:
    sighting) on sighting it. A road node in range is made out once per pass too, with the chance
    occlusion leaves it (its own random stream, so it does not depend on the target): a
    mismatch is found only on a node made out, and the prior-map nodes in range not made out
-   are reported ``hidden``;
+   are reported ``hidden``. A UAV flying high (``Scenario.false_alarms``; not a confirmer) also
+   sights clutter and decoys (:mod:`.false_alarms`): its sightings, true or false and off by its
+   position error, come in ``LocalBeliefUpdate.sightings``, each once (on the step it is made
+   out), and never end the mission. Its own random streams (clutter and decoys; the position error)
+   do not depend on the target;
 8. radio: queue this step's ``Transmit`` commands and deliver messages that are due.
 
 Robots are given the prior road map (``Scenario.graphs``); the UGV drives on the true one
@@ -66,13 +70,17 @@ from marsupial_search.core import (
     Undock,
 )
 
+from marsupial_search.core.belief import GATE_SIGMAS
+
 from .radio import _SIZE_KEYS as _RADIO_SIZE_KEYS
 from .radio import _STAT_KEYS as _RADIO_STAT_KEYS
 from .radio import RadioChannel, RadioConfig
 from .scenario import Scenario
+from .false_alarms import capped_detection, sighting_model, sights_wrongly
 from .visibility import detection_map, road_observability
 
 _EPS = 1e-9
+_SIGHTING_KEYS = ("sightings_target", "sightings_decoy", "sightings_clutter")  # per robot with false sightings
 
 
 @dataclass
@@ -185,6 +193,12 @@ class MissionResult:
     final_mass: np.ndarray
     belief_snapshots: list[tuple[float, np.ndarray]] = field(default_factory=list)
     wall_time_s: float = 0.0
+    target_xy: Optional[tuple[float, float]] = None  # ground truth (None: a target-free run)
+    # Every sighting a robot with false sightings reported: (time, robot, where, "target" | "decoy" | "clutter")
+    sightings: list[tuple[float, str, tuple[float, float], str]] = field(default_factory=list)
+    # The sightings the controller pursued (its ``leads()``): {"t0", "t1" (None: to the end), "xy", "verify"}
+    leads: list[dict] = field(default_factory=list)
+    lead_gate_m: float = 0.0  # a lead this close to the target was the target
     # Set by Simulator.run: time spent inside the controller's reset and step calls.
     controller_timing: dict = field(default_factory=dict)
 
@@ -206,13 +220,20 @@ class MissionResult:
             if key in self.log:
                 out[key] = float(self.log[key][-1])
         for k in ("sorties", "dock_aborts", "undock_aborts", "rejected", "path_blocked", "map_changes_found",
-                  *_RADIO_STAT_KEYS):
+                  *_SIGHTING_KEYS, *_RADIO_STAT_KEYS):
             out[k] = sum(s[k] for s in self.robot_stats.values())
         senders = [s for s in self.robot_stats.values() if s["radio_sent"]]
         out["radio_payload_min_bytes"] = min((s["radio_payload_min_bytes"] for s in senders), default=float("nan"))
         out["radio_payload_avg_bytes"] = (out["radio_bytes_sent"] / out["radio_sent"] if out["radio_sent"]
                                           else float("nan"))
         out["radio_payload_max_bytes"] = max((s["radio_payload_max_bytes"] for s in senders), default=float("nan"))
+        out["false_sightings"] = out["sightings_decoy"] + out["sightings_clutter"]
+        false = [ld for ld in self.leads if self.target_xy is None
+                 or np.hypot(ld["xy"][0] - self.target_xy[0], ld["xy"][1] - self.target_xy[1]) > self.lead_gate_m]
+        out["leads"] = len(self.leads)
+        out["false_leads"] = len(false)  # pursued a sighting with no target there ...
+        out["false_lead_s"] = sum((self.time_s if ld["t1"] is None else ld["t1"]) - ld["t0"] for ld in false)  # ... this long
+        out["false_verify_flights"] = sum(ld["verify"] for ld in false)
         out["depleted"] = sum(int(s["depleted"]) for s in self.robot_stats.values())
         out["ugv_distance_m"] = sum(s["distance_m"] for s in self.robot_stats.values() if s["type"] == "ugv")
         out["uav_distance_m"] = sum(s["distance_m"] for s in self.robot_stats.values() if s["type"] == "uav")
@@ -227,6 +248,26 @@ class MissionResult:
                                        default=float("nan"))
         out["robot_max_step_s"] = max((s["controller_max_step_s"] for s in timed), default=float("nan"))
         return out
+
+
+def robot_sensing(scenario: Scenario, confirmers: tuple[str, ...]) -> tuple[dict[str, np.ndarray], dict]:
+    """Per robot, layer and cell: the chance a look detects the target (true terrain and occlusion;
+    from the air, with false sightings, never certain); and the robots with false sightings, with
+    their :class:`~marsupial_search.core.SightingModel`."""
+    fa = scenario.false_alarms
+    detection = {rid: detection_map(spec, scenario.terrain, scenario.occlusion) for rid, spec in scenario.robots.items()}
+    models = {}
+    for rid, spec in scenario.robots.items():
+        if sights_wrongly(spec, fa, confirmers):
+            detection[rid] = capped_detection(detection[rid], fa)
+            models[rid] = sighting_model(detection[rid], scenario.layer_fractions, fa)
+    return detection, models
+
+
+def confirmers_of(scenario: Scenario, config: SimConfig) -> tuple[str, ...]:
+    """The robots whose sighting (or range) ends the mission."""
+    return tuple(rid for rid, spec in scenario.robots.items()
+                 if spec.robot_type in config.terminate_on or rid in config.confirm_by)
 
 
 class Simulator:
@@ -249,14 +290,12 @@ class Simulator:
         unknown = set(self.config.confirm_by) - set(scenario.robots)
         if unknown:
             raise ValueError(f"confirm_by: no robots {sorted(unknown)} in scenario {scenario.name!r}")
-        confirmers = tuple(rid for rid, spec in scenario.robots.items()
-                           if spec.robot_type in self.config.terminate_on or rid in self.config.confirm_by)
-        # Per robot, layer and cell: the chance a look detects the target (true terrain and occlusion).
-        self._detection = {rid: detection_map(spec, scenario.terrain, scenario.occlusion)
-                           for rid, spec in scenario.robots.items()}
+        confirmers = confirmers_of(scenario, self.config)
+        self._detection, self._models = robot_sensing(scenario, confirmers)
         self.setup: MissionSetup = dataclasses.replace(
             scenario.mission_setup(self.config.dt), radio_range_m=ranges, confirmers=confirmers,
-            confirm_test=self.config.confirm_test, detection={rid: p.copy() for rid, p in self._detection.items()})
+            confirm_test=self.config.confirm_test, detection={rid: p.copy() for rid, p in self._detection.items()},
+            sightings=dict(self._models))
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -272,7 +311,7 @@ class Simulator:
         self._requests: dict[str, Command] = {}
         self._outgoing: list[tuple[str, Transmit]] = []
         self.radio = RadioChannel(cfg.radio, np.random.default_rng([cfg.seed, 1]))
-        self.truth_belief = BeliefMap(sc.grid, sc.prior, sc.layer_fractions)
+        self.truth_belief = BeliefMap(sc.grid, sc.prior, sc.layer_fractions, self._models)
         self.target_cell = sc.grid.world_to_cell(*sc.target_xy)
         self._target_center = np.array(sc.grid.cell_center(*self.target_cell)) if cfg.target else np.full(2, np.inf)
 
@@ -328,6 +367,14 @@ class Simulator:
         self._view: dict[str, Optional[tuple[int, int, np.ndarray]]] = {rid: None for rid in sc.robots}  # looked, in view
         self._target_in_view = {rid: False for rid in sc.robots}
         self._target_seen = {rid: False for rid in sc.robots}
+        # False sightings: clutter per cell per look and a roll per decoy per pass (their own stream); the
+        # position error of a true one (another, so the target's sighting does not shift the false ones).
+        fa = sc.false_alarms
+        self._fa_rng = np.random.default_rng([cfg.seed, 4])
+        self._noise_rng = np.random.default_rng([cfg.seed, 5])
+        self._decoy_tree = cKDTree(fa.decoys) if fa is not None and len(fa.decoys) else None
+        self._decoys_in_view: dict[str, set[int]] = {rid: set() for rid in sc.robots}
+        self.sightings: list[tuple[float, str, tuple[float, float], str]] = []
 
         self._terrain_masks = {t: sc.terrain == int(t) for t in Terrain if (sc.terrain == int(t)).any()}
         self._log: dict[str, list] = {"t": [], "searched_prob": []}
@@ -343,7 +390,7 @@ class Simulator:
         self._next_snapshot = 0.0
         self._stats = {
             rid: {"type": r.spec.robot_type.value, "sorties": 0, "dock_aborts": 0, "undock_aborts": 0, "rejected": 0,
-                  "path_blocked": 0, "map_changes_found": 0}
+                  "path_blocked": 0, "map_changes_found": 0, **dict.fromkeys(_SIGHTING_KEYS, 0)}
             for rid, r in self.robots.items()
         }
 
@@ -386,6 +433,8 @@ class Simulator:
         if hasattr(controller, "robot_timing"):
             for rid, t in controller.robot_timing().items():
                 result.robot_stats[rid].update(t)
+        if hasattr(controller, "leads"):
+            result.leads = controller.leads()
         return result
 
     def step(self, commands: dict[str, RobotCommands]) -> Observation:
@@ -596,7 +645,10 @@ class Simulator:
         for r in self.robots.values():
             if r.mode != RobotMode.ACTIVE:  # depleted, or a UAV that is not airborne
                 self._view[r.rid], self._target_in_view[r.rid] = None, False  # back in the air: a new pass
+                self._decoys_in_view[r.rid] = set()
                 continue
+            soft = r.rid in self._models  # its sightings may be false: reported in ``sightings``
+            sightings: list[tuple[float, float]] = []
             rng_m = r.spec.sensor.range_m
             row0, col0, mask = grid.disk_window(r.pos[0], r.pos[1], rng_m)
             new = mask & ~self._in_view_last_step(r.rid, row0, col0, mask)
@@ -618,7 +670,12 @@ class Simulator:
                     if entering:
                         pd = self._layer_vis[r.rid][(int(sc.target_layer),) + self.target_cell]
                         self._target_seen[r.rid] = pd >= 1 or (pd > 0 and self._detect_rng.random() < pd)
-                    if self._target_seen[r.rid]:
+                    if soft:
+                        if entering and self._target_seen[r.rid]:
+                            xy = self._target_center + self._noise_rng.normal(0.0, sc.false_alarms.sigma_m, 2)
+                            sightings.append(self._sighting(r.rid, xy, "target"))
+                            self._emit(EventType.TARGET_SIGHTED, r.rid)
+                    elif self._target_seen[r.rid]:
                         detected = True
                         self._emit(EventType.TARGET_SIGHTED, r.rid)
                         ends = r.rid in self.config.confirm_by or r.spec.robot_type in self.config.terminate_on
@@ -626,8 +683,10 @@ class Simulator:
                             self.found_by = r.rid
                             self._emit(EventType.TARGET_FOUND, r.rid)
                             self._finish("found")
+            if soft:
+                sightings += self._false_sightings(r, row0, col0, new)
             # A sighting's update carries no looks (BeliefMap.apply skips it): the cells that came
-            # into view get theirs on the next step without one.
+            # into view get theirs on the next step without one. (Not one in ``sightings``: it keeps them.)
             self._view[r.rid] = (row0, col0, mask & ~new if detected else mask)
             upd = LocalBeliefUpdate(
                 robot_id=r.rid,
@@ -638,10 +697,40 @@ class Simulator:
                 p_detect=p,
                 detected=detected,
                 detection_xy=tuple(self._target_center) if detected else None,
+                sightings=tuple(sightings),
             )
             self.truth_belief.apply(upd)
             updates.append(upd)
         return updates
+
+    def _sighting(self, rid: str, xy, kind: str) -> tuple[float, float]:
+        xy = (float(xy[0]), float(xy[1]))
+        self.sightings.append((self.time, rid, xy, kind))
+        self._stats[rid][f"sightings_{kind}"] += 1
+        return xy
+
+    def _false_sightings(self, r: _SimRobot, row0: int, col0: int, new: np.ndarray) -> list[tuple[float, float]]:
+        """What robot ``r``'s look mistakes for the target this step: clutter in the cells that entered
+        its footprint, and each decoy that came into range, sighted with its roll for the pass."""
+        fa, grid, rng = self.scenario.false_alarms, self.scenario.grid, self._fa_rng
+        out = []
+        rr, cc = np.nonzero(new)
+        res = grid.resolution
+        counts = rng.poisson(fa.clutter[rr + row0, cc + col0] * res ** 2)
+        for i in np.flatnonzero(counts):
+            x, y = grid.cell_center(rr[i] + row0, cc[i] + col0)
+            for _ in range(counts[i]):
+                xy = np.array([x, y]) + rng.uniform(-0.5, 0.5, 2) * res + rng.normal(0.0, fa.sigma_m, 2)
+                out.append(self._sighting(r.rid, xy, "clutter"))
+        if self._decoy_tree is not None:
+            now = set(self._decoy_tree.query_ball_point(r.pos, r.spec.sensor.range_m))
+            for d in sorted(now - self._decoys_in_view[r.rid]):
+                cell = grid.world_to_cell(*fa.decoys[d])
+                p = fa.decoy_p * self._layer_vis[r.rid][(int(fa.decoy_layers[d]),) + cell]
+                if p > 0 and rng.random() < p:
+                    out.append(self._sighting(r.rid, fa.decoys[d] + rng.normal(0.0, fa.sigma_m, 2), "decoy"))
+            self._decoys_in_view[r.rid] = now
+        return out
 
     def _in_view_last_step(self, rid: str, row0: int, col0: int, mask: np.ndarray) -> np.ndarray:
         """Which cells of this footprint window were in robot ``rid``'s footprint last step and had
@@ -784,4 +873,7 @@ class Simulator:
             robot_stats=stats,
             final_mass=self.truth_belief.cell_mass(),
             belief_snapshots=self._snapshots,
+            target_xy=tuple(map(float, self._target_center)) if self.config.target else None,
+            sightings=list(self.sightings),
+            lead_gate_m=self.truth_belief.gate_m,
         )

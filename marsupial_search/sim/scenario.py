@@ -1,4 +1,4 @@
-"""Scenario container: map, graphs, prior, fleet, (hidden) ground-truth target and road-map mismatches."""
+"""Scenario container: map, graphs, prior, fleet, (hidden) ground-truth target, road-map mismatches, occlusion and false alarms."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from marsupial_search.core import (
     TraversabilityGraph,
 )
 
+from .false_alarms import FalseAlarms
 from .visibility import Occlusion
 
 
@@ -64,6 +65,8 @@ class Scenario:
     map_terrain: Optional[np.ndarray] = None
     # What hides the target and the roads from the sensors (the simulator's: never shown to the robots; None: nothing).
     occlusion: Optional[Occlusion] = None
+    # What a UAV flying high mistakes for the target, and how far off its sightings are (the simulator's: None: nothing).
+    false_alarms: Optional[FalseAlarms] = None
 
     def true_road(self, blocked: bool = True) -> TraversabilityGraph:
         """The road network as it really is (see :meth:`MapMismatch.apply`)."""
