@@ -21,7 +21,7 @@ does a robot whose sighting ends the mission (``MissionSetup.confirmers``): it i
 
 A robot's model of it (:func:`sighting_model`) has the position error, and per cell the false
 sightings it should expect per look: the clutter, plus the decoy density times the chance a
-look sights one (it does not know where they are).
+look sights one (it does not know where they are), and which part of them are decoys.
 """
 
 from __future__ import annotations
@@ -66,4 +66,5 @@ def sighting_model(detection: np.ndarray, layer_fractions: np.ndarray, false_ala
     lf = layer_fractions / np.maximum(layer_fractions.sum(0, keepdims=True), 1e-300)
     sighted = (lf * detection).sum(0)
     fa = false_alarms
-    return SightingModel(false_alarms=fa.clutter + fa.decoy_density * fa.decoy_p * sighted, sigma_m=fa.sigma_m)
+    decoys = fa.decoy_density * fa.decoy_p * sighted
+    return SightingModel(false_alarms=fa.clutter + decoys, sigma_m=fa.sigma_m, decoys=decoys, decoy_p=fa.decoy_p)

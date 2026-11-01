@@ -191,7 +191,7 @@ class TimedRouteUgv(BookingRobot):
         self.detour_road: Optional[TraversabilityGraph] = None  # the road map detour_cache is for
         self.now = 0.0
         self.uav_planners: Optional[list[SortiePlanner]] = None  # per UAV, for when the search is done
-        self.lead = Lead(self.cfg)  # the sighting pursued
+        self.lead = Lead(self.cfg, self.rid)  # the sighting pursued
 
     def leads(self) -> list[dict]:
         """Every sighting pursued (``Lead.log``)."""
@@ -942,7 +942,7 @@ class TimedRouteUgv(BookingRobot):
                 if stop.get("verify") is not None:
                     self.verify_flown = True
                     self.passes["verify"] += 1
-                    self.lead.verified()
+                    self.lead.verified(stop["uav"], now)
                 if stop["kind"] == LAND:  # the booking is spent; its take-off stop remains
                     self.bookings.pop(stop["uav"], None)
                     self.swap_until = self.swap_end[stop["uav"]] = now + self.setup.docking.swap_duration_s

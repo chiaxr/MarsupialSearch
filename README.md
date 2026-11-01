@@ -202,7 +202,8 @@ streams, so a target-free run makes the same ones (§3.3).
 
 The robots get, per robot that may sight wrongly, a `SightingModel` (`MissionSetup.sightings`):
 the position error, and per cell the false sightings to expect per look (the clutter, plus the
-decoy density times the chance a look sights one; not where the decoys are). Such a robot's
+decoy density times the chance a look sights one; not where the decoys are), and the decoys' share
+of them. Such a robot's
 sightings come in `LocalBeliefUpdate.sightings`, each once, with the update's looks. The belief
 weighs each by its likelihood ratio, per cell `c` of the look:
 
@@ -210,7 +211,18 @@ weighs each by its likelihood ratio, per cell `c` of the look:
 |---|---|
 | sights nothing | `1 − p(c)`, as before |
 | sights `z` | `(1 − p(c)) + p(c) · g(z; c) / λ(z)`: `g` the position error's density round `c`, `λ` the false sightings per m² |
-| sights `z` within `3σ + one cell` of an earlier sighting (a repeat) | `1` within that gate: a thing mistaken for the target once is mistaken again, so it says nothing new |
+| sights `z` within `3σ + one cell` of an earlier sighting `a` (a repeat) | as a sighting, with `λ(z) + π · decoy_p · p(a) · g₂(z − a)` in place of `λ(z)`: a decoy at `a` sighted again (`g₂`: twice the variance), `π` the chance `a` was a decoy were it not the target |
+| sights nothing near an earlier sighting `a` it could have sighted (a miss) | `1 − p(c)`, and `a`'s own ratio is divided by `1 − π · decoy_p · p̄(a)`: a decoy at `a` missed too (`p̄`: the look's chance, averaged round `a`) |
+
+Clutter does not come back but a decoy does, so a repeat counts against clutter only. `π` starts
+as the decoys' share of `λ` at the first sighting, rises with each repeat (by Bayes, against
+clutter coming back there by chance) and falls with each miss (a decoy would likely have been
+sighted). A target sighted again where false sightings are mostly clutter soon becomes likely;
+where they are mostly decoys, each repeat raises it by only about `1 / decoy_p`, until misses in
+between make a decoy unlikely. A miss also lowers it less where a decoy is likely, as a decoy
+would have been missed too. A pass comes in slivers (each step's update holds the cells newly in
+view), so `p̄` is averaged over where the decoy may be: the slivers add up to one miss. Only
+looks after the first sighting count as misses.
 
 A sighting thus raises the belief near it as far as the false sightings it could be allow: where
 they are rare, one sighting makes the target likely there; in a town full of parked cars, much
@@ -222,7 +234,10 @@ below `lead_drop_p` (0.1); in between, the search gets to it as the belief says.
 counts `sightings_target`, `sightings_decoy`, `sightings_clutter` (and `false_sightings`, the
 last two), `leads`, `false_leads` (pursued with no target there), `false_lead_s` (for how long) and
 `false_verify_flights`. With `false_alarms: false` (the default), sightings are certain and
-missions are as before. `configs/small_car_false_alarms.yaml` runs it.
+missions are as before. `configs/small_car_false_alarms.yaml` runs it. The GIF draws each false
+sighting (repeats near it are one, `MissionResult.false_spots`) as a yellow diamond once sighted,
+greyed once ruled out: the looks since would have sighted the target near it 4 times in 5 (the
+belief near it down to a fifth).
 
 ### 1.4 Radio channel
 
@@ -476,7 +491,9 @@ team). It writes to `outputs/` (`--out`): the map (`<map>_map.png`), a plot and 
 (`<map>[_t<target seed>]_<team>.png` / `.gif`) and the resolved settings
 (`<map>[_t<target seed>]_config.yaml`). Here `<map>` is the base scenario and map seed, e.g. `small_s0`.
 GIFs play at 10 frames per second. By default each frame covers 1/150 of the mission (10–60 s),
-i.e. 100–600× real time; `mission.gif_speedup` (or `--gif-speedup`) sets the speed instead.
+i.e. 100–600× real time; `mission.gif_speedup` (or `--gif-speedup`) sets the speed instead. A
+dashed line in a robot's colour joins the UGV to the sighting it pursues, and a UAV flying to
+verify it, until it is closest to it; false sightings are diamonds (§1.3).
 
 ### 3.2 Experiment files (YAML)
 

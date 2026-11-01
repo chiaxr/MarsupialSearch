@@ -98,11 +98,16 @@ class SightingModel:
     A look that would detect the target in a cell reports it at a position off by Gaussian error
     ``sigma_m`` (per axis); and every look also reports, with no target there, sightings at
     ``false_alarms`` per square metre of the cells it covers (things a camera mistakes for it).
-    :class:`~marsupial_search.core.belief.BeliefMap` weighs a sighting with them.
+    Of those, ``decoys`` are things there on every pass (a parked car like the one sought), sighted
+    with ``decoy_p`` times the chance the look would sight the target there; the rest is clutter,
+    there for one look only. :class:`~marsupial_search.core.belief.BeliefMap` weighs a sighting with
+    them: a sighting near an earlier one is likelier the target where clutter is.
     """
 
     false_alarms: np.ndarray  # (H, W): expected false sightings per m² per look
     sigma_m: float  # std of a sighting's position error, per axis
+    decoys: Optional[np.ndarray] = None  # (H, W): the part of false_alarms from decoys (None: all of it)
+    decoy_p: float = 1.0  # a decoy is sighted with this times the chance the target would be there
 
 
 @dataclass(frozen=True)

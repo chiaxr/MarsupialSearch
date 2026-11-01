@@ -25,7 +25,9 @@ Per step (``dt`` seconds), in order:
    sights clutter and decoys (:mod:`.false_alarms`): its sightings, true or false and off by its
    position error, come in ``LocalBeliefUpdate.sightings``, each once (on the step it is made
    out), and never end the mission. Its own random streams (clutter and decoys; the position error)
-   do not depend on the target;
+   do not depend on the target. Each false sighting that is not near an earlier one is a *spot*
+   (``MissionResult.false_spots``), cleared once the looks since would have sighted the target
+   near it with chance ``1 - _CLEARED`` (from the belief: the mass near it has fallen that far);
 8. radio: queue this step's ``Transmit`` commands and deliver messages that are due.
 
 Robots are given the prior road map (``Scenario.graphs``); the UGV drives on the true one
@@ -81,6 +83,7 @@ from .visibility import detection_map, road_observability
 
 _EPS = 1e-9
 _SIGHTING_KEYS = ("sightings_target", "sightings_decoy", "sightings_clutter")  # per robot with false sightings
+_CLEARED = 0.2  # a false sighting's spot is cleared once the mass near it is this much of what it was
 
 
 @dataclass
@@ -196,7 +199,11 @@ class MissionResult:
     target_xy: Optional[tuple[float, float]] = None  # ground truth (None: a target-free run)
     # Every sighting a robot with false sightings reported: (time, robot, where, "target" | "decoy" | "clutter")
     sightings: list[tuple[float, str, tuple[float, float], str]] = field(default_factory=list)
-    # The sightings the controller pursued (its ``leads()``): {"t0", "t1" (None: to the end), "xy", "verify"}
+    # Each place a robot sighted the target where it is not (false sightings near it are one):
+    # {"t", "robot", "xy" (the first sighting), "kind", "n" (sightings), "t_clear" (None: never cleared)}
+    false_spots: list[dict] = field(default_factory=list)
+    # The sightings the controller pursued (its ``leads()``): {"t0", "t1" (None: to the end), "xy", "by"
+    # (the robot pursuing it), "verify" (flights to verify it), "flights" ((uav, take-off time) each)}
     leads: list[dict] = field(default_factory=list)
     lead_gate_m: float = 0.0  # a lead this close to the target was the target
     # Set by Simulator.run: time spent inside the controller's reset and step calls.
@@ -375,6 +382,8 @@ class Simulator:
         self._decoy_tree = cKDTree(fa.decoys) if fa is not None and len(fa.decoys) else None
         self._decoys_in_view: dict[str, set[int]] = {rid: set() for rid in sc.robots}
         self.sightings: list[tuple[float, str, tuple[float, float], str]] = []
+        self.false_spots: list[dict] = []
+        self._spot_mass: list[list] = []  # per spot: the window near it, and its mass when made
 
         self._terrain_masks = {t: sc.terrain == int(t) for t in Terrain if (sc.terrain == int(t)).any()}
         self._log: dict[str, list] = {"t": [], "searched_prob": []}
@@ -701,13 +710,38 @@ class Simulator:
             )
             self.truth_belief.apply(upd)
             updates.append(upd)
+        self._clear_spots()
         return updates
 
     def _sighting(self, rid: str, xy, kind: str) -> tuple[float, float]:
         xy = (float(xy[0]), float(xy[1]))
         self.sightings.append((self.time, rid, xy, kind))
         self._stats[rid][f"sightings_{kind}"] += 1
+        if kind != "target":
+            gate = self.truth_belief.gate_m
+            near = [s for s in self.false_spots if np.hypot(xy[0] - s["xy"][0], xy[1] - s["xy"][1]) <= gate]
+            if near:
+                near[0]["n"] += 1
+            else:
+                self.false_spots.append({"t": self.time, "robot": rid, "xy": xy, "kind": kind, "n": 1, "t_clear": None})
         return xy
+
+    def _clear_spots(self) -> None:
+        """Clear the spots the looks since have missed: the mass near one down to ``_CLEARED`` of
+        what it was once its sighting was weighed (on the step it was made)."""
+        mass = self.truth_belief.mass
+        for i, spot in enumerate(self.false_spots):
+            if i == len(self._spot_mass):
+                self._spot_mass.append([self.scenario.grid.disk_window(*spot["xy"], self.truth_belief.gate_m), None])
+            if spot["t_clear"] is not None:
+                continue
+            (r0, c0, mask), m0 = self._spot_mass[i]
+            h, w = mask.shape
+            m = float(mass[:, r0:r0 + h, c0:c0 + w].sum(0)[mask].sum())
+            if m0 is None:
+                self._spot_mass[i][1] = m
+            elif m <= _CLEARED * m0:
+                spot["t_clear"] = self.time
 
     def _false_sightings(self, r: _SimRobot, row0: int, col0: int, new: np.ndarray) -> list[tuple[float, float]]:
         """What robot ``r``'s look mistakes for the target this step: clutter in the cells that entered
@@ -875,5 +909,6 @@ class Simulator:
             belief_snapshots=self._snapshots,
             target_xy=tuple(map(float, self._target_center)) if self.config.target else None,
             sightings=list(self.sightings),
+            false_spots=[dict(s) for s in self.false_spots],
             lead_gate_m=self.truth_belief.gate_m,
         )

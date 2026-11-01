@@ -450,6 +450,9 @@ def test_the_near_scout_verifies_a_sighting_in_a_cut_off_pocket(on_map, sighted_
     off = [e.time for e in res.events if e.type == EventType.UNDOCKED and e.robot_id == "uav0"]
     assert t[EventType.TARGET_SIGHTED, "uav1"] < off[-1] < res.time_s <= off[-1] + 60.0  # sighted, sent, verified
     assert ugv.verify_flown and ugv.verify_call["node"] == 13  # from the reachable node nearest it
+    (lead,) = res.leads
+    ((uav, t_off),) = lead["flights"]
+    assert lead["by"] == "ugv0" and uav == "uav0" and off[-1] <= t_off <= off[-1] + 1.0  # (heard the step after)
     assert res.trajectories["ugv0"][:, 0].max() <= 675.0 + 1e-6  # never drove to the blockage
     if not on_map:  # sighted before the UGV ran into the blockage: the detour (cut off) called it
         assert t[EventType.TARGET_SIGHTED, "uav1"] == 0.0 and ugv.roads.blocked == {CUT}

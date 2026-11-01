@@ -28,6 +28,7 @@ NODE_FACE, NODE_EDGE = "white", "#333333"
 UNMAPPED_COLOR, BLOCKED_COLOR = "#1565c0", "#d62728"  # the true roads where they differ from the robots' map
 UNMAPPED_STYLE = (0, (2.5, 1.5))
 TARGET_COLOR, SIGHTED_COLOR = "gold", "#00e5ff"  # the target star, before and after a robot sees it
+SPOT_COLOR, CLEARED_COLOR = "#ffe100", "#a6a6a6"  # a false sighting's diamond, before and after it is ruled out
 UGV_COLORS = ["#c0392b", "#8e44ad", "#d35400", "#2c3e50", "#16a085"]
 UAV_COLORS = ["#2980b9", "#27ae60", "#f39c12", "#e84393", "#00b8d4"]
 
@@ -240,8 +241,11 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
     Side panel: robot legend with live energy bars and modes, plus a target/terrain key.
     The colour bar explains the belief heatmap. The target star turns from gold to cyan once a
     robot has seen it, and a label next to it names the last robot to see it (bordered in that
-    robot's colour): the first UAV sighting, then the UGV's find. ``step_s`` (mission time per
-    frame) defaults to about 150 frames per mission, clipped to 10-60 s.
+    robot's colour): the first UAV sighting, then the UGV's find. A false sighting
+    (``result.false_spots``) appears as a yellow diamond where it was sighted, greyed once ruled
+    out. A dashed line in the robot's colour joins the robot pursuing a sighting
+    (``result.leads``) to it, and a UAV flying to verify it, until it is closest to it. ``step_s``
+    (mission time per frame) defaults to about 150 frames per mission, clipped to 10-60 s.
     """
     from matplotlib.patches import Rectangle
 
@@ -277,6 +281,24 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
                            ha="left" if right else "right", va="bottom" if up else "top", fontsize=9, zorder=8,
                            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=SIGHTED_COLOR, lw=1.5),
                            visible=False)
+
+    # False sightings, and the lines to the sighting pursued.
+    spots = result.false_spots
+    spot_xy = np.array([sp["xy"] for sp in spots], float).reshape(-1, 2)
+    spot_t = np.array([sp["t"] for sp in spots], float)
+    spot_clear = np.array([np.inf if sp["t_clear"] is None else sp["t_clear"] for sp in spots], float)
+    spot_on = ax.plot([], [], "D", color=SPOT_COLOR, mec="k", mew=0.8, ms=7, zorder=5.8)[0]
+    spot_off = ax.plot([], [], "D", color=CLEARED_COLOR, mec="#555555", mew=0.8, ms=7, zorder=5.7)[0]
+    pursue = []  # (robot, sighting, from, to): a line from the robot to the sighting over [from, to)
+    for ld in result.leads:
+        t1 = np.inf if ld["t1"] is None else ld["t1"]
+        if ld.get("by") in result.trajectories:
+            pursue.append((ld["by"], ld["xy"], ld["t0"], t1))
+        for uav, t_off in ld.get("flights", ()):
+            if uav in result.trajectories and t_off is not None:
+                pursue.append((uav, ld["xy"], t_off, min(t1, _closest_time(result, uav, ld["xy"], t_off))))
+    lines = LineCollection([], linestyles=(0, (4, 3)), linewidths=1.6, zorder=5.9)
+    ax.add_collection(lines)
 
     markers = {}
     for rid, spec in robots:
@@ -318,6 +340,15 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
     y -= 0.05
     side.plot(0.05, y, "*", color=SIGHTED_COLOR, mec="k", ms=14, clip_on=False)
     side.text(bar_x, y, "target, sighted", fontsize=9, va="center")
+    if scenario.false_alarms is not None or spots:
+        for color, edge, label in ((SPOT_COLOR, "k", "false sighting"), (CLEARED_COLOR, "#555555", "false sighting, ruled out")):
+            y -= 0.05
+            side.plot(0.05, y, "D", color=color, mec=edge, mew=0.8, ms=8, clip_on=False)
+            side.text(bar_x, y, label, fontsize=9, va="center")
+    if pursue:
+        y -= 0.05
+        side.plot([0.01, 0.09], [y, y], color="#555555", lw=1.6, ls=(0, (4, 3)))
+        side.text(bar_x, y, "pursuing a sighting", fontsize=9, va="center")
     y -= 0.05
     side.plot([0.01, 0.09], [y, y], color=ROAD_COLOR, lw=1.2)
     side.text(bar_x, y, "road (UGV graph edge)", fontsize=9, va="center")
@@ -359,6 +390,12 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
             pct.set_text(f"{frac:.0%}")
             mode_txt.set_text(MissionResult.MODE_ORDER[result.modes[rid][i]].value)
         title.set_text(f"t = {_clock(tk)}")
+        shown, cleared = spot_t <= tk, spot_clear <= tk
+        spot_on.set_data(*spot_xy[shown & ~cleared].T)
+        spot_off.set_data(*spot_xy[shown & cleared].T)
+        active = [(rid, xy) for rid, xy, t0, t1 in pursue if t0 <= tk < t1]
+        lines.set_segments([[result.trajectories[rid][i], xy] for rid, xy in active])
+        lines.set_color([_robot_color(rid, scenario.robots[rid].robot_type) for rid, _ in active])
         last = [e for e in seen_by if e.time <= tk]
         star.set_color(SIGHTED_COLOR if last else TARGET_COLOR)
         if seen is not None:
@@ -373,7 +410,7 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
         fig.canvas.draw()
         return np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
 
-    key_colors = [TARGET_COLOR, SIGHTED_COLOR, "black", "white", "#e6e6e6", "#888888", "#555555", ROAD_COLOR,
+    key_colors = [TARGET_COLOR, SIGHTED_COLOR, SPOT_COLOR, CLEARED_COLOR, "black", "white", "#e6e6e6", "#888888", "#555555", ROAD_COLOR,
                   NODE_FACE, NODE_EDGE,
                   *TERRAIN_COLORS.values(), *(_energy_color(f) for f in (1.0, 0.3, 0.0)),
                   *(_robot_color(rid, spec.robot_type) for rid, spec in robots)]
@@ -381,6 +418,20 @@ def animate_result(scenario: Scenario, result: MissionResult, path: str, step_s:
     palette = _gif_palette([render(k) for k in sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})], key_colors)
     _save_gif((render(k) for k in range(n)), palette, path, fps)
     plt.close(fig)
+
+
+def _closest_time(result: MissionResult, rid: str, xy, t0: float) -> float:
+    """When UAV ``rid``, taking off at ``t0``, is closest to ``xy`` before it lands again."""
+    t, modes = result.traj_t, result.modes[rid]
+    i0 = int(np.searchsorted(t, t0))
+    up = np.flatnonzero(modes[i0:] == MissionResult.MODE_ORDER.index(RobotMode.ACTIVE))
+    if not len(up):
+        return t0
+    i0 += int(up[0])
+    down = np.flatnonzero(modes[i0:] != MissionResult.MODE_ORDER.index(RobotMode.ACTIVE))  # landing, or out of energy
+    i1 = i0 + (int(down[0]) if len(down) else len(t) - i0)
+    d = np.hypot(*(result.trajectories[rid][i0:i1] - np.asarray(xy)).T)
+    return float(t[i0 + int(np.argmin(d))])
 
 
 def _clock(t: float) -> str:

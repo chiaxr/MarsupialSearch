@@ -217,7 +217,7 @@ route is re-planned on the current belief every 60 s.
   dropped one leaves the route to the next re-plan. On the line map with a decoy under a UAV at
   the start (`tests/test_false_alarms.py`), the UGV takes it up at once and drops it 13 to 20 s
   later, once it has driven within sensor range of it and seen nothing; the UAVs' later sightings
-  of it are repeats and do not take it up again.
+  of it are repeats of a decoy, which raise it too little to take it up again.
   The UGV detours at once, from the node it is at or driving to, if no UAV still
   to land would wait past its hover slack (60 s). Otherwise it goes straight after the pin, and
   checks the detour again at every node it gets to (and once a stop there is done) while a stop

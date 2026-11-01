@@ -56,11 +56,13 @@ class Lead:
     (``BeliefMap.detection_xy``) is pursued for good. Otherwise the uncertain one most likely to be
     the target (``BeliefMap.hypotheses``), once the chance it is near is ``lead_pursue_p``, until
     the looks that miss it bring that below ``lead_drop_p``. ``log`` keeps each lead: when it
-    started and ended (``"t0"``, ``"t1"``: None while pursued), where, whether it was certain,
-    and the flights to verify it (``"verify"``, counted by the controller)."""
+    started and ended (``"t0"``, ``"t1"``: None while pursued), where, whether it was certain, the
+    robot pursuing it (``"by"``), and the flights to verify it (``"verify"``; ``"flights"``: the UAV
+    and its take-off time each, told by the controller)."""
 
-    def __init__(self, cfg: SearchConfig):
+    def __init__(self, cfg: SearchConfig, by: Optional[str] = None):
         self.cfg = cfg
+        self.by = by
         self.xy: Optional[tuple[float, float]] = None
         self.hard = False
         self.log: list[dict] = []
@@ -88,12 +90,14 @@ class Lead:
             self.log[-1]["t1"] = now
         self.xy, self.hard = xy, hard
         if xy is not None:
-            self.log.append({"t0": now, "t1": None, "xy": xy, "hard": hard, "verify": 0})
+            self.log.append({"t0": now, "t1": None, "xy": xy, "hard": hard, "by": self.by, "verify": 0,
+                             "flights": []})
 
-    def verified(self) -> None:
-        """A flight to verify the lead took off."""
+    def verified(self, uav: Optional[str] = None, now: Optional[float] = None) -> None:
+        """A flight (by ``uav``) to verify the lead took off (at ``now``)."""
         if self.log and self.log[-1]["t1"] is None:
             self.log[-1]["verify"] += 1
+            self.log[-1]["flights"].append((uav, now))
 
 
 def pursuit_path(road: TraversabilityGraph, sighting_xy, src: int, path_fn: Optional[PathFn] = None) -> list[int]:

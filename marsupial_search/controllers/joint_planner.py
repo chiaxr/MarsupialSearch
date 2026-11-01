@@ -202,7 +202,7 @@ class JointPlannerController(MissionController):
         self.waiting: set[str] = set()
         self.last_plan = -np.inf
         self.replan_now = True
-        self.lead = Lead(self.cfg)  # the sighting pursued
+        self.lead = Lead(self.cfg, self.ugv)  # the sighting pursued
         self.pursuit_goal: Optional[int] = None
         self.pursuit_done = False
         self.held: dict[str, float] = {}  # UAV -> when its dock manoeuvre ends

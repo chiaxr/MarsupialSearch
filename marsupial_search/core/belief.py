@@ -15,7 +15,8 @@ GATE_SIGMAS = 3.0  # a sighting within this many position errors (plus a cell) o
 
 @dataclass(frozen=True)
 class SightingEvent:
-    """An update with uncertain sightings, kept so the belief can weigh them again (and pass them on)."""
+    """An update with uncertain sightings, or a look near one that sighted nothing there (a *miss*),
+    kept so the belief can weigh them again (and pass them on)."""
 
     robot_id: str
     time: float
@@ -44,11 +45,24 @@ class BeliefMap:
 
     with ``g`` the position error's Gaussian density and ``λ`` the false sightings per m² per look.
     With no sightings this is the plain look. A pass that sights nothing near a sighting later
-    lowers it again. A sighting near an earlier one (within ``gate_m``) is a *repeat*: it says
-    nothing new (a thing mistaken for the target once is mistaken again), so the cells within
-    ``gate_m`` of the one it repeats get no look at all: a pass that sights it again neither
-    raises nor lowers it, and only a pass that misses it (or a look that cannot sight wrongly,
-    from the ground) clears it.
+    lowers it again. A sighting near an earlier one ``a`` (within ``gate_m``: its *anchor*) is a
+    *repeat*. Clutter does not come back, but a decoy does: if the anchor was one, it is sighted
+    again with the chance ``decoy_p · p(a)`` (``p(a)`` the look's chance of sighting the target
+    there: the most it gives a cell near ``a``), at ``z`` off ``a`` by twice the position error's
+    variance (``g₂``). So a repeat counts as a sighting with false sightings at
+    ``λ(z) + π · decoy_p · p(a) · g₂(z - a)``, where ``π`` is the chance the anchor was a decoy
+    were it not the target: the decoys' share of ``λ`` there (:attr:`SightingModel.decoys`) at
+    first, higher after each repeat and lower after each miss. A repeat thus raises the belief
+    where clutter is the likely false sighting, and little where decoys are (by about
+    ``1 / decoy_p``).
+
+    A look from such a robot that sights nothing near an anchor (a *miss*) lowers it by ``1 - p``
+    as any look, but a decoy there would have gone unseen too, with the chance ``1 - x``,
+    ``x = π · decoy_p · p̄(a)`` (``p̄(a)``: the look's chance of sighting it, averaged over where
+    it may be round ``a``; a pass comes in slivers, the cells newly in view). So the anchor's own
+    ratio is divided by ``1 - x``: a miss lowers it less where decoys are likely, and makes them
+    less likely (``π`` falls), so later repeats count more. A look that cannot sight wrongly (from
+    the ground) lowers it by ``1 - p`` alone.
 
     The belief is kept in two parts, so two robots' beliefs can be fused: ``looked`` (every look as
     if it sighted nothing, which only ever goes down: fused by element-wise minimum) and the
@@ -70,13 +84,18 @@ class BeliefMap:
         self.evidence: Optional[np.ndarray] = None  # None: all ones
         self.events: dict[tuple[float, str], SightingEvent] = {}
         self.anchors: list[tuple[float, float]] = []  # the uncertain sightings that are not repeats, in time order
+        self.decoy_chance: list[float] = []  # per anchor: π, the chance it was a decoy were it not the target
+        self._missed: dict[tuple, float] = {}  # (event key, anchor): its _miss_chance, which never changes
+        lf = self.initial_mass.sum(0, keepdims=True)
+        self._layer_share = np.divide(self.initial_mass, lf, out=np.zeros_like(self.initial_mass), where=lf > 0)
 
     def apply(self, update: LocalBeliefUpdate) -> None:
         if update.detected:
             self.detection_xy = update.detection_xy
             return
         ev = None
-        if update.sightings and update.robot_id in self.models and (update.time, update.robot_id) not in self.events:
+        if update.robot_id in self.models and (update.time, update.robot_id) not in self.events \
+                and (update.sightings or self._misses(update)):
             ev = SightingEvent(update.robot_id, update.time, update.row0, update.col0, update.p_detect,
                                tuple(tuple(map(float, z)) for z in update.sightings))
         _, h, w = update.p_detect.shape
@@ -90,39 +109,113 @@ class BeliefMap:
             self._weigh()
 
     def _weigh(self) -> None:
-        """``evidence`` from every sighting event, in time order (a repeat depends on what came before)."""
+        """``evidence`` from every sighting event, in time order (a repeat or a miss depends on what
+        came before; a miss also on the anchor's ratio, made before it, so the ratios come last)."""
         if self.evidence is None:
             self.evidence = np.ones_like(self.looked)
             self.mass = self.looked * self.evidence  # its own array from now on
         else:
             self.evidence.fill(1.0)
         res, gate = self.grid.resolution, self.gate_m
-        self.anchors = []
+        self.anchors, self.decoy_chance = [], []
+        missed: list[float] = []  # per anchor: ∏ 1 / (1 - x) over its misses
+        terms = []  # per event: (event, s2, [(z, λ, anchor index or -1)])
         for key in sorted(self.events):
             ev = self.events[key]
             model = self.models[ev.robot_id]
             _, h, w = ev.p_detect.shape
             if not (h and w):
                 continue
-            x0, y0 = self.grid.cell_center(ev.row0, ev.col0)
-            X, Y = np.meshgrid(x0 + res * np.arange(w), y0 + res * np.arange(h))
-            s2 = max(model.sigma_m, res / np.sqrt(12.0)) ** 2  # an exact sighting is still anywhere in its cell
-            G, repeat = np.zeros((h, w)), np.zeros((h, w), dtype=bool)
+            s2 = self._s2(model)
+            seen, zs = set(), []
             for z in ev.sightings:
-                near = [a for a in self.anchors if np.hypot(z[0] - a[0], z[1] - a[1]) <= gate]
-                for a in near:  # the cells the sighting it repeats is about
-                    repeat |= (X - a[0]) ** 2 + (Y - a[1]) ** 2 <= gate ** 2
-                if near:
-                    continue
-                d2 = (X - z[0]) ** 2 + (Y - z[1]) ** 2
-                self.anchors.append(z)
+                d = [np.hypot(z[0] - a[0], z[1] - a[1]) for a in self.anchors]
+                i = int(np.argmin(d)) if d else -1
+                if d and d[i] <= gate:
+                    seen.add(i)
+            for i, a in enumerate(self.anchors):  # the anchors this look sighted nothing near
+                if i not in seen:
+                    pi, dp = self.decoy_chance[i], min(model.decoy_p * self._miss_chance(ev, a), 1.0 - 1e-9)
+                    if pi * dp > 0.0:  # a decoy there would have gone unseen with the chance 1 - x
+                        self.decoy_chance[i] = pi * (1.0 - dp) / (1.0 - pi * dp)
+                        missed[i] /= 1.0 - pi * dp
+            for z in ev.sightings:
                 r, c = self.grid.world_to_cell(*z)
                 lam = max(float(model.false_alarms[r, c]), 1e-12)
-                G += np.exp(-d2 / (2.0 * s2)) / (2.0 * np.pi * s2 * lam)
+                d = [np.hypot(z[0] - a[0], z[1] - a[1]) for a in self.anchors]
+                i = int(np.argmin(d)) if d else -1
+                if d and d[i] <= gate:  # a repeat: of a decoy, or the target
+                    a, pi = self.anchors[i], self.decoy_chance[i]
+                    again = model.decoy_p * self._sight_chance(ev, a) * np.exp(-d[i] ** 2 / (4.0 * s2)) / (4.0 * np.pi * s2)
+                    self.decoy_chance[i] = pi * (lam + again) / (lam + pi * again)
+                    zs.append((z, lam + pi * again, -1))
+                else:
+                    self.anchors.append(z)
+                    share = 1.0 if model.decoys is None else float(model.decoys[r, c]) / lam
+                    self.decoy_chance.append(min(max(share, 0.0), 1.0))
+                    missed.append(1.0)
+                    zs.append((z, lam, len(self.anchors) - 1))
+            if zs:
+                terms.append((ev, s2, zs))
+        for ev, s2, zs in terms:
+            _, h, w = ev.p_detect.shape
+            x0, y0 = self.grid.cell_center(ev.row0, ev.col0)
+            X, Y = np.meshgrid(x0 + res * np.arange(w), y0 + res * np.arange(h))
+            G = np.zeros((h, w))
+            for z, lam, i in zs:
+                k = missed[i] if i >= 0 else 1.0
+                G += k * np.exp(-((X - z[0]) ** 2 + (Y - z[1]) ** 2) / (2.0 * s2)) / (2.0 * np.pi * s2 * lam)
             q = 1.0 - np.minimum(ev.p_detect, 1.0 - 1e-9)
-            f = np.where(repeat, 1.0 / q, 1.0 + (1.0 - q) * G / q)  # times the look's 1 - p: the ratio above
+            f = 1.0 + (1.0 - q) * G / q  # times the look's 1 - p: the ratio above
             self.evidence[:, ev.row0:ev.row0 + h, ev.col0:ev.col0 + w] *= f
         np.multiply(self.looked, self.evidence, out=self.mass)
+
+    def _s2(self, model: SightingModel) -> float:
+        """The position error's variance (an exact sighting is still anywhere in its cell)."""
+        return max(model.sigma_m, self.grid.resolution / np.sqrt(12.0)) ** 2
+
+    def _misses(self, update: LocalBeliefUpdate) -> bool:
+        """Whether a look with no sightings could have sighted one near an anchor (so it is kept)."""
+        return any(self._miss_chance(update, a) > 0.0 for a in self.anchors)
+
+    def _miss_chance(self, ev, xy) -> float:
+        """The chance pass ``ev`` (a :class:`SightingEvent`, or the update it comes from) sights a
+        decoy at ``xy``, averaged over where it may be (the position error round ``xy``, within
+        ``gate_m``): a pass that comes in slivers adds up to one pass."""
+        key = (ev.time, ev.robot_id, xy)
+        if key in self._missed:
+            return self._missed[key]
+        _, h, w = ev.p_detect.shape
+        r0, c0, mask = self.grid.disk_window(xy[0], xy[1], self.gate_m)
+        mh, mw = mask.shape
+        if not (h and w and r0 < ev.row0 + h and ev.row0 < r0 + mh and c0 < ev.col0 + w and ev.col0 < c0 + mw):
+            return 0.0  # nowhere near: not kept, nor asked again
+        rr, cc = np.nonzero(mask)
+        rr, cc = rr + r0, cc + c0
+        keep = (rr >= ev.row0) & (rr < ev.row0 + h) & (cc >= ev.col0) & (cc < ev.col0 + w)
+        out = 0.0
+        if keep.any():
+            x, y = self.grid.cell_center(rr, cc)
+            wt = np.exp(-((x - xy[0]) ** 2 + (y - xy[1]) ** 2) / (2.0 * self._s2(self.models[ev.robot_id])))
+            rk, ck = rr[keep], cc[keep]
+            p = (self._layer_share[:, rk, ck] * ev.p_detect[:, rk - ev.row0, ck - ev.col0]).sum(0)
+            out = float((wt[keep] * p).sum() / wt.sum())
+        self._missed[key] = out
+        return out
+
+    def _sight_chance(self, ev: SightingEvent, xy) -> float:
+        """The chance pass ``ev`` sights the target near ``xy``: the most its look gives a cell within
+        ``gate_m`` of it (over its layers, as the target's mass is split). A look covers only the
+        cells that came into view, so not always the one at ``xy`` itself."""
+        _, h, w = ev.p_detect.shape
+        r0, c0, mask = self.grid.disk_window(xy[0], xy[1], self.gate_m)
+        rr, cc = np.nonzero(mask)
+        rr, cc = rr + r0, cc + c0
+        keep = (rr >= ev.row0) & (rr < ev.row0 + h) & (cc >= ev.col0) & (cc < ev.col0 + w)
+        rr, cc = rr[keep], cc[keep]
+        if not len(rr):
+            return 0.0
+        return float((self._layer_share[:, rr, cc] * ev.p_detect[:, rr - ev.row0, cc - ev.col0]).sum(0).max())
 
     # ------------------------------------------------------------------ sightings
     def p_near(self, xy, total: Optional[float] = None) -> float:
