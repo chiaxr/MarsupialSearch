@@ -6,7 +6,8 @@ fleet (``FleetConfig``): one UGV, ``uav0`` docked on it and ``uav1`` hovering ov
 
 * ``large`` – 5 km x 5 km, 3 towns.
 * ``small`` – 1.5 km x 1.5 km, 1 town, a denser road network for its size. The UGV battery
-  is sized to run out mid-mission, so depletion is a realistic outcome.
+  (about 80 min of driving) leaves the UAVs three or four sorties each, so depletion is still
+  a realistic outcome.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ def small(seed: int = 0) -> ScenarioConfig:
         n_prior_modes=3,
         prior_sigma_m=(150.0, 400.0),
         fleet=FleetConfig(
-            # About 40 min of driving.
-            ugv_energy=EnergySpec(capacity=17_000, idle_power=2.0, energy_per_m=1.0),
+            # About 80 min of driving.
+            ugv_energy=EnergySpec(capacity=34_000, idle_power=2.0, energy_per_m=1.0),
         ),
         seed=seed,
     )

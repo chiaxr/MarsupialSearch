@@ -86,7 +86,7 @@ any scenario without exactly one UGV.
 | motion | road graph only, 5 m/s; road nodes at most 55 m apart (the sensor range) | free, 10 m/s, between nodes of an 85 m UAV grid (√2 × the sensor range: the widest square grid whose footprints leave no gaps) or to any point |
 | sensor | 55 m disk; ground and shared layers | 60 m disk; aerial and shared layers (per UAV: `fleet.uav_sensor_ranges`, e.g. `{uav0: 20, uav1: 50}` for a low and a high UAV; the UAV grid then follows the smaller), and street level with probability `fleet.uav_ground_p_detect` per pass (default 0; per UAV: `fleet.uav_ground_p_detects`). A UAV with the `ground` viewpoint (`fleet.uav_viewpoints`, e.g. `{uav0: ground}`) flies at street level with a front-facing camera instead: it sees the ground and shared layers, as the UGV does (§1.3) |
 | energy | 250 000 units; 2.0 /s + 1.0 /m | 2000 units; 1.0 /s (hovering included) + 0.04 /m, so 1.4 /s at full speed |
-| endurance | about 10 h of driving (`small` base: 17 000 units, about 40 min) | about 24 min flying (14 km), 33 min hovering |
+| endurance | about 10 h of driving (`small` base: 34 000 units, about 80 min) | about 24 min flying (14 km), 33 min hovering |
 
 **The dock** (`DockingSpec`) takes one UAV at a time:
 
@@ -263,8 +263,10 @@ false sightings; ignore the scores (`use_scores: false`); or, with `mode: cue`, 
 at all. A cue is only a
 place to check from close up: the controllers pursue each in turn (`BeliefMap.lead_chance`: the
 share of the target's chance round it, prior times the position error's Gaussian, that the looks
-of robots that never sight wrongly have not yet ruled out) and drop it once that share is below
-`lead_drop_p`. A cue needs no rates, at the cost of checking every false sighting.
+of robots that never sight wrongly have not yet ruled out, counting only the layers and cells
+those robots can detect the target in, `SightingModel.checkable`: a roof the ground never sees
+would hold it up for good) and drop it once that share is below `lead_drop_p`. A cue needs no
+rates, at the cost of checking every false sighting.
 
 ### 1.4 Radio channel
 
@@ -302,10 +304,10 @@ the same simulator settings (`SimConfig()`).
 | `scenario.base` | map | sets (besides the size) |
 |---|---|---|
 | `large` (default) | 5 km × 5 km, 3 towns | the `ScenarioConfig` defaults |
-| `small` | 1.5 km × 1.5 km, 1 town | a smaller town; 15 rural road nodes at least 200 m apart (denser for its size than `large`'s 70); finer roadless regions; a 17 000-unit UGV battery; smaller modes for the optional Gaussian-mixture prior |
+| `small` | 1.5 km × 1.5 km, 1 town | a smaller town; 15 rural road nodes at least 200 m apart (denser for its size than `large`'s 70); finer roadless regions; a 34 000-unit UGV battery; smaller modes for the optional Gaussian-mixture prior |
 
 A run ends when the UGV finds the target or is depleted (6 h limit). The `small` UGV battery is
-sized for about 40 min of driving, so a `small` run either finds the target in time or ends with
+sized for about 80 min of driving, so a `small` run either finds the target in time or ends with
 `ugv_depleted`.
 
 ```yaml

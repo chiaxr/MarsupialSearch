@@ -302,8 +302,10 @@ class Simulator:
             raise ValueError(f"confirm_by: no robots {sorted(unknown)} in scenario {scenario.name!r}")
         confirmers = confirmers_of(scenario, self.config)
         self._detection, self._models = robot_sensing(scenario, confirmers)  # the true models: the truth's belief
+        close = [p for rid, p in self._detection.items() if rid not in self._models]  # the robots that check
+        checkable = np.max(close, axis=0) > 0 if close else None
         assumed = {rid: sighting_model(self._detection[rid], scenario.layer_fractions, scenario.false_alarms,
-                                       self.config.sighting_belief) for rid in self._models}
+                                       self.config.sighting_belief, checkable) for rid in self._models}
         self.setup: MissionSetup = dataclasses.replace(
             scenario.mission_setup(self.config.dt), radio_range_m=ranges, confirmers=confirmers,
             confirm_test=self.config.confirm_test, detection={rid: p.copy() for rid, p in self._detection.items()},

@@ -41,7 +41,7 @@ it (`BeliefMap.lead_chance`): once that chance reaches `lead_pursue_p` (0.5), un
 lets the lead go, `Lead.spend`, and takes it up again only on a new sighting near it). Below
 that, the search gets to it, or not, as the belief says, as it does any belief. With
 `sim.sighting_belief.mode: cue` a sighting raises nothing: each is a lead in turn, until the looks
-of robots that never sight wrongly have ruled out the target near it. A sighting
+of robots that never sight wrongly have ruled out the target near it, where they can detect it. A sighting
 by a robot that never sights wrongly is a lead for good.
 
 **What constrains them.** The dock shapes every plan. A UAV that is not docked has nowhere to wait
@@ -466,7 +466,8 @@ plans better, by optimising one plan for the whole team over a horizon of severa
   across all three robots (shared-layer belief counts once, for whoever gets there first). Over
   the horizon this is the reduction in expected time to find. A UAV only sights the target and
   the UGV must confirm it, so a UAV look counts at `t + λ·c`, with `c` the UGV's drive from where
-  it is then (`sighting_delay_weight` λ, default 1).
+  it is then (`sighting_delay_weight` λ, default 1); a look by a UAV whose own sighting ends the
+  mission (`sim.confirm_by`) counts at `t`.
 - **Search.** Large-neighbourhood search with simulated annealing (`iterations`, default 1000 per
   re-plan, so runs are reproducible), from the best of the previous plan and greedy starting
   plans (the dock handed over in turn; with a UAV docked, also launching it at once, with either
@@ -478,6 +479,16 @@ plans better, by optimising one plan for the whole team over a horizon of severa
   change, including a UAV's tour and landing in flight. After a sighting the route starts with the
   pursuit path; dock events go after it unless a UAV could not wait. If no plan is feasible it
   flies the one that leaves the emptiest UAV the most energy.
+- **Verifying a lead** (`verify`). A lead the UGV cannot confirm (no road it can reach comes within
+  its sensor range, as in a pocket a blockage cut off, or the UGV is not a confirmer) is flown over
+  by a UAV whose sighting ends the mission, if its chance of detecting the target there is above
+  0. Every re-plan also starts from the plans with the sighting put in that UAV's first sortie (at
+  its start, and where it adds least), and the UAV flies to the sighting itself. With cues the
+  belief holds no sighting, so its pass there counts the lead's chance when it gets there;
+  otherwise the belief round it already does. Each time it comes within sensor range is a pass,
+  up to `pursue_passes` (3) with `sim.confirm_test: sighting` (else one). The lead is let go
+  once the UGV's pursuit and the passes are all made. Before this, the oracle only drove the UGV
+  to the road nearest such a lead, and a UAV got there only if the belief drew its tour there.
 
 It replaced `greedy_belief` (perfect information, one leg of look-ahead); that baseline's last
 numbers are in [Results](README.md#34-results).

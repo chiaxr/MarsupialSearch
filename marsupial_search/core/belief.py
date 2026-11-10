@@ -120,7 +120,9 @@ class BeliefMap:
     check from close up. The belief keeps ``checked``, the looks of the robots that never sight
     wrongly alone (fused by minimum, as ``looked``), and the chance a sighting's spot is still
     unchecked (:meth:`lead_chance`) is what share of the target's chance round it (prior mass times
-    the position error's Gaussian) those looks have not ruled out.
+    the position error's Gaussian) those looks have not ruled out, counting only where they can
+    detect it (``SightingModel.checkable``: a layer no close look can see, such as a roof, is never
+    ruled out, so it would hold the chance up for good). With nowhere to check, it is 0.
 
     The belief is kept in two parts, so two robots' beliefs can be fused: ``looked`` (every look as
     if it sighted nothing, which only ever goes down: fused by element-wise minimum) and the
@@ -148,6 +150,8 @@ class BeliefMap:
         self._missed: dict[tuple, float] = {}  # (event key, anchor): its _miss_chance, which never changes
         self.cue = any(m.cue for m in self.models.values())
         self.checked = self.initial_mass.copy() if self.cue else None  # cue: the looks that never sight wrongly
+        masks = [m.checkable for m in self.models.values() if m.cue and m.checkable is not None]
+        self.checkable = np.logical_or.reduce(masks) if masks else None  # cue: where they can detect it
         lf = self.initial_mass.sum(0, keepdims=True)
         self._layer_share = np.divide(self.initial_mass, lf, out=np.zeros_like(self.initial_mass), where=lf > 0)
 
@@ -313,7 +317,8 @@ class BeliefMap:
 
     def lead_chance(self, xy) -> float:
         """What a controller pursues a sighting by: ``p_near``; with cues, the chance the target
-        round ``xy`` (where the position error puts it) has not been ruled out from close up."""
+        round ``xy`` (where the position error puts it) has not been ruled out from close up, where
+        it can be."""
         if not self.cue:
             return self.p_near(xy)
         r0, c0, mask = self.grid.disk_window(xy[0], xy[1], self.gate_m)
@@ -326,8 +331,9 @@ class BeliefMap:
         s2 = max(self._s2(m) for m in self.models.values())
         g = np.exp(-((X - xy[0]) ** 2 + (Y - xy[1]) ** 2) / (2.0 * s2)) * mask
         win = (slice(None), slice(r0, r0 + h), slice(c0, c0 + w))
-        init = float((self.initial_mass[win].sum(0) * g).sum())
-        return float((self.checked[win].sum(0) * g).sum()) / init if init > 0 else 0.0
+        c = 1.0 if self.checkable is None else self.checkable[win]
+        init = float(((self.initial_mass[win] * c).sum(0) * g).sum())
+        return float(((self.checked[win] * c).sum(0) * g).sum()) / init if init > 0 else 0.0
 
     def hypotheses(self) -> list[tuple[tuple[float, float], float]]:
         """Each uncertain sighting that is not a repeat, with its :meth:`lead_chance`: most likely

@@ -26,7 +26,8 @@ Objective
     there first. Over the horizon ``H`` this is the reduction in expected time to find.
     A UAV can only sight the target and the UGV must drive there to confirm, so a UAV look
     counts at ``t + λ · c``, with ``c`` the UGV's drive from where it is at ``t``
-    (``λ = sighting_delay_weight``). Looks after the UGV would run flat count nothing.
+    (``λ = sighting_delay_weight``); a look by a UAV whose sighting ends the mission
+    (``MissionSetup.confirmers``) counts at ``t``. Looks after the UGV would run flat count nothing.
 
 Search
     Large-neighbourhood search with simulated annealing, from the best of the previous plan
@@ -41,9 +42,21 @@ Re-planning
     finds a blocked node on the route. Dock manoeuvres in progress are kept; everything else
     may change, including the tour and landing of a UAV in flight. The sighting pursued is the
     *lead* (``common.Lead``: a certain one, or an uncertain one the belief makes likely enough,
-    until it no longer does). After a new lead the route starts with the pursuit path, and dock events go after it unless a UAV could not otherwise
+    until it no longer does, or the UGV has driven past it once: it is then let go, and taken up
+    again only on a new sighting near it). After a new lead the route starts with the pursuit path, and dock events go after it unless a UAV could not otherwise
     land. It plans on the road map as the robots have found it so far (roads missing from it
     are used from the next re-plan), never on the true one.
+
+Verifying a lead (``verify``)
+    A lead the UGV cannot confirm (no road it can reach comes within its sensor range, or it is
+    not a confirmer) is flown over by a UAV whose sighting ends the mission, if its chance of
+    detecting the target there is above 0. Every re-plan also starts from the plans with the
+    sighting (the UAV-grid node nearest it) put in that UAV's first sortie: at its start, and
+    where it adds least. The UAV flies to the sighting itself. With cues the belief holds no
+    sighting, so its pass there counts the lead's chance (``BeliefMap.lead_chance``) at the time
+    it gets there; otherwise the belief round it already counts. Each time it comes within sensor
+    range is a pass; with ``MissionSetup.confirm_test`` ``"sighting"``, up to ``pursue_passes``
+    (else one). The lead is let go once the UGV's pursuit and the passes are all made.
 """
 
 from __future__ import annotations
@@ -85,6 +98,8 @@ class JointPlannerConfig(DockBookingConfig):
     anneal_t0: float = 0.002  # initial annealing temperature, as a fraction of the starting plan's value
     sighting_delay_weight: float = 1.0  # λ: a UAV look counts at t + λ · (the UGV's drive to confirm)
     insert_radius_m: float = 400.0  # tour insertions pick nodes this close to the tour
+    verify: bool = True  # a lead the UGV cannot confirm: a UAV whose sighting ends the mission flies over it ...
+    pursue_passes: int = 3  # ... confirm_test "sighting": up to this many passes (else one)
     seed: int = 0
 
 
@@ -137,6 +152,8 @@ class _Context:
     m0: np.ndarray  # searchable belief, (layers, cells)
     candidates: np.ndarray  # road nodes not yet visited
     air_value: dict[str, np.ndarray] = field(default_factory=dict)  # per UAV: belief each UAV-grid node would sweep (for insertions)
+    verify_node: Optional[int] = None  # a lead to verify: the UAV-grid node nearest it ...
+    verify_w: float = 0.0  # ... and what a verifier's pass there is worth (with cues: the lead's chance)
 
 
 @dataclass
@@ -206,6 +223,14 @@ class JointPlannerController(MissionController):
         self.pursuit_goal: Optional[int] = None
         self.pursuit_done = False
         self.held: dict[str, float] = {}  # UAV -> when its dock manoeuvre ends
+        self.verifiers = [u for u in self.uavs if u in setup.confirmers]  # UAVs whose sighting ends the mission
+        self.ugv_confirms = not setup.confirmers or self.ugv in setup.confirmers
+        self.detect: dict[str, np.ndarray] = {}  # per robot: detection chance per layer and cell (flat)
+        self.verify_xy: Optional[tuple[float, float]] = None  # the lead, while a verifier is to fly over it ...
+        self.verify_node: Optional[int] = None  # ... the UAV-grid node nearest it
+        self.verify_passes = 0  # verifier passes over the lead so far
+        self.verify_over: set[str] = set()  # verifiers within sensor range of the lead now
+        self.verify_flying: set[str] = set()  # verifiers flying to the lead (logged as a flight to verify it)
         self._done = False
         self.replans = 0
 
@@ -230,12 +255,15 @@ class JointPlannerController(MissionController):
         if self.sent is not None:
             self.cur = max(self.cur, self.sent[0] - len(g.path_remaining))
         self._handle_events(obs)
-        spent = self.pursuit_done and self.lead.xy is not None and not self.lead.hard \
-            and dist(g.position, self.lead.xy) > self.ugv_spec.sensor.range_m  # its pass made: no try left
+        self._count_passes(S, now)
+        spent = self.pursuit_done and self.lead.xy is not None and not self.lead.hard and self.verify_xy is None \
+            and dist(g.position, self.lead.xy) > self.ugv_spec.sensor.range_m  # its pass(es) made: no try left
         if spent:
             self.lead.spend(now)
         if self.lead.update(self.belief, now) or spent:  # a new lead (or none): pursue it afresh
             self.pursuit_done, self.replan_now = False, True
+            self.verify_xy, self.verify_node, self.verify_passes = None, None, 0
+            self.verify_over, self.verify_flying = set(), set()
         if self.pursuit_goal is not None and not self.pursuit_done and g.node == self.pursuit_goal:
             self.pursuit_done, self.replan_now = True, True  # drove past it without confirming
         if g.mode == RobotMode.DEPLETED:
@@ -249,6 +277,54 @@ class JointPlannerController(MissionController):
         for u in self.uavs:
             self._fly(u, S, cmds)
         return cmds
+
+    def _count_passes(self, S: dict[str, RobotState], now: float) -> None:
+        """A verifier heading for the lead flies to verify it (``Lead.verified``); coming within sensor
+        range of it makes a pass (re-plan: one fewer left)."""
+        xy = self.lead.xy
+        for u in self.verifiers:
+            s = S[u]
+            wp = self.wp.get(u)
+            heading = self.verify_xy is not None and s.mode == RobotMode.ACTIVE and bool(wp) and wp[0] == self.verify_node
+            if heading and u not in self.verify_flying:
+                self.verify_flying.add(u)
+                self.lead.verified(u, now)
+            near = xy is not None and s.mode == RobotMode.ACTIVE \
+                and dist(s.position, xy) <= self.setup.robots[u].sensor.range_m
+            if near and u not in self.verify_over:
+                self.verify_passes += 1
+                self.verify_flying.discard(u)
+                self.replan_now = True
+            (self.verify_over.add if near else self.verify_over.discard)(u)
+
+    def _to_verify(self, S: dict[str, RobotState], src: int) -> bool:
+        """Is a verifier to fly over the lead: one with a chance of detecting the target there, and
+        passes left, while the UGV cannot confirm it (from road node ``src``)?"""
+        xy = self.lead.xy
+        if not self.cfg.verify or xy is None:
+            return False
+        if self.verify_passes >= (self.cfg.pursue_passes if self.setup.confirm_test == "sighting" else 1):
+            return False
+        if not any(S[u].mode != RobotMode.DEPLETED and self._chance(u, xy) > 0 for u in self.verifiers):
+            return False
+        if not self.ugv_confirms:
+            return True
+        path = pursuit_path(self.road, xy, src)
+        a, b = self.road.positions[path[-2:][0]], self.road.positions[path[-1]]
+        p, ab = np.asarray(xy, dtype=float), b - a
+        t = np.clip((p - a) @ ab / max(ab @ ab, 1e-12), 0.0, 1.0)
+        return dist(a + t * ab, p) > self.ugv_spec.sensor.range_m  # no road it can reach comes within range
+
+    def _chance(self, rid: str, xy) -> float:
+        """The chance a look by robot ``rid`` detects a target sighted at ``xy``: its detection there,
+        over the layers weighed by the prior and by the best a UAV detects each."""
+        for r in [rid] + self.uavs:
+            if r not in self.detect:
+                self.detect[r] = SortiePlanner.detection(self.setup, self.setup.robots[r])
+        r, c = self.setup.grid.world_to_cell(*xy)
+        k = r * self.setup.grid.cols + c
+        w = self.belief.initial_mass[:, r, c] * np.max([self.detect[u][:, k] for u in self.uavs], axis=0)
+        return float(w @ self.detect[rid][:, k] / w.sum()) if w.sum() > 0 else 0.0
 
     def _map_changed(self) -> None:
         """Plan on the road map as now known: at once if the route runs into a blocked node, else
@@ -316,10 +392,10 @@ class JointPlannerController(MissionController):
                 cmds[u] = [Undock()]
             return
         wp = self.wp.setdefault(u, [])
-        while wp and dist(s.position, self.air_graph.positions[wp[0]]) < 0.5:
+        while wp and dist(s.position, self._waypoint(u, wp[0])) < 0.5:
             wp.pop(0)
         if wp:
-            target = tuple(self.air_graph.positions[wp[0]])
+            target = self._waypoint(u, wp[0])
         else:
             land = next((v.land for v in self.plan.visits if v.uav == u and v.land is not None), None)
             if land is not None:
@@ -342,6 +418,12 @@ class JointPlannerController(MissionController):
         if s.goal_point is None or dist(s.goal_point, target) > 0.5:
             cmds[u] = [GoToPoint(target)]
 
+    def _waypoint(self, u: str, n: int) -> tuple[float, float]:
+        """Where UAV ``u`` flies for tour node ``n``: the sighting itself for a verifier's node nearest it."""
+        if n == self.verify_node and self.verify_xy is not None and u in self.verifiers:
+            return tuple(self.verify_xy)
+        return tuple(self.air_graph.positions[n])
+
     # ----------------------------------------------------------------- re-plan
     def _replan(self, S: dict[str, RobotState], now: float) -> None:
         self.replan_now, self.last_plan = False, now
@@ -356,7 +438,34 @@ class JointPlannerController(MissionController):
         if warm is not None:
             self._ensure_length(ctx, warm)
             starts.append(warm)
+        if ctx.verify_node is not None:
+            starts += [p for plan in starts for p in self._with_verify(ctx, plan)]
         self._install(self._search(ctx, starts))
+
+    def _with_verify(self, ctx: _Context, plan: JointPlan) -> list[JointPlan]:
+        """``plan`` with the lead's node put in the first verifier sortie (and taken out of any later
+        one): at its start, and where it adds least (none if that sortie already has it)."""
+        n = ctx.verify_node
+        ev = self._evaluate(ctx, plan, value=False)
+        mine = [s for s in ev.sorties if s.uav in self.verifiers]
+        if not mine:
+            return []
+        s = min(mine, key=lambda s: s.t_start)
+        if n in s.tour:
+            return []
+        pts = np.vstack([np.asarray(s.start, float)[None], self.air_graph.positions[s.tour].reshape(-1, 2),
+                         self.road.positions[plan.route[s.land_idx]][None]])
+        q = self.air_graph.positions[n]
+        cost = np.hypot(*(pts[:-1] - q).T) + np.hypot(*(pts[1:] - q).T) - np.hypot(*np.diff(pts, axis=0).T)
+        out = []
+        for i in sorted({0, int(np.argmin(cost))}):
+            p = plan.copy()
+            for o in mine:
+                if n in o.tour:
+                    p.tour(o.key).remove(n)
+            p.tour(s.key).insert(i, n)
+            out.append(p)
+        return out
 
     def _context(self, S: dict[str, RobotState], now: float) -> _Context:
         g, v = S[self.ugv], self.ugv_spec.speed
@@ -386,13 +495,17 @@ class JointPlannerController(MissionController):
         if not self.setup.docking.swap_while_moving:
             hold = max([hold] + [t for t, _ in docked.values()])
         t0, min_lock = max(t0, hold), lock
+        self.verify_xy = self.lead.xy if self._to_verify(S, prefix[-1]) else None
+        self.verify_node = None if self.verify_xy is None else self.air_graph.nearest_node(self.verify_xy)
         self.pursuit_goal = None
         if self.lead.xy is not None and self.cfg.pursue_sightings and not self.pursuit_done:
             path = pursuit_path(self.road, self.lead.xy, prefix[-1])
             prefix = prefix + [int(n) for n in path[1:]]
             lock, self.pursuit_goal = len(prefix) - 1, prefix[-1]
+        w = self.belief.lead_chance(self.verify_xy) if self.verify_xy is not None and self.belief.cue else 0.0
         return _Context(now, now + self.cfg.horizon_s, prefix, t0, lock, min_lock, g.energy, docked, air,
-                        self.P.searchable_mass(self.belief), ~self.road_visited)
+                        self.P.searchable_mass(self.belief), ~self.road_visited, verify_node=self.verify_node,
+                        verify_w=w * max(self._chance(u, self.verify_xy) for u in self.verifiers) if w > 0 else 0.0)
 
     def _edge_end(self, g: RobotState) -> int:
         """The node a UGV stopped between two nodes faces: the neighbour of its last node it is beside."""
@@ -548,11 +661,17 @@ class JointPlannerController(MissionController):
         keep = arrive <= h_end
         looks = [(P.F_road, R[keep], arrive[keep], arrive[keep], P.p_ugv)]
         lam = self.cfg.sighting_delay_weight
+        bonus = 0.0
+        if ctx.verify_w > 0:  # a verifier's first pass over the lead (with cues: the belief holds no sighting)
+            t_v = min((s.node_t[i] for s in sorties if s.uav in self.verifiers
+                       for i, n in enumerate(s.tour) if n == ctx.verify_node), default=np.inf)
+            bonus = ctx.verify_w * max(h_end - t_v, 0.0)
         for s in sorties:
             if not s.tour:
                 continue
             nodes, t = np.asarray(s.tour, dtype=int), s.node_t
-            found = t + lam * self._confirm_delay(R, arrive, nodes, t) if lam > 0 else t
+            delay = lam > 0 and s.uav not in self.verifiers  # a verifier's sighting ends the mission
+            found = t + lam * self._confirm_delay(R, arrive, nodes, t) if delay else t
             keep = found <= h_end
             Pu = self.PU[s.uav]
             looks.append((Pu.F_air, nodes[keep], t[keep], found[keep], Pu.p_air))
@@ -567,7 +686,7 @@ class JointPlannerController(MissionController):
                 w.append(h_end - found[rep])
                 p.append(np.minimum(pd[l, cells], 1 - 1e-12))
         if not keys:
-            return 0.0
+            return bonus
         keys, order_t, w, p = map(np.concatenate, (keys, order_t, w, p))
         o = np.lexsort((order_t, keys))
         keys, w, p = keys[o], w[o], p[o]
@@ -576,7 +695,7 @@ class JointPlannerController(MissionController):
         first = np.r_[True, keys[1:] != keys[:-1]]
         base = excl[first][np.cumsum(first) - 1]
         gain = ctx.m0.reshape(-1)[keys] * np.exp(excl - base) * p
-        return float((gain * w).sum())
+        return float((gain * w).sum()) + bonus
 
     def _confirm_delay(self, R, arrive, nodes, t) -> np.ndarray:
         """The UGV's drive from where it is at time ``t`` to the road node nearest each UAV look."""

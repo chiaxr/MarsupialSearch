@@ -86,11 +86,12 @@ def draw_score(rng: np.random.Generator, mu: float, sd: float, threshold: float)
 
 
 def sighting_model(detection: np.ndarray, layer_fractions: np.ndarray, false_alarms: FalseAlarms,
-                   belief: SightingBelief = SightingBelief()) -> SightingModel:
+                   belief: SightingBelief = SightingBelief(), checkable: Optional[np.ndarray] = None) -> SightingModel:
     """The model a robot that sights wrongly is given: its position error, the score distributions,
     and per cell the false sightings to expect per look (clutter, plus decoys in view as the target
     would be, over its layers as the target's mass is split, times a decoy's chance to clear the
-    threshold), as ``belief`` has it."""
+    threshold), as ``belief`` has it; with cues, where the robots that check from close up can
+    detect the target (``checkable``, from their detection maps)."""
     if belief.mode not in ("weigh", "cue"):
         raise ValueError(f"sighting_belief.mode must be 'weigh' or 'cue', got {belief.mode!r}")
     fa, k = false_alarms, belief.false_alarm_scale
@@ -99,4 +100,5 @@ def sighting_model(detection: np.ndarray, layer_fractions: np.ndarray, false_ala
     in_view = (lf * detection).sum(0) / float(sc.recall(sc.target))
     decoys = k * fa.decoy_density * in_view * sc.decoy_recall()
     return SightingModel(false_alarms=k * fa.clutter + decoys, sigma_m=fa.sigma_m, decoys=decoys, scores=sc,
-                         use_scores=belief.use_scores, cue=belief.mode == "cue")
+                         use_scores=belief.use_scores, cue=belief.mode == "cue",
+                         checkable=checkable if belief.mode == "cue" else None)

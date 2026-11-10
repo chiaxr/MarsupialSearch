@@ -495,7 +495,9 @@ def test_the_robots_assume_what_sighting_belief_says_and_the_truth_keeps_the_tru
     assert np.allclose(m.false_alarms - m.decoys, 4.0 * (true.false_alarms - true.decoys))
     assert np.allclose(sim.truth_belief.models["uav1"].false_alarms, true.false_alarms)  # the truth's own is true
     cue = Simulator(sc, SimConfig(confirm_by=("uav0",), sighting_belief=SightingBelief(mode="cue"))).setup.sightings["uav1"]
-    assert cue.cue
+    assert cue.cue and true.checkable is None
+    close = np.max([sim.setup.detection[r] for r in sim.setup.robots if r != "uav1"], axis=0)
+    assert np.array_equal(cue.checkable, close > 0)  # where uav0 (low) or the UGV can detect it
     with pytest.raises(ValueError):
         Simulator(sc, SimConfig(sighting_belief=SightingBelief(mode="trust")))
 
@@ -516,6 +518,22 @@ def test_a_cue_raises_nothing_and_is_unchecked_until_a_close_look():
     assert b.lead_chance(z) == pytest.approx(0.05)  # checked: 1 - 0.95 of the target's chance round it left
     a.fuse(b.sync_payload())
     assert a.lead_chance(z) < 0.1 and a.hypotheses()[0][0] == z
+
+
+
+def test_a_cue_counts_only_where_a_close_look_can_detect_the_target():
+    sc = make_line_scenario()
+    lf = np.zeros_like(sc.layer_fractions)
+    lf[S], lf[int(Layer.AERIAL)] = 0.5, 0.5  # half of it on roofs
+    checkable = np.zeros(lf.shape, dtype=bool)
+    checkable[S] = True  # the ground sees only the shared layer
+    z = (512.5, 712.5)
+    for mask, left in [(None, 0.5 + 0.5 * 0.05), (checkable, 0.05)]:
+        model = SightingModel(false_alarms=np.full(sc.grid.shape, 1e-6), sigma_m=10.0, cue=True, checkable=mask)
+        b = BeliefMap(sc.grid, sc.prior, lf, {"uav0": model})
+        b.apply(_look(sc, (500.0, 700.0), 1.0, sightings=[z]))
+        b.apply(_look(sc, z, 2.0, p=0.95, radius=60.0, rid="ugv0"))
+        assert b.lead_chance(z) == pytest.approx(left)  # the roofs no longer hold it above the drop line
 
 
 @pytest.mark.parametrize("team", ["greedy", "joint"])

@@ -420,7 +420,7 @@ def test_the_near_scout_flies_to_the_sighting_itself_then_lands():
     assert uav.plan_sortie((0.0, 500.0), 5.0, 2000.0, 0.0) is None
 
 
-def _pocket_mission(on_map: bool, sighted_at_start: bool, confirm_by=("uav0",), max_time_s=3600.0):
+def _pocket_mission(on_map: bool, sighted_at_start: bool, confirm_by=("uav0",), max_time_s=3600.0, team=SCOUT_TEAM):
     """The line map with the road cut at node 14 (on the map, or found by driving there), the near
     scout (uav0, 20 m sensor) on the dock and the far scout (uav1) searching, or hovering over the
     target from the start. Belief is on the right of the map."""
@@ -437,9 +437,9 @@ def _pocket_mission(on_map: bool, sighted_at_start: bool, confirm_by=("uav0",), 
         sc = dataclasses.replace(sc, road_mismatch=MapMismatch(blocked=(CUT,)))
     if sighted_at_start:
         sc = dataclasses.replace(sc, init={**sc.init, "uav1": RobotInit(position=(875.0, 560.0))})
-    team = make_team(SCOUT_TEAM)
+    team = make_team(team)
     res = Simulator(sc, SimConfig(confirm_by=confirm_by, max_time_s=max_time_s)).run(team)
-    return res, team.robots["ugv0"]
+    return res, team.robots["ugv0"] if hasattr(team, "robots") else team
 
 
 @pytest.mark.parametrize("on_map, sighted_at_start", [(True, False), (True, True), (False, True)])
@@ -456,6 +456,21 @@ def test_the_near_scout_verifies_a_sighting_in_a_cut_off_pocket(on_map, sighted_
     assert res.trajectories["ugv0"][:, 0].max() <= 675.0 + 1e-6  # never drove to the blockage
     if not on_map:  # sighted before the UGV ran into the blockage: the detour (cut off) called it
         assert t[EventType.TARGET_SIGHTED, "uav1"] == 0.0 and ugv.roads.blocked == {CUT}
+
+
+@pytest.mark.parametrize("verifier", [True, False])
+def test_the_joint_planner_flies_a_verifier_over_a_sighting_in_a_cut_off_pocket(verifier):
+    res, ctl = _pocket_mission(True, True, confirm_by=("uav0",) if verifier else (), max_time_s=1800.0,
+                               team="joint_planner")
+    (lead, *_) = res.leads
+    if not verifier:  # nobody but the UGV can confirm it, and it cannot get there
+        assert res.outcome != "found" and lead["verify"] == 0
+        return
+    assert res.outcome == "found" and res.found_by == "uav0"
+    off = next(e.time for e in res.events if e.type == EventType.UNDOCKED and e.robot_id == "uav0")
+    ((uav, t_fly),) = lead["flights"]  # straight there from the dock
+    assert uav == "uav0" and off <= t_fly <= off + 5.0 and res.time_s <= off + 60.0  # (the re-plan after take-off)
+    assert res.trajectories["ugv0"][:, 0].max() <= 675.0 + 1e-6  # never drove past the cut
 
 
 def test_without_a_verifier_a_cut_off_target_is_never_found():

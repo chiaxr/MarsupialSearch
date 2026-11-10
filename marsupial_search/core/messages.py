@@ -135,7 +135,8 @@ class SightingModel:
     :class:`~marsupial_search.core.belief.BeliefMap` weighs a sighting with them, and its score if
     ``use_scores``: a sighting near an earlier one is likelier the target where clutter is, and a
     high score likelier than a low one. With ``cue``, it weighs none: each sighting is only a place
-    to check, from close up (by a robot that never sights wrongly).
+    to check, from close up (by a robot that never sights wrongly), where such a robot can detect
+    the target (``checkable``).
     """
 
     false_alarms: np.ndarray  # (H, W): expected false sightings per m² per look
@@ -144,6 +145,7 @@ class SightingModel:
     scores: SightingScores = field(default_factory=SightingScores)
     use_scores: bool = True  # weigh each sighting's score (else only that it was made)
     cue: bool = False  # sightings are places to check, not evidence (the rest unused but sigma_m)
+    checkable: Optional[np.ndarray] = None  # cue: (N_LAYERS, H, W) bool, where a robot that never sights wrongly can detect the target (None: everywhere)
 
 
 @dataclass(frozen=True)

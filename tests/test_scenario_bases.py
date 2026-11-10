@@ -33,13 +33,14 @@ def test_small_base_ends_on_target_or_ugv_depletion(small, team):
     assert res.time_s < sim_cfg.max_time_s
 
 
-def test_small_base_ends_on_depletion_when_target_unreachable(small):
-    # A target the UGV cannot get within sensor range of is never found, so the battery decides.
+def test_small_base_never_finds_an_unreachable_target(small):
+    # A target the UGV cannot get within sensor range of is never found: the team runs out of
+    # belief to search, or the battery runs out first.
     unreachable = np.argwhere(~small.meta["confirmable_mask"])[0]
     sc = small.with_target(small.grid.cell_center(*unreachable), Layer.SHARED)
     res = Simulator(sc, SimConfig()).run(make_team(DEFAULT_TEAM))
-    assert res.outcome == "ugv_depleted"
-    assert res.robot_stats["ugv0"]["depleted"]
+    assert res.outcome in ("ugv_depleted", "controller_done")
+    assert res.robot_stats["ugv0"]["depleted"] == (res.outcome == "ugv_depleted")
 
 
 def _flat_ugv_scenario():

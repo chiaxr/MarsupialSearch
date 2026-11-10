@@ -231,6 +231,8 @@ controller_params:
     anneal_t0: 0.002               # initial annealing temperature, as a fraction of the starting plan's value
     sighting_delay_weight: 1.0     # λ: a UAV look counts at t + λ · (the UGV's drive to confirm it)
     insert_radius_m: 400.0         # tour insertions pick UAV-grid nodes this close to the tour
+    verify: true                   # a lead the UGV cannot confirm: a UAV whose sighting ends the mission (sim.confirm_by) flies over it ...
+    pursue_passes: 3               # ... sim.confirm_test sighting: up to this many passes (else one)
     seed: 0                        # the search's random numbers
 
 out: outputs/example       # output folder (default: outputs/ for run_mission.py, outputs/compare_<base>[_<object>] for compare.py)
