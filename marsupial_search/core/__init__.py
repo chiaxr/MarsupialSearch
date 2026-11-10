@@ -27,6 +27,7 @@ from .messages import (
     RobotState,
     SensorSpec,
     SightingModel,
+    SightingScores,
     Transmit,
     TraversabilityUpdate,
     Undock,

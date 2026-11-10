@@ -23,7 +23,8 @@ UGV cannot drive on). Construction order:
 8. Optionally (``false_alarms``), what a UAV flying high mistakes for the target
    (:class:`~.false_alarms.FalseAlarms`, the simulator's only): transient clutter
    (``clutter_per_km2``) and decoys placed at random (``decoys_per_km2``), both weighted per
-   terrain by the target class (``TargetVisibility.clutter``: parked cars in a town for a car).
+   terrain by the target class (``TargetVisibility.clutter``: parked cars in a town for a car),
+   each decoy with its own likeness to the target (its mean detector score, ``decoy_score``).
 
 Layers: without occlusion, a town cell's mass is split between the aerial layer (roofs, seen
 from the air only: ``urban_aerial_fraction``) and the ground layer (street level); elsewhere
@@ -76,6 +77,7 @@ from marsupial_search.core import (
     RobotSpec,
     RobotType,
     SensorSpec,
+    SightingScores,
     Terrain,
     TraversabilityGraph,
 )
@@ -163,9 +165,15 @@ class ScenarioConfig:
     false_alarms: bool = False  # False: a UAV sights only the target, exactly where it is
     clutter_per_km2: float = 0.5  # transient false sightings per km² per look ...
     decoys_per_km2: float = 0.5  # ... and things that look like the target from the air, per km² (both times the class's terrain weight)
-    decoy_p: float = 0.8  # a look sights a decoy with this times its chance of detecting the target there
     sighting_sigma_m: float = 15.0  # a high sighting's position error, std per axis
-    air_max_p: float = 0.9  # nothing is certain from the air: a high look detects the target with at most this
+    # ... each sighting's detector score (core.SightingScores): sighted when above score_threshold; afresh each look
+    score_threshold: float = 0.0
+    score_noise: float = 1.0  # std of a score from look to look
+    target_score: float = 1.2816  # the target's mean score: from the air, in view, it is sighted 9 times in 10
+    decoy_score: float = 0.5  # each decoy's mean score (its likeness) is drawn once from N(this, decoy_score_spread²) ...
+    decoy_score_spread: float = 0.5
+    clutter_score: float = -1.0  # ... and each clutter sighting's from N(this, clutter_score_spread²)
+    clutter_score_spread: float = 0.5
     # UAV grid
     uav_grid_spacing_m: Optional[float] = None  # None: √2 · the smallest UAV sensor range, the widest square grid whose footprints leave no gaps
     # prior
@@ -804,8 +812,12 @@ def _false_alarms(cfg: ScenarioConfig, grid: GridSpec, terrain: np.ndarray, laye
     lf = layer_fractions[:, rr, cc].T
     cum = np.cumsum(lf / np.maximum(lf.sum(1, keepdims=True), 1e-300), axis=1)
     layers = np.minimum((rng.random((len(rr), 1)) > cum).sum(1), N_LAYERS - 1)
+    scores = SightingScores(threshold=cfg.score_threshold, noise=cfg.score_noise, target=cfg.target_score,
+                            decoy=cfg.decoy_score, decoy_spread=cfg.decoy_score_spread, clutter=cfg.clutter_score,
+                            clutter_spread=cfg.clutter_score_spread)
+    likeness = rng.normal(cfg.decoy_score, cfg.decoy_score_spread, len(rr))
     return FalseAlarms(clutter=clutter, decoy_density=density, decoys=xy.reshape(-1, 2), decoy_layers=layers,
-                       decoy_p=cfg.decoy_p, sigma_m=cfg.sighting_sigma_m, max_p=cfg.air_max_p)
+                       decoy_scores=likeness, sigma_m=cfg.sighting_sigma_m, scores=scores)
 
 
 def _at(grid: GridSpec, field_: np.ndarray, xy: np.ndarray) -> np.ndarray:

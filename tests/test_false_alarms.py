@@ -21,12 +21,14 @@ from marsupial_search.core import (
     RobotType,
     SensorSpec,
     SightingModel,
+    SightingScores,
     Terrain,
     Undock,
 )
 from marsupial_search.sim import SimConfig, Simulator, generate_scenario
 from marsupial_search.sim.evaluation import look_events, predicted_find_times, target_free
-from marsupial_search.sim.false_alarms import FalseAlarms
+from marsupial_search.sim.false_alarms import FalseAlarms, SightingBelief
+from scipy.special import ndtri
 from marsupial_search.sim.generator import TARGET_VISIBILITY
 from marsupial_search.sim.scenario_bases import small
 from marsupial_search.sim.simulator import robot_sensing
@@ -34,19 +36,28 @@ from marsupial_search.sim.simulator import robot_sensing
 S = int(Layer.SHARED)
 
 
-def _fa(sc, clutter=0.0, decoys=(), density=1e-7, decoy_p=1.0, sigma=5.0, max_p=0.9):
+def _alike(decoy_p=1.0, recall=0.9, **kw):
+    """Scores with the target sighted ``recall`` of the looks in view, and every decoy ``decoy_p``
+    times that (all alike: the model before scores)."""
+    return SightingScores(target=float(ndtri(recall)), decoy=float(ndtri(decoy_p * recall)), decoy_spread=0.0, **kw)
+
+
+def _fa(sc, clutter=0.0, decoys=(), density=1e-7, decoy_p=1.0, sigma=5.0, scores=None):
     """``sc`` with uniform clutter (per m² per look) and decoys at ``decoys`` (in the shared layer)."""
     xy = np.asarray(decoys, dtype=float).reshape(-1, 2)
+    scores = scores or _alike(decoy_p)
     fa = FalseAlarms(clutter=np.full(sc.grid.shape, clutter), decoy_density=np.full(sc.grid.shape, density),
-                     decoys=xy, decoy_layers=np.full(len(xy), S), decoy_p=decoy_p, sigma_m=sigma, max_p=max_p)
+                     decoys=xy, decoy_layers=np.full(len(xy), S), decoy_scores=np.full(len(xy), scores.decoy),
+                     sigma_m=sigma, scores=scores)
     return dataclasses.replace(sc, false_alarms=fa)
 
 
 # ----------------------------------------------------------------- the belief
-def _belief(lam=1e-6, sigma=10.0, decoy_share=None, decoy_p=1.0):
+def _belief(lam=1e-6, sigma=10.0, decoy_share=None, decoy_p=1.0, scores=None, use_scores=False):
     sc = make_line_scenario()
     decoys = None if decoy_share is None else np.full(sc.grid.shape, decoy_share * lam)
-    model = SightingModel(false_alarms=np.full(sc.grid.shape, lam), sigma_m=sigma, decoys=decoys, decoy_p=decoy_p)
+    model = SightingModel(false_alarms=np.full(sc.grid.shape, lam), sigma_m=sigma, decoys=decoys,
+                          scores=scores or _alike(decoy_p), use_scores=use_scores)
     return sc, BeliefMap(sc.grid, sc.prior, sc.layer_fractions, {"uav0": model})
 
 
@@ -104,6 +115,40 @@ def test_a_pass_that_misses_it_lowers_it_less_where_decoys_are_and_a_repeat_coun
     assert 3 * p2s[0] < p2s[2] and p2s[0] < p2s[1] < p2s[2]  # the miss lowers it less, the likelier a decoy
 
 
+def test_a_score_like_the_target_s_raises_it_more_and_the_score_is_ignored_without_use_scores():
+    z = (512.5, 712.5)
+    p = {}
+    for use in (True, False):
+        for s in (2.5, 0.5, -0.5):
+            sc, b = _belief(lam=1e-5, decoy_share=0.8, scores=SightingScores(), use_scores=use)
+            b.apply(LocalBeliefUpdate("uav0", RobotType.UAV, 1.0, *_window(sc, (500.0, 700.0)), sightings=(z,), scores=(s,)))
+            p[use, s] = b.p_near(z)
+    assert p[True, 2.5] > 2 * p[True, 0.5] > 2 * p[True, -0.5]  # the target scores 1.28 on average, decoys 0.5
+    assert p[False, 2.5] == p[False, 0.5] == p[False, -0.5]
+
+
+def test_repeats_scoring_as_the_target_make_it_likely_and_as_a_decoy_do_not():
+    z, out = (512.5, 712.5), {}
+    for name, s in (("target-like", 1.6), ("decoy-like", 0.3)):
+        sc, b = _belief(lam=1e-5, decoy_share=1.0, scores=SightingScores(), use_scores=True)
+        for k in range(5):  # sighted on five passes, each scoring s
+            b.apply(LocalBeliefUpdate("uav0", RobotType.UAV, float(k), *_window(sc, (500.0, 700.0)),
+                                      sightings=(z,), scores=(s,)))
+        out[name] = b.p_near(z)
+        w = b.spots[0][1:] / b.spots[0][1:].sum()
+        mu = b._scores["uav0"].mu
+        assert abs(float((w * mu).sum()) - (min(s, 1.28) + 0.5) / 2) < 0.6  # a decoy would be one that scores so
+        assert b.anchors == [z] and b.decoy_chance[0] > 0.99  # only decoys are false here
+    assert out["target-like"] > 3 * out["decoy-like"]
+
+
+def _window(sc, xy, radius=100.0, p=0.9):
+    r0, c0, mask = sc.grid.disk_window(*xy, radius)
+    pd = np.zeros((3,) + mask.shape)
+    pd[S] = p * mask
+    return r0, c0, pd
+
+
 def test_a_pass_in_slivers_is_one_miss():
     sc, whole = _belief(lam=1e-5, decoy_share=1.0, decoy_p=0.8)
     _, parts = _belief(lam=1e-5, decoy_share=1.0, decoy_p=0.8)
@@ -157,7 +202,7 @@ class _FakeBelief:
     def hypotheses(self):
         return sorted(self.p.items(), key=lambda t: -t[1])
 
-    def p_near(self, xy):
+    def lead_chance(self, xy):
         return self.p.get(xy, 0.0)
 
 
@@ -187,7 +232,8 @@ def test_only_a_high_uav_that_does_not_end_the_mission_sights_wrongly():
     sim = Simulator(sc, SimConfig())
     assert set(sim.setup.sightings) == {"uav0", "uav1"}
     m = sim.setup.sightings["uav0"]  # the decoys' share of its false sightings, and how they are sighted
-    assert m.decoy_p == 1.0 and np.allclose(m.false_alarms, sc.false_alarms.clutter + m.decoys) and m.decoys.max() > 0
+    assert m.scores == sc.false_alarms.scores and m.use_scores
+    assert np.allclose(m.false_alarms, sc.false_alarms.clutter + m.decoys) and m.decoys.max() > 0
     assert sim.setup.detection["uav0"].max() == pytest.approx(0.9)  # nothing is certain from the air
     assert sim.setup.detection["ugv0"].max() == 1.0
     assert set(Simulator(sc, SimConfig(confirm_by=("uav0",))).setup.sightings) == {"uav1"}  # the check sights truly
@@ -273,6 +319,45 @@ def test_a_sighting_comes_in_the_update_with_its_looks():
 
 
 # ------------------------------------------------------------------ the generator
+def test_a_decoy_is_sighted_by_its_likeness_and_every_sighting_has_a_score_above_the_threshold():
+    alike, unlike = (500.0, 800.0), (300.0, 300.0)
+    sc = _fa(make_line_scenario(), clutter=2e-4, decoys=[alike, unlike], scores=SightingScores(decoy_spread=0.5))
+    sc = dataclasses.replace(sc, false_alarms=dataclasses.replace(sc.false_alarms, decoy_scores=np.array([4.0, -4.0])))
+    seen, scores = {"alike": 0, "unlike": 0}, {"clutter": [], "decoy": []}
+    for seed in range(10):
+        sim = _fly(sc, [alike, unlike], seed=seed, target=False)
+        res = sim.result()
+        assert len(res.sighting_scores) == len(res.sightings)
+        for (_, _, xy, kind), s in zip(res.sightings, res.sighting_scores):
+            assert s > 0.0
+            scores[kind].append(s)
+            if kind == "decoy":
+                seen["alike" if np.hypot(xy[0] - alike[0], xy[1] - alike[1]) < 60 else "unlike"] += 1
+    assert seen == {"alike": 10, "unlike": 0}  # in view every pass: one that scores 4 always clears it, -4 never
+    assert np.mean(scores["decoy"]) == pytest.approx(4.0, abs=0.5) and np.mean(scores["clutter"]) < 1.0
+
+
+def test_a_sighting_s_score_comes_with_it_in_the_update():
+    xy = (512.5, 812.5)
+    sc = _fa(make_line_scenario(target_xy=xy))
+    sim = Simulator(sc, SimConfig(terminate_on=(), max_time_s=1e5))
+    sim.step({"uav0": Undock()})
+    ups = []
+    for _ in range(80):
+        obs = sim.step({"uav0": GoToPoint(xy)} if not ups else {})
+        ups += [u for u in obs.belief_updates if u.sightings]
+    assert ups and all(len(u.scores) == len(u.sightings) for u in ups)
+    assert sim.sighting_scores[0] == ups[0].scores[0] > 0.0
+
+
+def test_the_generator_draws_each_decoy_s_likeness():
+    cfg = dataclasses.replace(small(2), decoys_per_km2=200.0, false_alarms=True, decoy_score=0.3, decoy_score_spread=0.7)
+    f = generate_scenario(cfg).false_alarms
+    assert len(f.decoy_scores) == len(f.decoys) > 50
+    assert np.mean(f.decoy_scores) == pytest.approx(0.3, abs=0.2) and np.std(f.decoy_scores) == pytest.approx(0.7, abs=0.2)
+    assert f.scores.decoy == 0.3 and f.scores.decoy_spread == 0.7
+
+
 def test_the_generator_places_decoys_by_terrain_on_their_own_stream():
     cfg = dataclasses.replace(small(2), decoys_per_km2=20.0)
     plain, fa = generate_scenario(cfg), generate_scenario(dataclasses.replace(cfg, false_alarms=True))
@@ -296,7 +381,7 @@ def test_the_prediction_uses_what_a_high_uav_really_detects():
     cfg = dataclasses.replace(small(1), false_alarms=True)
     sc = generate_scenario(cfg)
     det, models = robot_sensing(sc, ("ugv0",))
-    assert set(models) == {"uav0", "uav1"} and max(det[u].max() for u in models) == pytest.approx(cfg.air_max_p)
+    assert set(models) == {"uav0", "uav1"} and max(det[u].max() for u in models) == pytest.approx(sc.false_alarms.scores.recall(cfg.target_score))  # 0.9
     sim_cfg = SimConfig(max_time_s=600)
     res = Simulator(sc, target_free(sim_cfg)).run(make_team({"ugv0": "ugv_timed_route", "uav0": "uav_greedy_tour",
                                                              "uav1": "uav_greedy_tour"}))
@@ -331,6 +416,21 @@ def test_a_decoy_lead_is_pursued_until_the_ugv_sees_nothing_there(team):
     assert belief.p_near(first["xy"]) < 0.1
 
 
+@pytest.mark.parametrize("team", ["greedy", "joint"])
+def test_with_cues_every_sighting_is_checked_from_the_ground_and_dropped_once_checked(team):
+    sc = _fa(make_line_scenario(n_uav=2, target_xy=(937.5, 537.5)), decoys=[DECOY])
+    spec = "joint_planner" if team == "joint" else {"ugv0": "ugv_timed_route", "uav0": "uav_greedy_tour",
+                                                    "uav1": "uav_greedy_tour"}
+    ctl = make_team(spec)
+    res = Simulator(sc, SimConfig(max_time_s=2000, seed=0, sighting_belief=SightingBelief(mode="cue"))).run(ctl)
+    first = res.leads[0]
+    assert np.hypot(first["xy"][0] - DECOY[0], first["xy"][1] - DECOY[1]) < 20 and first["t1"] is not None
+    assert first["t0"] - min(t for t, *_ in res.sightings) <= 1.0  # taken up at once (heard a step later)
+    assert res.outcome == "found"
+    belief = ctl.belief if team == "joint" else ctl.robots["ugv0"].belief
+    assert belief.lead_chance(first["xy"]) < 0.1 and np.allclose(belief.mass, belief.looked)
+
+
 def test_the_gif_draws_a_false_sighting_yellow_then_grey_and_a_line_to_the_lead(tmp_path):
     from PIL import Image
     from marsupial_search.viz.plot import CLEARED_COLOR, SPOT_COLOR, animate_result
@@ -361,3 +461,38 @@ def test_the_teams_find_targets_with_false_alarms():
         res = Simulator(sc, SimConfig(max_time_s=3000, confirm_by=by)).run(make_team(team))
         assert res.outcome == "found"
         assert res.sightings and all(rid == "uav1" for _, rid, *_ in res.sightings)  # uav0 flies low
+
+
+# ------------------------------------------------------- what the robots assume
+def test_the_robots_assume_what_sighting_belief_says_and_the_truth_keeps_the_true_model():
+    sc = generate_scenario(dataclasses.replace(small(1), false_alarms=True))
+    true = Simulator(sc, SimConfig(confirm_by=("uav0",))).setup.sightings["uav1"]
+    sim = Simulator(sc, SimConfig(confirm_by=("uav0",), sighting_belief=SightingBelief(false_alarm_scale=4.0,
+                                                                                         use_scores=False)))
+    m = sim.setup.sightings["uav1"]
+    assert not m.use_scores and not m.cue and true.use_scores
+    assert np.allclose(m.decoys, 4.0 * true.decoys)
+    assert np.allclose(m.false_alarms - m.decoys, 4.0 * (true.false_alarms - true.decoys))
+    assert np.allclose(sim.truth_belief.models["uav1"].false_alarms, true.false_alarms)  # the truth's own is true
+    cue = Simulator(sc, SimConfig(confirm_by=("uav0",), sighting_belief=SightingBelief(mode="cue"))).setup.sightings["uav1"]
+    assert cue.cue
+    with pytest.raises(ValueError):
+        Simulator(sc, SimConfig(sighting_belief=SightingBelief(mode="trust")))
+
+
+def test_a_cue_raises_nothing_and_is_unchecked_until_a_close_look():
+    sc = make_line_scenario()
+    model = SightingModel(false_alarms=np.full(sc.grid.shape, 1e-6), sigma_m=10.0, cue=True)
+    a, b = (BeliefMap(sc.grid, sc.prior, sc.layer_fractions, {"uav0": model}) for _ in range(2))
+    z = (512.5, 712.5)
+    a.apply(_look(sc, (500.0, 700.0), 1.0, sightings=[z]))
+    assert np.allclose(a.mass, a.looked) and a.anchors == [z]  # no evidence: the air look only lowers it
+    assert a.lead_chance(z) == pytest.approx(1.0)
+    a.apply(_look(sc, (500.0, 700.0), 2.0))  # the far scout misses it: no check
+    assert a.lead_chance(z) == pytest.approx(1.0) and len(a.events) == 1
+    a.apply(_look(sc, (520.0, 700.0), 3.0, sightings=[(525.0, 705.0)]))  # sighted again: the same place
+    assert a.anchors == [z]
+    b.apply(_look(sc, z, 4.0, p=0.95, radius=60.0, rid="ugv0"))  # a close look, by a robot that never sights wrongly
+    assert b.lead_chance(z) == pytest.approx(0.05)  # checked: 1 - 0.95 of the target's chance round it left
+    a.fuse(b.sync_payload())
+    assert a.lead_chance(z) < 0.1 and a.hypotheses()[0][0] == z

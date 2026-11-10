@@ -190,39 +190,53 @@ runs it.
 **False sightings** (`scenario.false_alarms: true`; `marsupial_search/sim/false_alarms.py`). A UAV
 flying high (the `air` viewpoint) mistakes things for the target: transient clutter (a shadow, a
 glint: `clutter_per_km2` per look, drawn afresh on every pass over a cell) and decoys (a parked car
-like the one sought, a rock like a hiker: `decoys_per_km2`, placed at random, each sighted on a pass
-with `decoy_p` times the chance the look would detect the target there, so the next pass may well
-sight it again). Both are weighted per terrain by the target class (`TargetVisibility.clutter`:
-for a car, twice as many in town, a tenth in vegetation). Every air sighting, true or not, is off
-by Gaussian error `sighting_sigma_m` (15 m) per axis, and nothing is certain from the air: an air
-look detects the target with at most `air_max_p` (0.9). Ground looks (the UGV, a UAV at street
-level) and the robots whose sighting ends the mission (`confirm_by`) never sight wrongly: they
-are the check. False sightings never end the mission, and they come from their own random
-streams, so a target-free run makes the same ones (§3.3).
+like the one sought, a rock like a hiker: `decoys_per_km2`, placed at random, so the next pass may
+well sight one again). Both are weighted per terrain by the target class
+(`TargetVisibility.clutter`: for a car, twice as many in town, a tenth in vegetation). Every air
+sighting, true or not, is off by Gaussian error `sighting_sigma_m` (15 m) per axis. Ground looks
+(the UGV, a UAV at street level) and the robots whose sighting ends the mission (`confirm_by`)
+never sight wrongly: they are the check. False sightings never end the mission, and they come
+from their own random streams, so a target-free run makes the same ones (§3.3).
 
-The robots get, per robot that may sight wrongly, a `SightingModel` (`MissionSetup.sightings`):
-the position error, and per cell the false sightings to expect per look (the clutter, plus the
-decoy density times the chance a look sights one; not where the decoys are), and the decoys' share
-of them. Such a robot's
-sightings come in `LocalBeliefUpdate.sightings`, each once, with the update's looks. The belief
-weighs each by its likelihood ratio, per cell `c` of the look:
+**Scores** (`core.SightingScores`). Every air sighting comes with its detector score `s`: how well
+it matches the target. An object in view scores `s = μ + ε` on each look (`ε ~ N(0, score_noise²)`,
+afresh) and is sighted when `s > score_threshold`. `μ` is its likeness to the target:
+
+| object | mean score `μ` | default |
+|---|---|---|
+| target | `target_score` | 1.28: in view, sighted 9 times in 10 from the air |
+| each decoy | drawn once from `N(decoy_score, decoy_score_spread²)`: that car's likeness, the same every pass | 0.5 ± 0.5: on average sighted 0.75 times as often as the target; a few nearly as often |
+| each clutter sighting | afresh from `N(clutter_score, clutter_score_spread²)` | −1 ± 0.5 |
+
+So nothing is certain from the air (the target's recall caps an air look's detection), each decoy
+is sighted with its own chance, and a sighting's score tells a little of what it is. A decoy that
+scores as the target does cannot be told from it from the air.
+
+The robots get, per robot that may sight wrongly, a `SightingModel` (`MissionSetup.sightings`): the
+position error, the score distributions, and per cell the false sightings to expect per look (the
+clutter, plus the decoy density times the chance a look sights one; not where the decoys are, nor
+their likenesses), and the decoys' share of them. Such a robot's sightings come in
+`LocalBeliefUpdate.sightings`, each once, with its score (`LocalBeliefUpdate.scores`) and the
+update's looks. The belief weighs each by its likelihood ratio, per cell `c` of the look:
 
 | looks at `c` | multiplies the cell's mass by |
 |---|---|
 | sights nothing | `1 − p(c)`, as before |
-| sights `z` | `(1 − p(c)) + p(c) · g(z; c) / λ(z)`: `g` the position error's density round `c`, `λ` the false sightings per m² |
-| sights `z` within `3σ + one cell` of an earlier sighting `a` (a repeat) | as a sighting, with `λ(z) + π · decoy_p · p(a) · g₂(z − a)` in place of `λ(z)`: a decoy at `a` sighted again (`g₂`: twice the variance), `π` the chance `a` was a decoy were it not the target |
-| sights nothing near an earlier sighting `a` it could have sighted (a miss) | `1 − p(c)`, and `a`'s own ratio is divided by `1 − π · decoy_p · p̄(a)`: a decoy at `a` missed too (`p̄`: the look's chance, averaged round `a`) |
+| sights `z` scoring `s` | `(1 − p(c)) + p(c) · g(z; c) · h_T(s) / F(z, s)`: `g` the position error's density round `c`, `h_T` the target's score density, `F` a false sighting's density there with that score (clutter's rate and score density, plus decoys', over their likenesses) |
+| sights `z` within `3σ + one cell` of an earlier sighting `a` (a repeat) | as a sighting, with `F` plus the anchor's decoy sighted again (per likeness: the chance it is in view times its score's density, at `g₂(z − a)`, twice the variance) |
+| sights nothing near an earlier sighting `a` it could have sighted (a miss) | `1 − p(c)`, and `a`'s own ratio is divided by the chance a decoy at `a` was missed too (in view with `p̄(a)`, the look's chance averaged round `a`, times its chance to clear the threshold) |
 
-Clutter does not come back but a decoy does, so a repeat counts against clutter only. `π` starts
-as the decoys' share of `λ` at the first sighting, rises with each repeat (by Bayes, against
-clutter coming back there by chance) and falls with each miss (a decoy would likely have been
-sighted). A target sighted again where false sightings are mostly clutter soon becomes likely;
-where they are mostly decoys, each repeat raises it by only about `1 / decoy_p`, until misses in
-between make a decoy unlikely. A miss also lowers it less where a decoy is likely, as a decoy
-would have been missed too. A pass comes in slivers (each step's update holds the cells newly in
-view), so `p̄` is averaged over where the decoy may be: the slivers add up to one miss. Only
-looks after the first sighting count as misses.
+Were an anchor not the target, the belief keeps the chance it was clutter or a decoy of each
+likeness (`BeliefMap.spots`, on 25 points). Clutter does not come back but a decoy does, so a
+repeat counts against clutter; its score says which likeness a decoy would need. A target sighted
+again where false sightings are mostly clutter soon becomes likely; where they are mostly decoys,
+repeats that score as the target does raise it, and ones that score as a decoy does hardly. A miss
+lowers it less where a decoy is likely, as a decoy would have been missed too, and makes decoys,
+the target-like ones above all, less likely. A pass comes in slivers (each step's update holds
+the cells newly in view), so `p̄` is averaged over where the decoy may be: the slivers add up to one
+miss. Only looks after the first sighting count as misses. Without scores (`use_scores: false`)
+and with decoys all alike, this is the chance `π` of a decoy and a repeat weighs with
+`λ + π · decoy_p · p(a) · g₂(z − a)`, `decoy_p` a decoy's recall over the target's.
 
 A sighting thus raises the belief near it as far as the false sightings it could be allow: where
 they are rare, one sighting makes the target likely there; in a town full of parked cars, much
@@ -232,12 +246,21 @@ clears it. Beliefs fuse as before: the looks by element-wise minimum and the sig
 belief puts the target within the gate of it with chance `lead_pursue_p` (0.5), until it falls
 below `lead_drop_p` (0.1); in between, the search gets to it as the belief says. The run summary
 counts `sightings_target`, `sightings_decoy`, `sightings_clutter` (and `false_sightings`, the
-last two), `leads`, `false_leads` (pursued with no target there), `false_lead_s` (for how long) and
+last two; each sighting and its score are in `MissionResult.sightings` and `sighting_scores`), `leads`, `false_leads` (pursued with no target there), `false_lead_s` (for how long) and
 `false_verify_flights`. With `false_alarms: false` (the default), sightings are certain and
 missions are as before. `configs/small_car_false_alarms.yaml` runs it. The GIF draws each false
 sighting (repeats near it are one, `MissionResult.false_spots`) as a yellow diamond once sighted,
 greyed once ruled out: the looks since would have sighted the target near it 4 times in 5 (the
 belief near it down to a fifth).
+
+By default the robots know the false sightings' rates and scores (their `SightingModel` is the
+truth's). `SimConfig.sighting_belief` makes them assume others: `false_alarm_scale` times the true
+false sightings; ignore the scores (`use_scores: false`); or, with `mode: cue`, weigh no sighting
+at all. A cue is only a
+place to check from close up: the controllers pursue each in turn (`BeliefMap.lead_chance`: the
+share of the target's chance round it, prior times the position error's Gaussian, that the looks
+of robots that never sight wrongly have not yet ruled out) and drop it once that share is below
+`lead_drop_p`. A cue needs no rates, at the cost of checking every false sighting.
 
 ### 1.4 Radio channel
 

@@ -279,9 +279,14 @@ scenario:
   false_alarms: false                # false: a UAV sights only the target, exactly where it is
   clutter_per_km2: 0.5               # transient false sightings per km² per look ...
   decoys_per_km2: 0.5                # ... and things that look like the target from the air, per km² (both times the class's terrain weight)
-  decoy_p: 0.8                       # a look sights a decoy with this times its chance of detecting the target there
   sighting_sigma_m: 15.0             # a high sighting's position error, std per axis
-  air_max_p: 0.9                     # nothing is certain from the air: a high look detects the target with at most this
+  score_threshold: 0.0               # each air sighting's detector score: sighted when above this ...
+  score_noise: 1.0                   # ... a score's std from look to look ...
+  target_score: 1.2816               # ... the target's mean score: in view, sighted 9 times in 10 from the air ...
+  decoy_score: 0.5                   # ... each decoy's mean score (its likeness), drawn once from N(this, decoy_score_spread²) ...
+  decoy_score_spread: 0.5
+  clutter_score: -1.0                # ... and each clutter sighting's, from N(this, clutter_score_spread²)
+  clutter_score_spread: 0.5
   uav_grid_spacing_m: null           # UAV waypoint grid spacing, 8-connected (null: √2 · the smallest UAV sensor range, the widest gap-free grid)
   # prior (README §1.5)
   prior_model: semantic              # semantic (LMPath proxy) | gaussian_mixture
@@ -329,6 +334,10 @@ sim:
   stop_when_ugv_depleted: true       # end the run when the UGV runs flat
   target: true             # false: a target-free run (used by the cv estimator)
   seed: 0                  # simulator random numbers (radio loss, energy noise); the map seed is mission.seed / compare.maps
+  sighting_belief:         # with false alarms: what the robots that sight wrongly assume of them (default: the truth)
+    mode: weigh            # weigh: each sighting by its likelihood ratio | cue: only a place to check from close up
+    use_scores: true       # weigh: each sighting's score too (false: only that it was made)
+    false_alarm_scale: 1.0 # weigh: they expect this times the true false sightings (clutter and decoys alike)
   radio:
     enabled: true          # false: no radio at all
     simulate_channel: true # false: ideal channel, every message goes through

@@ -55,7 +55,8 @@ class Lead:
     """The sighting a controller pursues (``xy``; None: none). A certain one
     (``BeliefMap.detection_xy``) is pursued for good. Otherwise the uncertain one most likely to be
     the target (``BeliefMap.hypotheses``), once the chance it is near is ``lead_pursue_p``, until
-    the looks that miss it bring that below ``lead_drop_p``. ``log`` keeps each lead: when it
+    the looks that miss it bring that below ``lead_drop_p`` (``BeliefMap.lead_chance``; with cues,
+    the chance it is still unchecked). ``log`` keeps each lead: when it
     started and ended (``"t0"``, ``"t1"``: None while pursued), where, whether it was certain, the
     robot pursuing it (``"by"``), and the flights to verify it (``"verify"``; ``"flights"``: the UAV
     and its take-off time each, told by the controller)."""
@@ -75,7 +76,7 @@ class Lead:
             self._set(tuple(belief.detection_xy), True, now)
             return True
         changed = False
-        if self.xy is not None and belief.p_near(self.xy) < self.cfg.lead_drop_p:
+        if self.xy is not None and belief.lead_chance(self.xy) < self.cfg.lead_drop_p:
             self._set(None, False, now)
             changed = True
         if self.xy is None and belief.anchors:

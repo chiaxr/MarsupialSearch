@@ -33,11 +33,14 @@ end the mission, so a UAV sighting is worth something only once the UGV drives o
 unless the near scout's own sighting ends it (`sim.confirm_by: [uav0]`): then it can verify a
 sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*). A UAV flying high may
 sight things that are not the target ([False sightings](README.md#13-visibility-layers-urban-needs-both-robot-types)):
-its sighting raises the belief near it, by how rare false sightings are there, and a pass that
-misses it lowers it again. A controller pursues a sighting (its *lead*, `common.Lead`) only while
-the belief makes the target likely near it: once that chance reaches `lead_pursue_p` (0.5), until
-it falls below `lead_drop_p` (0.1). Below that, the search gets to it, or not, as the belief says,
-as it does any belief. A sighting by a robot that never sights wrongly is a lead for good.
+its sighting raises the belief near it, by how rare false sightings are there and how much its
+detector score is like the target's, and a pass that misses it lowers it again. A controller
+pursues a sighting (its *lead*, `common.Lead`) only while the belief makes the target likely near
+it (`BeliefMap.lead_chance`): once that chance reaches `lead_pursue_p` (0.5), until it falls below
+`lead_drop_p` (0.1). Below that, the search gets to it, or not, as the belief says, as it does any
+belief. With `sim.sighting_belief.mode: cue` a sighting raises nothing: each is a lead in turn,
+until the looks of robots that never sight wrongly have ruled out the target near it. A sighting
+by a robot that never sights wrongly is a lead for good.
 
 **What constrains them.** The dock shapes every plan. A UAV that is not docked has nowhere to wait
 except in the air, and a stay on the dock takes landing + swap + take-off (about 3 min), during

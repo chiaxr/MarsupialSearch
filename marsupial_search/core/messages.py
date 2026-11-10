@@ -14,6 +14,8 @@ from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 
+from scipy.special import ndtr
+
 from .graph import TraversabilityGraph
 from .grid import GridSpec
 from .types import N_LAYERS, Layer, RobotMode, RobotType
@@ -91,23 +93,57 @@ class DockingSpec:
 
 
 @dataclass(frozen=True)
+class SightingScores:
+    """A detector's score ``s`` for what it sights: how well it matches the target.
+
+    An object in view scores ``s = μ + ε``, ``ε ~ N(0, noise²)`` afresh on every look, and is sighted
+    when ``s > threshold``. ``μ`` is the object's similarity to the target: ``target`` for the target;
+    for each decoy, drawn once from ``N(decoy, decoy_spread²)`` (that car's likeness, the same on
+    every pass); for each clutter sighting, afresh from ``N(clutter, clutter_spread²)``. So the target
+    in view is sighted with :meth:`recall` ``(target)`` (0.9 by default), each decoy with its own
+    chance, and a sighting's score tells, a little, what it is.
+    """
+
+    threshold: float = 0.0  # a sighting is reported when its score is above this
+    noise: float = 1.0  # std of a score from look to look
+    target: float = 1.2816  # the target's mean score (recall 0.9)
+    decoy: float = 0.5  # decoys' mean scores are drawn from N(decoy, decoy_spread²) ...
+    decoy_spread: float = 0.5
+    clutter: float = -1.0  # ... and clutter's from N(clutter, clutter_spread²)
+    clutter_spread: float = 0.5
+
+    def recall(self, mu):
+        """The chance an object of mean score ``mu`` in view is sighted."""
+        return ndtr((np.asarray(mu, dtype=float) - self.threshold) / self.noise)
+
+    def decoy_recall(self) -> float:
+        """The chance a decoy in view is sighted, over the decoys' mean scores."""
+        return float(ndtr((self.decoy - self.threshold) / np.hypot(self.noise, self.decoy_spread)))
+
+
+@dataclass(frozen=True)
 class SightingModel:
     """How a robot's sightings may be wrong, as the environment models them (a robot not given one
     sights only the target, exactly where it is).
 
     A look that would detect the target in a cell reports it at a position off by Gaussian error
-    ``sigma_m`` (per axis); and every look also reports, with no target there, sightings at
-    ``false_alarms`` per square metre of the cells it covers (things a camera mistakes for it).
-    Of those, ``decoys`` are things there on every pass (a parked car like the one sought), sighted
-    with ``decoy_p`` times the chance the look would sight the target there; the rest is clutter,
-    there for one look only. :class:`~marsupial_search.core.belief.BeliefMap` weighs a sighting with
-    them: a sighting near an earlier one is likelier the target where clutter is.
+    ``sigma_m`` (per axis), with a score (:class:`SightingScores`); and every look also reports, with
+    no target there, sightings at ``false_alarms`` per square metre of the cells it covers (things a
+    camera mistakes for it). Of those, ``decoys`` are things there on every pass (a parked car like
+    the one sought), sighted on each pass with their own chance (their mean score's); the rest is
+    clutter, there for one look only. The robot's detection map already holds the target's recall.
+    :class:`~marsupial_search.core.belief.BeliefMap` weighs a sighting with them, and its score if
+    ``use_scores``: a sighting near an earlier one is likelier the target where clutter is, and a
+    high score likelier than a low one. With ``cue``, it weighs none: each sighting is only a place
+    to check, from close up (by a robot that never sights wrongly).
     """
 
     false_alarms: np.ndarray  # (H, W): expected false sightings per m² per look
     sigma_m: float  # std of a sighting's position error, per axis
     decoys: Optional[np.ndarray] = None  # (H, W): the part of false_alarms from decoys (None: all of it)
-    decoy_p: float = 1.0  # a decoy is sighted with this times the chance the target would be there
+    scores: SightingScores = field(default_factory=SightingScores)
+    use_scores: bool = True  # weigh each sighting's score (else only that it was made)
+    cue: bool = False  # sightings are places to check, not evidence (the rest unused but sigma_m)
 
 
 @dataclass(frozen=True)
@@ -193,6 +229,7 @@ class LocalBeliefUpdate:
     detected: bool = False
     detection_xy: Optional[tuple[float, float]] = None
     sightings: tuple[tuple[float, float], ...] = ()  # uncertain sightings made this step (SightingModel)
+    scores: tuple[float, ...] = ()  # ... and each one's score (SightingScores)
 
 
 @dataclass(frozen=True)
