@@ -244,7 +244,11 @@ less. A later pass that misses it lowers it again; only a pass that misses it (o
 clears it. Beliefs fuse as before: the looks by element-wise minimum and the sightings by union
 (`BeliefMap.fuse`). The controllers pursue a sighting (the *lead*, `controllers.common.Lead`) once the
 belief puts the target within the gate of it with chance `lead_pursue_p` (0.5), until it falls
-below `lead_drop_p` (0.1); in between, the search gets to it as the belief says. The run summary
+below `lead_drop_p` (0.1), or until the controller has no try left at it (its passes and verify
+flights all made). A look that may miss can leave the chance above `lead_drop_p` for good, and a
+lead held with nothing left to do would block the next one, so a spent lead is let go
+(`Lead.spend`, `"spent"` in `MissionResult.leads`) and taken up again only on a new sighting near
+it. In between, the search gets to it as the belief says. The run summary
 counts `sightings_target`, `sightings_decoy`, `sightings_clutter` (and `false_sightings`, the
 last two; each sighting and its score are in `MissionResult.sightings` and `sighting_scores`), `leads`, `false_leads` (pursued with no target there), `false_lead_s` (for how long) and
 `false_verify_flights`. With `false_alarms: false` (the default), sightings are certain and

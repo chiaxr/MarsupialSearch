@@ -230,7 +230,11 @@ class JointPlannerController(MissionController):
         if self.sent is not None:
             self.cur = max(self.cur, self.sent[0] - len(g.path_remaining))
         self._handle_events(obs)
-        if self.lead.update(self.belief, now):  # a new lead (or none): pursue it afresh
+        spent = self.pursuit_done and self.lead.xy is not None and not self.lead.hard \
+            and dist(g.position, self.lead.xy) > self.ugv_spec.sensor.range_m  # its pass made: no try left
+        if spent:
+            self.lead.spend(now)
+        if self.lead.update(self.belief, now) or spent:  # a new lead (or none): pursue it afresh
             self.pursuit_done, self.replan_now = False, True
         if self.pursuit_goal is not None and not self.pursuit_done and g.node == self.pursuit_goal:
             self.pursuit_done, self.replan_now = True, True  # drove past it without confirming

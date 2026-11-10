@@ -37,9 +37,11 @@ its sighting raises the belief near it, by how rare false sightings are there an
 detector score is like the target's, and a pass that misses it lowers it again. A controller
 pursues a sighting (its *lead*, `common.Lead`) only while the belief makes the target likely near
 it (`BeliefMap.lead_chance`): once that chance reaches `lead_pursue_p` (0.5), until it falls below
-`lead_drop_p` (0.1). Below that, the search gets to it, or not, as the belief says, as it does any
-belief. With `sim.sighting_belief.mode: cue` a sighting raises nothing: each is a lead in turn,
-until the looks of robots that never sight wrongly have ruled out the target near it. A sighting
+`lead_drop_p` (0.1), or until it has no try left at it (its passes and verify flights made: it
+lets the lead go, `Lead.spend`, and takes it up again only on a new sighting near it). Below
+that, the search gets to it, or not, as the belief says, as it does any belief. With
+`sim.sighting_belief.mode: cue` a sighting raises nothing: each is a lead in turn, until the looks
+of robots that never sight wrongly have ruled out the target near it. A sighting
 by a robot that never sights wrongly is a lead for good.
 
 **What constrains them.** The dock shapes every plan. A UAV that is not docked has nowhere to wait

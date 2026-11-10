@@ -19,8 +19,10 @@ Sightings
     The one pursued is the *lead* (``common.Lead``): a certain sighting, or an uncertain one (a
     UAV flying high may sight things that are not the target) once the belief puts the target
     near it with chance ``lead_pursue_p``, until looks that miss it bring that below
-    ``lead_drop_p`` (then the pursuit stops, and the search gets to it as the belief says). A
-    new lead starts the pursuit, its passes and its verifying afresh.
+    ``lead_drop_p`` (then the pursuit stops, and the search gets to it as the belief says), or
+    until no try is left at it (its passes and verifying, below, all made: it is let go, and taken
+    up again only on a new sighting near it). A new lead starts the pursuit, its passes and its
+    verifying afresh.
     The UGV drives past a sighting at once, from the node it is at or driving to, when the
     detour delays its next stops by no more than the hover slack of every UAV still to land.
     Otherwise it goes there straight after the pin, and re-checks the detour at every node it
@@ -804,6 +806,22 @@ class TimedRouteUgv(BookingRobot):
         """May the UGV (``"ugv"``) or the verifier (``"verify"``) try the sighting again after a missed pass?"""
         return self.setup.confirm_test == "sighting" and self.passes[who] < self.cfg.pursue_passes
 
+    def _exhausted(self, s: RobotState) -> bool:
+        """No try left at the uncertain lead (it is then let go, ``Lead.spend``): its pursuit done
+        and the UGV out of range of it, with no verifier called or due, and no pass left
+        (``_again``) for whoever made the last one: the verifier once back on the dock (or lost), or
+        the UGV, if its looks can detect the target there at all."""
+        xy = self.lead.xy
+        if xy is None or self.lead.hard or self.pursuit != "done" or dist(s.position, xy) <= self.spec.sensor.range_m:
+            return False
+        if self.pursuit_verify and self.verify_flown:
+            flights = self.lead.log[-1]["flights"] if self.lead.log else []
+            u = flights[-1][0] if flights else None
+            return (u is None or u in self.lost or s.docked_uav == u) and not self._again("verify")
+        if self.verify_due or self.verify_call is not None:
+            return False
+        return self.pursuit_verify or not (self._again("ugv") and self._chance(self.rid, xy) > 0)
+
     def _check_verify(self, s: RobotState, now: float) -> None:
         """Call the verifier (``verify``) at the node the UGV is at or driving to: at the end of a
         pursuit to the road node nearest the sighting, or after a long detour (``_long_detour``).
@@ -886,7 +904,10 @@ class TimedRouteUgv(BookingRobot):
         self._track(s, now)
         self._handle_events(obs, now)
         self._handle_messages(obs, s, now, cmds)
-        if self.lead.update(self.belief, now):
+        spent = self._exhausted(s)
+        if spent:
+            self.lead.spend(now)
+        if self.lead.update(self.belief, now) or spent:
             self._new_lead()
         self.standby |= {rid for rid, p in self.peers.items() if p.get("standby")}
         self._check_map(s, now)

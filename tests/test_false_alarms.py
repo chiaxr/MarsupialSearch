@@ -198,6 +198,7 @@ def test_without_a_sighting_model_the_belief_is_as_before():
 class _FakeBelief:
     def __init__(self):
         self.detection_xy, self.anchors, self.p = None, [], {}
+        self.gate_m, self.events = 30.0, {}
 
     def hypotheses(self):
         return sorted(self.p.items(), key=lambda t: -t[1])
@@ -224,6 +225,25 @@ def test_the_lead_is_pursued_while_the_belief_makes_it_likely():
     assert not lead.update(b, 6.0) and lead.xy == (5.0, 5.0)  # a certain one is never dropped
     assert [(ld["t0"], ld["t1"], ld["xy"], ld["verify"]) for ld in lead.log] == [
         (2.0, 4.0, z, 0), (4.0, 5.0, w, 1), (5.0, None, (5.0, 5.0), 0)]
+
+
+def test_a_spent_lead_is_let_go_and_taken_up_again_only_on_a_new_sighting_near_it():
+    from types import SimpleNamespace
+    lead, b = Lead(SearchConfig(lead_pursue_p=0.5, lead_drop_p=0.1)), _FakeBelief()
+    z, w = (100.0, 100.0), (300.0, 300.0)
+    b.anchors, b.p = [z, w], {z: 0.9, w: 0.6}
+    assert lead.update(b, 1.0) and lead.xy == z
+    lead.spend(2.0)  # no try left, though the belief still makes it likely
+    assert lead.xy is None and lead.log[-1]["spent"] and lead.log[-1]["t1"] == 2.0
+    assert lead.update(b, 2.0) and lead.xy == w  # not z again: the next one
+    lead.spend(3.0)
+    assert not lead.update(b, 3.0) and lead.xy is None  # both spent
+    b.events = {(4.0, "uav1"): SimpleNamespace(time=4.0, sightings=((110.0, 95.0),))}  # a new sighting near z
+    assert lead.update(b, 4.0) and lead.xy == z
+    b.detection_xy = (5.0, 5.0)
+    assert lead.update(b, 5.0) and lead.hard
+    lead.spend(6.0)
+    assert lead.xy == (5.0, 5.0)  # a certain one is never let go
 
 
 # -------------------------------------------------------------- the simulator
@@ -496,3 +516,16 @@ def test_a_cue_raises_nothing_and_is_unchecked_until_a_close_look():
     assert b.lead_chance(z) == pytest.approx(0.05)  # checked: 1 - 0.95 of the target's chance round it left
     a.fuse(b.sync_payload())
     assert a.lead_chance(z) < 0.1 and a.hypotheses()[0][0] == z
+
+
+@pytest.mark.parametrize("team", ["greedy", "joint"])
+def test_a_lead_is_let_go_once_no_try_is_left(team):
+    sc = _fa(make_line_scenario(n_uav=2, target_xy=(937.5, 537.5)), decoys=[DECOY])
+    spec = "joint_planner" if team == "joint" else {"ugv0": "ugv_timed_route", "uav0": "uav_greedy_tour",
+                                                    "uav1": "uav_greedy_tour"}
+    ctl = make_team(spec, {"joint_planner" if team == "joint" else "ugv_timed_route": {"lead_drop_p": 0.0}})
+    res = Simulator(sc, SimConfig(max_time_s=2000, seed=0, sighting_belief=SightingBelief(mode="cue"))).run(ctl)
+    first = res.leads[0]  # the decoy, never dropped by the belief: only let go
+    assert np.hypot(first["xy"][0] - DECOY[0], first["xy"][1] - DECOY[1]) < 20
+    assert first["spent"] and first["t1"] is not None
+    assert res.outcome == "found"

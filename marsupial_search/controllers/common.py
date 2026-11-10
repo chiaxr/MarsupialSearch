@@ -56,7 +56,10 @@ class Lead:
     (``BeliefMap.detection_xy``) is pursued for good. Otherwise the uncertain one most likely to be
     the target (``BeliefMap.hypotheses``), once the chance it is near is ``lead_pursue_p``, until
     the looks that miss it bring that below ``lead_drop_p`` (``BeliefMap.lead_chance``; with cues,
-    the chance it is still unchecked). ``log`` keeps each lead: when it
+    the chance it is still unchecked), or the controller has no try left at it (:meth:`spend`: a
+    look that may miss can leave its chance above that line for good, and a lead held with nothing
+    left to do blocks the next one). A spent lead is taken up again only once a new sighting comes
+    within ``BeliefMap.gate_m`` of it. ``log`` keeps each lead: when it
     started and ended (``"t0"``, ``"t1"``: None while pursued), where, whether it was certain, the
     robot pursuing it (``"by"``), and the flights to verify it (``"verify"``; ``"flights"``: the UAV
     and its take-off time each, told by the controller)."""
@@ -67,6 +70,7 @@ class Lead:
         self.xy: Optional[tuple[float, float]] = None
         self.hard = False
         self.log: list[dict] = []
+        self.spent: list[tuple[tuple[float, float], float]] = []  # (where, when) each lead let go with no try left
 
     def update(self, belief: BeliefMap, now: float) -> bool:
         """Follow the belief: True if the lead changed (a new one, or dropped)."""
@@ -80,11 +84,30 @@ class Lead:
             self._set(None, False, now)
             changed = True
         if self.xy is None and belief.anchors:
-            hyp = belief.hypotheses()
-            if hyp[0][1] >= self.cfg.lead_pursue_p:
-                self._set(tuple(hyp[0][0]), False, now)
-                changed = True
+            if self.spent:  # live again once a new sighting comes near
+                self.spent = [(xy, t) for xy, t in self.spent if not self._sighted_near(belief, xy, t)]
+            for z, p in belief.hypotheses():
+                if p < self.cfg.lead_pursue_p:
+                    break
+                if not any(dist(z, xy) <= belief.gate_m for xy, _ in self.spent):
+                    self._set(tuple(z), False, now)
+                    changed = True
+                    break
         return changed
+
+    def spend(self, now: float) -> None:
+        """The controller has no try left at the (uncertain) lead: let it go."""
+        if self.xy is None or self.hard:
+            return
+        self.spent.append((self.xy, now))
+        self.log[-1]["spent"] = True
+        self._set(None, False, now)
+
+    @staticmethod
+    def _sighted_near(belief: BeliefMap, xy, since: float) -> bool:
+        """Has a sighting come within ``gate_m`` of ``xy`` after ``since``?"""
+        return any(ev.time > since and any(dist(z, xy) <= belief.gate_m for z in ev.sightings)
+                   for ev in belief.events.values())
 
     def _set(self, xy, hard: bool, now: float) -> None:
         if self.log and self.log[-1]["t1"] is None:
@@ -92,7 +115,7 @@ class Lead:
         self.xy, self.hard = xy, hard
         if xy is not None:
             self.log.append({"t0": now, "t1": None, "xy": xy, "hard": hard, "by": self.by, "verify": 0,
-                             "flights": []})
+                             "flights": [], "spent": False})
 
     def verified(self, uav: Optional[str] = None, now: Optional[float] = None) -> None:
         """A flight (by ``uav``) to verify the lead took off (at ``now``)."""
