@@ -223,6 +223,34 @@ def test_the_far_scout_checks_the_road_ahead_once_blockages_are_known():
     assert bumped == set(range(7, 11))
 
 
+def test_the_far_scout_checks_the_road_the_ugv_reaches_after_it_lands():
+    # landing at 50 s: a find reaches the UGV then, so a node counts if the UGV gets to the node
+    # before it (no junction on the line) 60-110 s after: nodes 12-17 (node i-1 reached at 10(i-1) s)
+    uav, m = _far(near_route_m=0.0, recon_weight=2.0, recon_window="landing", recon_react_s=60.0,
+                  recon_horizon_s=110.0)
+    uav.roads.add(blocked=[19])
+    extra = (uav._tour_mass(m, 0.0, 50.0) - m).sum(0)
+    bumped = {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))) for c in np.flatnonzero(extra)}
+    assert bumped == set(range(12, 18))
+    extra = (uav._tour_mass(m, 0.0) - m).sum(0)  # no landing time: the take-off window, 120-1800 s
+    bumped = {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))) for c in np.flatnonzero(extra)}
+    assert bumped == set(range(12, 20))
+
+
+def test_the_far_scout_times_a_find_by_the_junction_before_the_node():
+    import types
+    from scipy.sparse import csr_matrix
+    uav, _ = _far(recon_window="landing")
+    # a road 0-1-2-3-4 with a spur off 2 (node 5) and one off 3 (node 6), blocked
+    e = np.array([[0, 1], [1, 2], [2, 3], [3, 4], [2, 5], [3, 6]])
+    a = csr_matrix((np.ones(12), (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])), shape=(7, 7))
+    uav.road = types.SimpleNamespace(csr=a, blocked=np.array([False] * 6 + [True]))
+    d = uav._decide_times(np.arange(5), 10.0 * np.arange(5))
+    # 2 is a junction (1, 3, 5); 3 is not (6 is blocked): nodes 3 and 4 are decided at 2 (20 s);
+    # nodes 0-2 have no junction before them on the route: the node before
+    assert d.tolist() == [0.0, 0.0, 10.0, 20.0, 20.0]
+
+
 # ----------------------------------------------------------------- the messenger
 def _stranded(radio_m=300.0):
     """The UGV with ``uav1`` booked to land at node 10, out of touch and short of energy: the UGV
