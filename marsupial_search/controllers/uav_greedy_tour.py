@@ -102,13 +102,21 @@ class GreedyTourUav(BookingUav):
         future = arr >= t_start
         t_ugv = P.ugv_sweep_times(nodes[future], arr[future] - t_start)
         k = tuple(self.road.positions[nodes[pick]])
-        m = self._tour_mass(P.searchable_mass(self.belief), t_start, float(arr[pick]))
-        return P.chain_tour(m, t_ugv, tuple(start), k, L_max, tau, 0.0, claim, t_start)
+        m0 = P.searchable_mass(self.belief)
+        m = self._tour_mass(m0, t_start, float(arr[pick]))
+        extra = self._tour_extra(m0, t_start, float(arr[pick]))
+        return P.chain_tour(m, t_ugv, tuple(start), k, L_max, tau, 0.0, claim, t_start, extra)
 
     def _tour_mass(self, m: np.ndarray, t_start: float, t_land: Optional[float] = None) -> np.ndarray:
         """The belief per (layer, cell) a tour from ``t_start``, landing at ``t_land``, scores (a
         subclass may weigh it)."""
         return m
+
+    def _tour_extra(self, m: np.ndarray, t_start: float, t_land: Optional[float] = None):
+        """Value other than the target a tour from ``t_start``, landing at ``t_land``, scores:
+        None, or ``(mass, p_see)`` per cell (``SortiePlanner.chain_tour``'s ``extra``); ``m`` is
+        the belief before any weighing."""
+        return None
 
     def _sortie(self, pick: int, start, t_start: float, energy: float, now: float,
                 claim: Optional[np.ndarray] = None, tour=None) -> Sortie:

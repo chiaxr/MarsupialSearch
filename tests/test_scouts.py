@@ -208,17 +208,24 @@ def test_the_far_scout_prefers_belief_the_ugv_can_confirm_soon():
     assert far == pytest.approx(600.0 / (600.0 + 420.0 / 5.0), abs=0.02)
 
 
+def _recon_value(uav, m, *t):
+    """Per cell: what the reconnaissance is worth to a tour (``chain_tour``'s ``extra``: mass ·
+    chance of seeing it)."""
+    extra = uav._tour_extra(m, *t)
+    return np.zeros(m.shape[1]) if extra is None else extra[0] * extra[1]
+
+
 def test_the_far_scout_checks_the_road_ahead_once_blockages_are_known():
     uav, m = _far(near_route_m=0.0, recon_weight=2.0, recon_from_s=50.0, recon_to_s=100.0)  # nodes 5-10
-    assert np.array_equal(uav._tour_mass(m, 0.0), m)  # no blocked node found yet: nothing to check
+    assert uav._tour_extra(m, 0.0) is None  # no blocked node found yet: nothing to check
     uav.roads.add(blocked=[15])
-    out = uav._tour_mass(m, 0.0)
-    extra = (out - m).sum(0)
+    assert np.array_equal(uav._tour_mass(m, 0.0), m)  # it leaves the target's belief alone
+    extra = _recon_value(uav, m, 0.0)
     bumped = {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))) for c in np.flatnonzero(extra)}
     assert bumped == set(range(5, 11))
     uav.belief.mass[:, :, :8] *= 0.0  # someone looked at x < 200 m (nodes 0-3) ...
     uav.belief.mass[:, 20, [11, 13]] *= 0.0  # ... and at nodes 5 and 6 (x = 275, 325)
-    extra = (uav._tour_mass(m, 0.0) - m).sum(0)
+    extra = _recon_value(uav, m, 0.0)
     bumped = {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))) for c in np.flatnonzero(extra)}
     assert bumped == set(range(7, 11))
 
@@ -229,10 +236,10 @@ def test_the_far_scout_checks_the_road_the_ugv_reaches_after_it_lands():
     uav, m = _far(near_route_m=0.0, recon_weight=2.0, recon_window="landing", recon_react_s=60.0,
                   recon_horizon_s=110.0)
     uav.roads.add(blocked=[19])
-    extra = (uav._tour_mass(m, 0.0, 50.0) - m).sum(0)
+    extra = _recon_value(uav, m, 0.0, 50.0)
     bumped = {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))) for c in np.flatnonzero(extra)}
     assert bumped == set(range(12, 18))
-    extra = (uav._tour_mass(m, 0.0) - m).sum(0)  # no landing time: the take-off window, 120-1800 s
+    extra = _recon_value(uav, m, 0.0)  # no landing time: the take-off window, 120-1800 s
     bumped = {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))) for c in np.flatnonzero(extra)}
     assert bumped == set(range(12, 20))
 
@@ -255,31 +262,30 @@ def _far_loop(**cfg):
     return uav, uav.planner.searchable_mass(uav.belief)
 
 
-def _bonus(uav, m, out):
-    """Per line node: the belief the reconnaissance added in its cell."""
-    extra = (out - m).sum(0)
+def _bonus(uav, extra):
+    """Per line node: the reconnaissance value in its cell."""
     return {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))): float(extra[c])
             for c in np.flatnonzero(extra)}
 
 
 def test_the_gated_far_scout_weighs_road_nodes_from_the_start_by_their_chance_of_being_blocked():
     uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0)  # nodes 5-15
-    b = _bonus(uav, m, uav._tour_mass(m, 0.0))  # no blocked node found yet: it counts already
+    b = _bonus(uav, _recon_value(uav, m, 0.0))  # no blocked node found yet: it counts already
     assert set(b) == set(range(5, 16))
     uav._look(uav.road.positions[13], 30.0)  # a robot saw node 13 open
-    b2 = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    b2 = _bonus(uav, _recon_value(uav, m, 0.0))
     assert 13 not in b2 and b2[5] < b[5]  # seen: nothing; and one more node seen open lowers the blocked rate
 
 
 def test_the_gated_far_scout_weighs_less_a_blockage_the_ugv_can_drive_round_in_time():
     # slack (60 + 30) s at 5 m/s = 450 m < the 500 m detour round nodes 8-11: every node breaks a landing
     uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0, recon_floor=0.1)
-    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    b = _bonus(uav, _recon_value(uav, m, 0.0))
     assert all(b[i] == pytest.approx(b[5]) for i in range(5, 16))
     # (200 + 30) s = 1150 m: the loop is a short enough way round, so nodes 8-11 get the floor
     uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0, recon_floor=0.1,
                        rendezvous_slack_s=200.0)
-    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    b = _bonus(uav, _recon_value(uav, m, 0.0))
     assert all(b[i] == pytest.approx(0.1 * b[5]) for i in range(8, 12))
     assert all(b[i] == pytest.approx(b[5]) for i in (5, 6, 7, 12, 13, 14, 15))
 
@@ -289,7 +295,7 @@ def test_the_gated_far_scout_weighs_a_blockage_by_the_belief_the_ugv_sweeps_afte
                        rendezvous_slack_s=200.0)
     uav.belief.mass[:, :, 22:] = 0.0  # nothing left at x > 550: what node 11 (x = 575) holds up is empty
     m = uav.planner.searchable_mass(uav.belief)
-    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    b = _bonus(uav, _recon_value(uav, m, 0.0))
     assert 11 not in b and b[10] > 0  # node 10's next three nodes see into x < 550; node 11's see nothing
 
 
@@ -298,8 +304,36 @@ def test_the_gated_far_scout_weighs_a_road_node_by_the_chance_its_pass_makes_it_
     see = np.ones(uav.setup.grid.shape)
     see[:, :12] = 0.5  # trees over x < 300: nodes 5 (x = 275)
     uav.setup.road_detection[uav.rid] = see
-    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    b = _bonus(uav, _recon_value(uav, m, 0.0))
     assert b[5] == pytest.approx(0.5 * b[6])
+
+
+def test_the_far_scouts_road_check_does_not_count_by_its_chance_of_seeing_a_target():
+    uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0)
+    b = _bonus(uav, _recon_value(uav, m, 0.0))
+    P = uav.planner
+    P.p_air = P.p_air * 0.5  # a target is half as easy to see from the air: the road is not
+    b2 = _bonus(uav, _recon_value(uav, m * 2.0, 0.0))  # (the same average footprint: unit unchanged)
+    assert b2 == pytest.approx(b)
+
+
+def test_chain_tour_scores_extra_value_by_its_own_chance_of_seeing_it():
+    uav, m = _far()
+    P = uav.planner
+    start = end = tuple(uav.road.positions[10])
+    no_ugv, free = np.full(P.F_road.shape[1], np.inf), np.full(P.air.n_nodes, np.inf)
+    zero = np.zeros_like(m)
+    mass = np.zeros(m.shape[1])
+    c = _cell(uav, 500, 700)
+    mass[c] = 1.0
+    run = lambda see: P.chain_tour(zero, no_ugv, start, end, 2000.0, 0.0, 0.0, free, 0.0,
+                                   (mass, np.full(m.shape[1], see)))
+    _, tour, _, value = run(0.5)
+    looks = int(sum(P.F_air[n, c] > 0 for n in tour))  # tour nodes whose footprint holds the cell
+    assert looks >= 1 and value == pytest.approx(1.0 - 0.5 ** looks)  # each look sees half of what is left
+    P.p_air = P.p_air * 0.0  # the target's detection chance does not enter
+    assert run(0.5)[3] == pytest.approx(value)
+    assert run(1.0)[3] == pytest.approx(1.0)
 
 
 def test_the_far_scout_times_a_find_by_the_junction_before_the_node():

@@ -38,6 +38,10 @@ Road reconnaissance (``recon_weight``)
     ``clear`` in ``ugv_ctp_route``'s plan; ``B`` the belief the UGV's route sweeps in the
     ``recon_belief_s`` after it, over the 90th percentile of that among the window's nodes, at
     most 1 (a blockage before much belief delays the search most).
+
+    In both modes the tour scores this apart from the target's belief (``chain_tour``'s
+    ``extra``): each node's worth counts by ``V``, the chance a look makes out the road, not the
+    chance it sees a target there, and a pass leaves ``1 - V`` of it.
 Confirmation delay (``confirm_scale_s``)
     Only the UGV can end the mission, so belief counts ``τ / (τ + d)``: ``d`` is the UGV's drive
     from its route to within sensor range of the cell (to confirm a sighting there), ``τ`` is
@@ -113,29 +117,57 @@ class FarScoutUav(GreedyTourUav):
         if sender in self.setup.robots:  # what that robot has seen, from where its status says it was
             self._look(p.get("pos"), self.setup.robots[sender].sensor.range_m, p.get("hidden", ()))
 
+    def _ahead(self, t_start: float) -> np.ndarray:
+        """The road nodes the UGV's route passes during a full sortie from ``t_start``."""
+        nodes, arr = np.asarray(self.plan["nodes"], int), np.asarray(self.plan["arrive"], float)
+        return nodes[(arr >= t_start) & (arr <= t_start + self.sortie_s)]
+
     def _tour_mass(self, m: np.ndarray, t_start: float, t_land: Optional[float] = None) -> np.ndarray:
-        cfg, p = self.cfg, self.plan
-        nodes, arr = np.asarray(p["nodes"], int), np.asarray(p["arrive"], float)
-        ahead = nodes[(arr >= t_start) & (arr <= t_start + self.sortie_s)]  # the UGV's route while it is away
-        if not len(ahead) or not (cfg.near_route_m > 0 or cfg.recon_weight > 0 or cfg.confirm_scale_s > 0):
+        cfg = self.cfg
+        if not (cfg.near_route_m > 0 or cfg.confirm_scale_s > 0):
             return m
-        unit = None
-        if cfg.recon_weight > 0:  # an average footprint's belief, before any weighing
-            P = self.planner
-            v = P.F_air @ P.seen(m, P.p_air)
-            unit = float(v[v > 0].mean()) if (v > 0).any() else 0.0
+        ahead = self._ahead(t_start)
+        if not len(ahead):
+            return m
         w = np.ones(m.shape[1])
-        pos = self.road.positions
         if cfg.near_route_m > 0:
-            d, _ = cKDTree(pos[ahead]).query(self.cells)
+            d, _ = cKDTree(self.road.positions[ahead]).query(self.cells)
             w *= cfg.near_route_weight + (1.0 - cfg.near_route_weight) * np.clip(d / cfg.near_route_m, 0.0, 1.0)
         if cfg.confirm_scale_s > 0:
             w *= cfg.confirm_scale_s / (cfg.confirm_scale_s + self._confirm_s(ahead))
-        m0, m = m, m * w
-        if unit:
-            m = self._recon_gated(m, m0, nodes, arr, t_start, unit, t_land) if self.blockage is not None \
-                else self._recon(m, nodes, arr, t_start, unit, t_land)
-        return m
+        return m * w
+
+    def _tour_extra(self, m: np.ndarray, t_start: float, t_land: Optional[float] = None):
+        """Road reconnaissance (module docstring), as ``chain_tour``'s ``extra``: a row of value per
+        cell, seen with this UAV's chance of making out the road there
+        (``MissionSetup.road_detection``) rather than the target's ``p_air``."""
+        cfg = self.cfg
+        if cfg.recon_weight <= 0 or not len(self._ahead(t_start)):
+            return None
+        P = self.planner
+        v = P.F_air @ P.seen(m, P.p_air)  # an average footprint's belief, before any weighing
+        unit = float(v[v > 0].mean()) if (v > 0).any() else 0.0
+        if not unit:
+            return None
+        nodes, arr = np.asarray(self.plan["nodes"], int), np.asarray(self.plan["arrive"], float)
+        found = self._recon_gated(m, nodes, arr, t_start, t_land) if self.blockage is not None \
+            else self._recon(nodes, arr, t_start, t_land)
+        if found is None:
+            return None
+        cell, worth = found
+        g = self.setup.grid
+        see = self.setup.road_detection.get(self.rid)
+        p_see = np.ones(g.rows * g.cols) if see is None else np.asarray(see, float).ravel()
+        mass = np.zeros(g.rows * g.cols)
+        np.add.at(mass, cell, cfg.recon_weight * unit * worth)
+        return mass, p_see
+
+    def _cells(self, xy: np.ndarray):
+        """Grid (rows, cols) of the points ``xy``."""
+        g = self.setup.grid
+        cols = np.clip(((xy[:, 0] - g.origin[0]) // g.resolution).astype(int), 0, g.cols - 1)
+        rows = np.clip(((xy[:, 1] - g.origin[1]) // g.resolution).astype(int), 0, g.rows - 1)
+        return rows, cols
 
     def _window(self, nodes: np.ndarray, arr: np.ndarray, t_start: float, t_land: Optional[float]) -> np.ndarray:
         """Per route index: is the node in the reconnaissance window (``recon_window``)?"""
@@ -166,34 +198,30 @@ class FarScoutUav(GreedyTourUav):
         de, j = cKDTree(road.positions[ok]).query(self.cells)  # the cell's nearest road node, as the crow flies
         return (dr[ok[j]] + np.maximum(de - ugv.sensor.range_m, 0.0)) / ugv.speed
 
-    def _recon(self, m: np.ndarray, nodes: np.ndarray, arr: np.ndarray, t_start: float, unit: float,
-               t_land: Optional[float] = None) -> np.ndarray:
-        """Add ``recon_weight · unit`` of belief, seen from the air only, at each road node on the
-        route ahead that no robot has looked at (its cell's belief is still at the prior)."""
-        cfg = self.cfg
+    def _recon(self, nodes: np.ndarray, arr: np.ndarray, t_start: float, t_land: Optional[float] = None):
+        """The cells (and weight 1 each) of the road nodes in the window that no robot has looked
+        at (their cell's belief is still at the prior), once a blocked node is found; None if
+        there are none."""
         if not self.roads.blocked:
-            return m
+            return None
         cand = np.unique(nodes[self._window(nodes, arr, t_start, t_land)])
         cand = cand[~self.road_visited[cand]]
         if not len(cand):
-            return m
-        g = self.setup.grid
-        xy = self.road.positions[cand]
-        cols = np.clip(((xy[:, 0] - g.origin[0]) // g.resolution).astype(int), 0, g.cols - 1)
-        rows = np.clip(((xy[:, 1] - g.origin[1]) // g.resolution).astype(int), 0, g.rows - 1)
+            return None
+        rows, cols = self._cells(self.road.positions[cand])
         b = self.belief
         init = b.initial_mass.sum(0)[rows, cols]
         unseen = b.mass.sum(0)[rows, cols] > 0.9 * init  # nothing has looked at it
         if not unseen.any():
-            return m
-        m = m.copy()
-        np.add.at(m[self.planner.own_layers[0]], rows[unseen] * g.cols + cols[unseen], cfg.recon_weight * unit)
-        return m
+            return None
+        cell = rows[unseen] * self.setup.grid.cols + cols[unseen]
+        return cell, np.ones(len(cell))
 
-    def _recon_gated(self, m: np.ndarray, m0: np.ndarray, nodes: np.ndarray, arr: np.ndarray, t_start: float,
-                     unit: float, t_land: Optional[float] = None) -> np.ndarray:
-        """Add ``recon_weight · unit · H · V · G`` of belief, seen from the air only, at each road
-        node in the window (module docstring); ``m0`` is the belief before any weighing."""
+    def _recon_gated(self, m0: np.ndarray, nodes: np.ndarray, arr: np.ndarray, t_start: float,
+                     t_land: Optional[float] = None):
+        """The cells and weights ``H · G`` of the road nodes in the window (module docstring; ``V``
+        is the chance of seeing them, which ``chain_tour`` applies); ``m0`` is the belief before
+        any weighing. None if there are none."""
         cfg, g, P = self.cfg, self.setup.grid, self.planner
         idx = np.flatnonzero(self._window(nodes, arr, t_start, t_land))
         idx = idx[~self.road_visited[nodes[idx]]]
@@ -203,11 +231,8 @@ class FarScoutUav(GreedyTourUav):
         keep = p > 0
         idx, xy, p = idx[keep], xy[keep], p[keep]
         if not len(idx):
-            return m
-        cols = np.clip(((xy[:, 0] - g.origin[0]) // g.resolution).astype(int), 0, g.cols - 1)
-        rows = np.clip(((xy[:, 1] - g.origin[1]) // g.resolution).astype(int), 0, g.rows - 1)
-        see = self.setup.road_detection.get(self.rid)
-        V = np.ones(len(idx)) if see is None else see[rows, cols]
+            return None
+        rows, cols = self._cells(xy)
         # L: would its blockage send the UGV further round than the UAVs can wait, or cut it off?
         if self.detour_road is not self.road:
             self.detour_cache, self.detour_road = {}, self.road
@@ -231,8 +256,6 @@ class FarScoutUav(GreedyTourUav):
             b90 = float(np.percentile(B, 90))
             B = np.minimum(1.0, B / b90) if b90 > 0 else np.zeros(len(idx))
         G = cfg.recon_floor + (1.0 - cfg.recon_floor) * np.maximum(L, B)
-        bonus = cfg.recon_weight * unit * (p / max(cfg.block_prior, 1e-9)) * V * G
+        worth = (p / max(cfg.block_prior, 1e-9)) * G
         cell, k = np.unique(rows * g.cols + cols, return_index=True)  # one node per cell
-        m = m.copy()
-        np.add.at(m[P.own_layers[0]], cell, bonus[k])
-        return m
+        return cell, worth[k]

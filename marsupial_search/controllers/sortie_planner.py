@@ -199,14 +199,16 @@ class SortiePlanner:
         return lambda length, value: (ugv_value + value) / (overhead + max(tau, length / v))
 
     def chain_tour(self, m, t_ugv: np.ndarray, start, end, L_max: float, tau: float, ugv_value: float,
-                   claim_eta: np.ndarray, t_off: float):
+                   claim_eta: np.ndarray, t_off: float, extra=None):
         """Greedy tour from ``start`` to ``end``: the next node has the best ``belief /
         (distance + offset)`` among those that leave enough range to reach ``end``. Collects
         the most belief early, which matters for time to find. Belief in layers both robots see
         counts for the UAV only in cells it reaches before the UGV route sweeps them (``t_ugv``);
         the team value drops what both would sweep. ``claim_eta``: per UAV-grid node, when another UAV
-        reaches it (inf: unclaimed, -inf: claimed outright). Returns (rate, nodes, length, value),
-        or None if ``end`` is out of range."""
+        reaches it (inf: unclaimed, -inf: claimed outright). ``extra``: an optional ``(mass,
+        p_see)`` pair of per-cell rows, value only this UAV collects with its own chance of seeing
+        it (not the target's ``p_air``): worth ``mass · p_see``, and a look leaves ``mass · (1 -
+        p_see)``. Returns (rate, nodes, length, value), or None if ``end`` is out of range."""
         cfg, v = self.cfg, self.uav.speed
         L0 = dist(start, end)
         if L_max < L0:
@@ -214,6 +216,9 @@ class SortiePlanner:
         rate = self._rate(tau, ugv_value)
         own, common = m[self.own_layers], m[self.common_layers]  # per layer: (layers, cells)
         p_own, p_com = self.p_air[self.own_layers], self.p_air[self.common_layers]
+        if extra is not None:  # one more row seen by this UAV only, with its own detection chance
+            own = np.vstack([own, np.asarray(extra[0], float)[None]])
+            p_own = np.vstack([p_own, np.asarray(extra[1], float)[None]])
         p_both = p_com * self.p_ugv[self.common_layers]  # swept by both: counted twice
         t_ugv = np.where(t_ugv <= tau, t_ugv, np.inf)  # the UGV stops at k
         value = self.F_air @ ((own * p_own).sum(0) + (common * p_com).sum(0))
