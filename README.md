@@ -174,6 +174,10 @@ The robots get what this means for their sensors, not the occlusion itself:
 * `MissionSetup.detection`: per robot, layer and cell, the chance a look by its sensor detects
   the target, which the planners weigh belief by (the belief updates after a look already carry
   the simulator's probabilities);
+* `MissionSetup.road_detection`: per robot and cell, the chance a look by its sensor makes out a
+  road node there (`1 − canopy`, times the street term in town, from the air; 1 from the ground).
+  Not the target class's: a road is no harder to see for the target being a person
+  (`uav_far_scout`'s gated road reconnaissance weighs each node by it);
 * `TraversabilityUpdate.hidden`: the prior-map road nodes in a robot's range now that its look
   cannot make out. A robot passes them on in its `"status"`, and the UGV, which counts the road
   nodes in a robot's range as seen open unless it reports a blockage, leaves those out: they

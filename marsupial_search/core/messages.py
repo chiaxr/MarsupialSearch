@@ -171,6 +171,10 @@ class MissionSetup:
     # Per robot, shape (N_LAYERS, H, W): the chance a look by its sensor detects the target there, as
     # the environment knows it (e.g. with what hides it). A robot not in it: ``layer_p()`` everywhere.
     detection: dict[str, np.ndarray] = field(default_factory=dict)
+    # Per robot, shape (H, W): the chance a look by its sensor makes out a road node there (whether it
+    # is blocked), as the environment knows it (less under trees or deep in a street, from the air).
+    # A robot not in it: 1 everywhere.
+    road_detection: dict[str, np.ndarray] = field(default_factory=dict)
     # Per robot whose sightings may be false or off (a UAV flying high): how (SightingModel). Its sightings
     # come as LocalBeliefUpdate.sightings. A robot not in it: a sighting is certain (``detected``).
     sightings: dict[str, SightingModel] = field(default_factory=dict)

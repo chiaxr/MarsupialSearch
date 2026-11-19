@@ -79,7 +79,7 @@ from .radio import _STAT_KEYS as _RADIO_STAT_KEYS
 from .radio import RadioChannel, RadioConfig
 from .scenario import Scenario
 from .false_alarms import SightingBelief, air_detection, draw_score, sighting_model, sights_wrongly
-from .visibility import detection_map, road_observability
+from .visibility import detection_map, road_detection_map, road_observability
 
 _EPS = 1e-9
 _SIGHTING_KEYS = ("sightings_target", "sightings_decoy", "sightings_clutter")  # per robot with false sightings
@@ -309,6 +309,8 @@ class Simulator:
         self.setup: MissionSetup = dataclasses.replace(
             scenario.mission_setup(self.config.dt), radio_range_m=ranges, confirmers=confirmers,
             confirm_test=self.config.confirm_test, detection={rid: p.copy() for rid, p in self._detection.items()},
+            road_detection={rid: road_detection_map(spec, scenario.terrain, scenario.occlusion)
+                            for rid, spec in scenario.robots.items()},
             sightings=assumed)
         self.reset()
 

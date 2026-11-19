@@ -80,10 +80,21 @@ def detection_map(spec: RobotSpec, terrain: np.ndarray, occlusion: Optional[Occl
     return p
 
 
+def road_detection_map(spec: RobotSpec, terrain: np.ndarray, occlusion: Optional[Occlusion]) -> np.ndarray:
+    """Per cell, shape (H, W): the chance a look by ``spec``'s sensor makes out a road node there
+    (whether it is blocked, or that a road is there). From the air: not under the trees, and in a
+    town only from near overhead; from the ground: always. Not the target class's: a road is no
+    harder to see for the target being a person."""
+    if occlusion is None or viewpoint(spec) == GROUND:
+        return np.ones(terrain.shape)
+    urban = terrain == int(Terrain.URBAN)
+    return (1.0 - occlusion.canopy) * np.where(urban, street_visibility(occlusion.canyon), 1.0)
+
+
 def road_observability(spec: RobotSpec, grid: GridSpec, terrain: np.ndarray, occlusion: Optional[Occlusion],
                        xy: np.ndarray) -> np.ndarray:
     """Per point of ``xy`` (n, 2), a road node: the chance a look by ``spec``'s sensor sees whether
-    it is blocked (or that a road is there)."""
+    it is blocked (or that a road is there): ``road_detection_map`` at its cell."""
     xy = np.asarray(xy, dtype=float).reshape(-1, 2)
     if occlusion is None or viewpoint(spec) == GROUND or not len(xy):
         return np.ones(len(xy))
@@ -91,6 +102,4 @@ def road_observability(spec: RobotSpec, grid: GridSpec, terrain: np.ndarray, occ
     xy = np.where(known[:, None], xy, grid.origin)
     cols = np.clip(((xy[:, 0] - grid.origin[0]) // grid.resolution).astype(int), 0, grid.cols - 1)
     rows = np.clip(((xy[:, 1] - grid.origin[1]) // grid.resolution).astype(int), 0, grid.rows - 1)
-    o = 1.0 - occlusion.canopy[rows, cols]
-    urban = terrain[rows, cols] == int(Terrain.URBAN)
-    return np.where(known, o * np.where(urban, street_visibility(occlusion.canyon[rows, cols]), 1.0), 0.0)
+    return np.where(known, road_detection_map(spec, terrain, occlusion)[rows, cols], 0.0)

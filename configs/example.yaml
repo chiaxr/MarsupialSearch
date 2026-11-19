@@ -178,6 +178,12 @@ controller_params:
     recon_window: takeoff          # takeoff: the window above | landing: by when the UGV hears of a find (when this UAV lands) ...
     recon_react_s: 60.0            # landing: ... the UGV reaches the junction before the node this long after the landing ...
     recon_horizon_s: 0.0           # ... to this long (0: one full sortie)
+    recon_mode: flat               # flat: as above | gated: from the start, by the chance a node is blocked, seen, and what its blockage would cost
+    recon_floor: 0.1               # gated: the weight of a node whose blockage breaks no landing and holds up little belief
+    recon_belief_s: 600.0          # gated: the belief the UGV's route sweeps this long after a node counts toward its weight (0: off)
+    block_prior: 0.05              # gated: prior share of road nodes blocked ...
+    block_prior_weight: 20.0       # ... worth this many road nodes seen
+    max_cutoff_fraction: 0.0       # gated: blockages cut off at most this share of the mapped road nodes (the generator's road_cutoff_fraction)
     confirm_scale_s: 0.0           # τ: belief counts τ / (τ + the UGV's drive to confirm a sighting there) (no gain found)
   uav_near_scout:                  # the UAV side of the booking, as uav_greedy_tour, plus its calls
     # shared search settings

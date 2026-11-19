@@ -26,6 +26,18 @@ Road reconnaissance (``recon_weight``)
     finds when it lands. A road node then counts only if the UGV reaches the last junction before
     it on its route (where it can still turn off) from ``recon_react_s`` to ``recon_horizon_s``
     after the landing (0: one full sortie, after which the next sortie can look).
+
+    With ``recon_mode: gated`` (after the gated rewards of Oerlemans, Shi and Popović, arXiv
+    2606.12306, which beat additive ones), each road node in that window counts from the start,
+    by how much seeing it first is worth: ``recon_weight · H · V · G`` footprints, where
+    ``H = p / block_prior`` (``p`` the chance it is blocked, from its own ``ctp.BlockageModel``:
+    0 once any robot has seen it), ``V`` the chance its pass makes the node out
+    (``MissionSetup.road_detection``), and ``G = recon_floor + (1 - recon_floor) · max(L, B)``
+    what a blockage there would cost: ``L`` 1 if it would send the UGV further round than the UAVs
+    can wait at a landing (``rendezvous_slack_s + hover_margin_s`` of driving), or cut it off, as
+    ``clear`` in ``ugv_ctp_route``'s plan; ``B`` the belief the UGV's route sweeps in the
+    ``recon_belief_s`` after it, over the 90th percentile of that among the window's nodes, at
+    most 1 (a blockage before much belief delays the search most).
 Confirmation delay (``confirm_scale_s``)
     Only the UGV can end the mission, so belief counts ``τ / (τ + d)``: ``d`` is the UGV's drive
     from its route to within sensor range of the cell (to confirm a sighting there), ``τ`` is
@@ -41,8 +53,9 @@ import numpy as np
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
-from marsupial_search.core import MissionSetup
+from marsupial_search.core import MissionSetup, RobotObservation, RobotState
 
+from .ctp import BlockageModel, clear_probabilities
 from .dock_booking import BookingUavConfig
 from .uav_greedy_tour import GreedyTourUav
 
@@ -57,6 +70,12 @@ class FarScoutUavConfig(BookingUavConfig):
     recon_window: str = "takeoff"  # takeoff: the window above | landing: by when the UGV hears of a find (at landing) ...
     recon_react_s: float = 60.0  # landing: ... the UGV reaches the junction before the node this long after the landing ...
     recon_horizon_s: float = 0.0  # ... to this long (0: one full sortie)
+    recon_mode: str = "flat"  # flat: as above | gated: from the start, by the chance a node is blocked, seen, and what its blockage would cost
+    recon_floor: float = 0.1  # gated: the weight of a node whose blockage breaks no landing and holds up little belief
+    recon_belief_s: float = 600.0  # gated: the belief the UGV's route sweeps this long after a node counts toward its weight (0: off)
+    block_prior: float = 0.05  # gated: prior share of road nodes blocked ...
+    block_prior_weight: float = 20.0  # ... worth this many road nodes seen
+    max_cutoff_fraction: float = 0.0  # gated: blockages cut off at most this share of the mapped road nodes (as the UGV's)
     confirm_scale_s: float = 0.0  # τ: belief counts τ / (τ + the UGV's drive to confirm a sighting there) (0: off)
 
 
@@ -70,8 +89,29 @@ class FarScoutUav(GreedyTourUav):
         self.cells = np.stack([X.ravel(), Y.ravel()], axis=1)
         e = self.spec.energy  # a full sortie: how long the UGV drives while it is away
         self.sortie_s = max(self.planner.energy_budget(e.capacity), 0.0) / (e.idle_power + e.energy_per_m * self.spec.speed)
-        if self.cfg.recon_window not in ("takeoff", "landing"):
-            raise ValueError(f"recon_window must be takeoff or landing, not {self.cfg.recon_window!r}")
+        cfg = self.cfg
+        if cfg.recon_window not in ("takeoff", "landing"):
+            raise ValueError(f"recon_window must be takeoff or landing, not {cfg.recon_window!r}")
+        if cfg.recon_mode not in ("flat", "gated"):
+            raise ValueError(f"recon_mode must be flat or gated, not {cfg.recon_mode!r}")
+        self.blockage = BlockageModel(self.roads, cfg.block_prior, cfg.block_prior_weight, cfg.max_cutoff_fraction) \
+            if cfg.recon_weight > 0 and cfg.recon_mode == "gated" else None
+        self.detour_cache: dict = {}  # (prev, node, next) -> would its blockage send the UGV the long way round?
+        self.detour_road = None  # the road map detour_cache is for
+
+    def _look(self, xy, radius: float, hidden=()) -> None:
+        """A robot at ``xy`` saw the road nodes within ``radius``, but those it could not make out."""
+        if self.blockage is not None and xy is not None:
+            self.blockage.look(self.road, xy, radius - 1.0, hidden)  # (a margin for where it was when it looked)
+
+    def _step(self, s: RobotState, now: float, obs: RobotObservation, cmds: list) -> None:
+        self._look(s.position, self.spec.sensor.range_m, self.hidden)
+        super()._step(s, now, obs, cmds)
+
+    def _ingest(self, sender: str, p: dict, t: float) -> None:
+        super()._ingest(sender, p, t)
+        if sender in self.setup.robots:  # what that robot has seen, from where its status says it was
+            self._look(p.get("pos"), self.setup.robots[sender].sensor.range_m, p.get("hidden", ()))
 
     def _tour_mass(self, m: np.ndarray, t_start: float, t_land: Optional[float] = None) -> np.ndarray:
         cfg, p = self.cfg, self.plan
@@ -91,10 +131,20 @@ class FarScoutUav(GreedyTourUav):
             w *= cfg.near_route_weight + (1.0 - cfg.near_route_weight) * np.clip(d / cfg.near_route_m, 0.0, 1.0)
         if cfg.confirm_scale_s > 0:
             w *= cfg.confirm_scale_s / (cfg.confirm_scale_s + self._confirm_s(ahead))
-        m = m * w
+        m0, m = m, m * w
         if unit:
-            m = self._recon(m, nodes, arr, t_start, unit, t_land)
+            m = self._recon_gated(m, m0, nodes, arr, t_start, unit, t_land) if self.blockage is not None \
+                else self._recon(m, nodes, arr, t_start, unit, t_land)
         return m
+
+    def _window(self, nodes: np.ndarray, arr: np.ndarray, t_start: float, t_land: Optional[float]) -> np.ndarray:
+        """Per route index: is the node in the reconnaissance window (``recon_window``)?"""
+        cfg = self.cfg
+        if cfg.recon_window == "landing" and t_land is not None:
+            d = self._decide_times(nodes, arr)
+            horizon = cfg.recon_horizon_s if cfg.recon_horizon_s > 0 else self.sortie_s
+            return (arr >= t_start) & (d >= t_land + cfg.recon_react_s) & (d <= t_land + horizon)
+        return (arr >= t_start + cfg.recon_from_s) & (arr <= t_start + cfg.recon_to_s)
 
     def _decide_times(self, nodes: np.ndarray, arr: np.ndarray) -> np.ndarray:
         """Per route index: when the UGV reaches the last junction before it on the route (three
@@ -123,13 +173,7 @@ class FarScoutUav(GreedyTourUav):
         cfg = self.cfg
         if not self.roads.blocked:
             return m
-        if cfg.recon_window == "landing" and t_land is not None:
-            d = self._decide_times(nodes, arr)
-            horizon = cfg.recon_horizon_s if cfg.recon_horizon_s > 0 else self.sortie_s
-            win = (arr >= t_start) & (d >= t_land + cfg.recon_react_s) & (d <= t_land + horizon)
-        else:
-            win = (arr >= t_start + cfg.recon_from_s) & (arr <= t_start + cfg.recon_to_s)
-        cand = np.unique(nodes[win])
+        cand = np.unique(nodes[self._window(nodes, arr, t_start, t_land)])
         cand = cand[~self.road_visited[cand]]
         if not len(cand):
             return m
@@ -144,4 +188,51 @@ class FarScoutUav(GreedyTourUav):
             return m
         m = m.copy()
         np.add.at(m[self.planner.own_layers[0]], rows[unseen] * g.cols + cols[unseen], cfg.recon_weight * unit)
+        return m
+
+    def _recon_gated(self, m: np.ndarray, m0: np.ndarray, nodes: np.ndarray, arr: np.ndarray, t_start: float,
+                     unit: float, t_land: Optional[float] = None) -> np.ndarray:
+        """Add ``recon_weight · unit · H · V · G`` of belief, seen from the air only, at each road
+        node in the window (module docstring); ``m0`` is the belief before any weighing."""
+        cfg, g, P = self.cfg, self.setup.grid, self.planner
+        idx = np.flatnonzero(self._window(nodes, arr, t_start, t_land))
+        idx = idx[~self.road_visited[nodes[idx]]]
+        xy = self.road.positions[nodes[idx]]
+        idx, xy = idx[np.isfinite(xy).all(1)], xy[np.isfinite(xy).all(1)]
+        p = self.blockage.probabilities(self.road)[nodes[idx]]
+        keep = p > 0
+        idx, xy, p = idx[keep], xy[keep], p[keep]
+        if not len(idx):
+            return m
+        cols = np.clip(((xy[:, 0] - g.origin[0]) // g.resolution).astype(int), 0, g.cols - 1)
+        rows = np.clip(((xy[:, 1] - g.origin[1]) // g.resolution).astype(int), 0, g.rows - 1)
+        see = self.setup.road_detection.get(self.rid)
+        V = np.ones(len(idx)) if see is None else see[rows, cols]
+        # L: would its blockage send the UGV further round than the UAVs can wait, or cut it off?
+        if self.detour_road is not self.road:
+            self.detour_cache, self.detour_road = {}, self.road
+        slack_m = (cfg.rendezvous_slack_s + cfg.hover_margin_s) * self.setup.robots[self.ugv].speed
+        q = np.zeros(self.road.n_nodes)
+        q[nodes[idx]] = 1.0  # clear_probabilities with p = 1 here: 0 from the first long detour on
+        L = np.zeros(len(idx))
+        for k, i in enumerate(idx):
+            if 0 < i < len(nodes) - 1:  # one at a time, each against its neighbours on the route
+                L[k] = float(clear_probabilities(self.road, nodes[i - 1:i + 2], q, slack_m, self.detour_cache)[1] == 0.0)
+        # B: the belief the UGV's route sweeps in the recon_belief_s after it, over the window's 90th percentile
+        B = np.zeros(len(idx))
+        if cfg.recon_belief_s > 0 and P.F_road.shape[0] == self.road.n_nodes:
+            v = P.F_road @ P.seen(m0, P.p_ugv)  # per road node: the belief a UGV look there sweeps
+            first = np.zeros(len(nodes), dtype=bool)
+            first[np.unique(nodes, return_index=True)[1]] = True  # a node met twice on the route sweeps once
+            s = np.where(first, v[nodes], 0.0)
+            cs = np.concatenate([[0.0], np.cumsum(s)])
+            end = np.searchsorted(np.maximum.accumulate(arr), arr[idx] + cfg.recon_belief_s, side="right")
+            B = cs[end] - cs[idx + 1]
+            b90 = float(np.percentile(B, 90))
+            B = np.minimum(1.0, B / b90) if b90 > 0 else np.zeros(len(idx))
+        G = cfg.recon_floor + (1.0 - cfg.recon_floor) * np.maximum(L, B)
+        bonus = cfg.recon_weight * unit * (p / max(cfg.block_prior, 1e-9)) * V * G
+        cell, k = np.unique(rows * g.cols + cols, return_index=True)  # one node per cell
+        m = m.copy()
+        np.add.at(m[P.own_layers[0]], cell, bonus[k])
         return m

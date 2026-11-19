@@ -237,6 +237,71 @@ def test_the_far_scout_checks_the_road_the_ugv_reaches_after_it_lands():
     assert bumped == set(range(12, 20))
 
 
+def _far_loop(**cfg):
+    """``_far`` on the line map with a loop: a road from node 7 (x = 375) up to y = 600, along it
+    and back down to node 12 (x = 625), so a blockage at nodes 8-11 costs a 500 m detour; any
+    other node cuts the road. The UGV's plan is the line, node i at 10 i s."""
+    from marsupial_search.controllers.uav_far_scout import FarScoutUav, FarScoutUavConfig
+    sc = make_line_scenario(n_uav=2)
+    line = sc.graphs[RobotType.UGV]
+    up = np.stack([np.arange(375.0, 626.0, 50.0), np.full(6, 600.0)], 1)  # nodes 20-25
+    edges = np.concatenate([line.edges, [[7, 20]], np.stack([np.arange(20, 25), np.arange(21, 26)], 1), [[25, 12]]])
+    road = TraversabilityGraph(np.concatenate([line.positions, up]), edges, "road")
+    sim = Simulator(dataclasses.replace(sc, graphs={**sc.graphs, RobotType.UGV: road}), SimConfig())
+    uav = FarScoutUav(FarScoutUavConfig(near_route_m=0.0, recon_weight=2.0, recon_mode="gated",
+                                        max_cutoff_fraction=1.0, **cfg))
+    uav.reset("uav1", sim.setup)
+    uav.plan = {"nodes": list(range(20)), "arrive": [10.0 * i for i in range(20)], "cur": 0}
+    return uav, uav.planner.searchable_mass(uav.belief)
+
+
+def _bonus(uav, m, out):
+    """Per line node: the belief the reconnaissance added in its cell."""
+    extra = (out - m).sum(0)
+    return {int(np.argmin(np.hypot(*(uav.road.positions[:20] - uav.cells[c]).T))): float(extra[c])
+            for c in np.flatnonzero(extra)}
+
+
+def test_the_gated_far_scout_weighs_road_nodes_from_the_start_by_their_chance_of_being_blocked():
+    uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0)  # nodes 5-15
+    b = _bonus(uav, m, uav._tour_mass(m, 0.0))  # no blocked node found yet: it counts already
+    assert set(b) == set(range(5, 16))
+    uav._look(uav.road.positions[13], 30.0)  # a robot saw node 13 open
+    b2 = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    assert 13 not in b2 and b2[5] < b[5]  # seen: nothing; and one more node seen open lowers the blocked rate
+
+
+def test_the_gated_far_scout_weighs_less_a_blockage_the_ugv_can_drive_round_in_time():
+    # slack (60 + 30) s at 5 m/s = 450 m < the 500 m detour round nodes 8-11: every node breaks a landing
+    uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0, recon_floor=0.1)
+    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    assert all(b[i] == pytest.approx(b[5]) for i in range(5, 16))
+    # (200 + 30) s = 1150 m: the loop is a short enough way round, so nodes 8-11 get the floor
+    uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0, recon_floor=0.1,
+                       rendezvous_slack_s=200.0)
+    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    assert all(b[i] == pytest.approx(0.1 * b[5]) for i in range(8, 12))
+    assert all(b[i] == pytest.approx(b[5]) for i in (5, 6, 7, 12, 13, 14, 15))
+
+
+def test_the_gated_far_scout_weighs_a_blockage_by_the_belief_the_ugv_sweeps_after_it():
+    uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=30.0, recon_floor=0.0,
+                       rendezvous_slack_s=200.0)
+    uav.belief.mass[:, :, 22:] = 0.0  # nothing left at x > 550: what node 11 (x = 575) holds up is empty
+    m = uav.planner.searchable_mass(uav.belief)
+    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    assert 11 not in b and b[10] > 0  # node 10's next three nodes see into x < 550; node 11's see nothing
+
+
+def test_the_gated_far_scout_weighs_a_road_node_by_the_chance_its_pass_makes_it_out():
+    uav, m = _far_loop(recon_from_s=50.0, recon_to_s=150.0, recon_belief_s=0.0)
+    see = np.ones(uav.setup.grid.shape)
+    see[:, :12] = 0.5  # trees over x < 300: nodes 5 (x = 275)
+    uav.setup.road_detection[uav.rid] = see
+    b = _bonus(uav, m, uav._tour_mass(m, 0.0))
+    assert b[5] == pytest.approx(0.5 * b[6])
+
+
 def test_the_far_scout_times_a_find_by_the_junction_before_the_node():
     import types
     from scipy.sparse import csr_matrix
