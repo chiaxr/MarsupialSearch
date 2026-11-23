@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 340" width="920" height="340" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#1f2937">
+  <defs>
+    <marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+    <marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker>
+    <marker id="arrK" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b5563"/></marker>
+  </defs>
+  <rect x="0" y="0" width="920" height="340" rx="10" fill="#ffffff"/>
+
+  <!-- pin -->
+  <line x1="620" y1="40" x2="620" y2="262" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="620" y="30" text-anchor="middle" font-weight="bold">pin</text>
+  <text x="626" y="52" font-size="12" fill="#4b5563">last promised stop</text>
+
+  <!-- UAV B: previous sortie, landing at 280 -->
+  <polyline points="20,120 70,165 130,150 190,172 240,160 280,200" fill="none" stroke="#d97706" stroke-width="2.5" marker-end="url(#arrB)"/>
+  <g fill="#d97706"><circle cx="70" cy="165" r="3.5"/><circle cx="130" cy="150" r="3.5"/><circle cx="190" cy="172" r="3.5"/><circle cx="240" cy="160" r="3.5"/></g>
+  <text x="36" y="108" fill="#b45309" font-weight="bold">UAV B</text>
+
+  <!-- UAV A: sortie from 70 to 560 -->
+  <polyline points="70,200 110,120 190,82 270,128 350,64 440,100 510,72 560,200" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrA)"/>
+  <g fill="#2563eb"><circle cx="110" cy="120" r="3.5"/><circle cx="190" cy="82" r="3.5"/><circle cx="270" cy="128" r="3.5"/><circle cx="350" cy="64" r="3.5"/><circle cx="440" cy="100" r="3.5"/><circle cx="510" cy="72" r="3.5"/></g>
+  <text x="350" y="46" text-anchor="middle" fill="#1d4ed8"><tspan font-weight="bold">UAV A</tspan>: its tour, then lands at the agreed node</text>
+
+  <!-- UAV B: booking requested, lands after the pin -->
+  <polyline points="340,200 420,152 520,166 620,140 720,162 790,140 840,200" fill="none" stroke="#d97706" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#arrB)"/>
+  <g fill="#d97706"><circle cx="420" cy="152" r="3.5"/><circle cx="520" cy="166" r="3.5"/><circle cx="620" cy="140" r="3.5"/><circle cx="720" cy="162" r="3.5"/><circle cx="790" cy="140" r="3.5"/></g>
+  <text x="770" y="118" text-anchor="middle" fill="#b45309">B's next booking: lands after the pin</text>
+
+  <!-- road: fixed up to the pin, re-planned after -->
+  <line x1="20" y1="200" x2="620" y2="200" stroke="#374151" stroke-width="4"/>
+  <line x1="620" y1="200" x2="900" y2="200" stroke="#374151" stroke-width="4" stroke-dasharray="10 6"/>
+  <g fill="#ffffff" stroke="#374151" stroke-width="1.5">
+    <circle cx="40" cy="200" r="3.5"/><circle cx="70" cy="200" r="3.5"/><circle cx="100" cy="200" r="3.5"/><circle cx="130" cy="200" r="3.5"/><circle cx="160" cy="200" r="3.5"/><circle cx="190" cy="200" r="3.5"/><circle cx="220" cy="200" r="3.5"/><circle cx="250" cy="200" r="3.5"/><circle cx="280" cy="200" r="3.5"/><circle cx="310" cy="200" r="3.5"/><circle cx="340" cy="200" r="3.5"/><circle cx="370" cy="200" r="3.5"/><circle cx="400" cy="200" r="3.5"/><circle cx="430" cy="200" r="3.5"/><circle cx="460" cy="200" r="3.5"/><circle cx="490" cy="200" r="3.5"/><circle cx="520" cy="200" r="3.5"/><circle cx="550" cy="200" r="3.5"/><circle cx="580" cy="200" r="3.5"/><circle cx="610" cy="200" r="3.5"/><circle cx="640" cy="200" r="3.5"/><circle cx="670" cy="200" r="3.5"/><circle cx="700" cy="200" r="3.5"/><circle cx="730" cy="200" r="3.5"/><circle cx="760" cy="200" r="3.5"/><circle cx="790" cy="200" r="3.5"/><circle cx="820" cy="200" r="3.5"/><circle cx="850" cy="200" r="3.5"/><circle cx="880" cy="200" r="3.5"/>
+  </g>
+  <!-- UGV -->
+  <rect x="136" y="191" width="30" height="18" rx="4" fill="#111827"/>
+  <text x="151" y="226" text-anchor="middle" font-weight="bold">UGV</text>
+  <text x="420" y="226" text-anchor="middle" font-size="12" fill="#4b5563">route fixed up to the pin</text>
+  <text x="760" y="226" text-anchor="middle" font-size="12" fill="#4b5563">re-planned every 60 s</text>
+
+  <!-- dock occupancy -->
+  <text x="450" y="252" text-anchor="middle" font-size="12" font-style="italic" fill="#6b7280">dock: one UAV at a time</text>
+  <rect x="10" y="238" width="60" height="18" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="40" y="251" text-anchor="middle" font-size="12">A</text>
+  <rect x="280" y="238" width="60" height="18" fill="#fef3c7" stroke="#d97706"/>
+  <text x="310" y="251" text-anchor="middle" font-size="12">B</text>
+  <rect x="560" y="238" width="60" height="18" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="590" y="251" text-anchor="middle" font-size="12">A</text>
+  <rect x="840" y="238" width="60" height="18" fill="#fef3c7" stroke="#d97706" stroke-dasharray="4 3"/>
+  <text x="870" y="251" text-anchor="middle" font-size="12">B?</text>
+  <text x="590" y="274" text-anchor="middle" font-size="12">R</text>
+  <text x="310" y="274" text-anchor="middle" font-size="11" fill="#4b5563">land · swap · take off</text>
+
+  <!-- slot spacing -->
+  <line x1="282" y1="298" x2="558" y2="298" stroke="#4b5563" stroke-width="1.5" marker-start="url(#arrK)" marker-end="url(#arrK)"/>
+  <text x="420" y="292" text-anchor="middle" font-style="italic">s</text>
+  <line x1="562" y1="298" x2="838" y2="298" stroke="#4b5563" stroke-width="1.5" marker-start="url(#arrK)" marker-end="url(#arrK)"/>
+  <text x="700" y="292" text-anchor="middle" font-style="italic">s</text>
+  <text x="20" y="328" font-size="12" fill="#4b5563">landings a slot s apart; with two UAVs, one sortie S plus one stay R is two slots</text>
+  <text x="900" y="328" text-anchor="end" font-size="12" fill="#4b5563">route index (UGV's arrival time) →</text>
+</svg>

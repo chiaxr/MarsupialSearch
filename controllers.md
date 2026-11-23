@@ -31,18 +31,39 @@ planners weigh each cell's belief by it (`SortiePlanner.p_ugv` and `p_air` are p
 cell). The controllers never see the occlusion itself. Only the UGV can
 end the mission, so a UAV sighting is worth something only once the UGV drives over to confirm it,
 unless the near scout's own sighting ends it (`sim.confirm_by: [uav0]`): then it can verify a
-sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*). A UAV flying high may
-sight things that are not the target ([False sightings](README.md#13-visibility-layers-urban-needs-both-robot-types)):
-its sighting raises the belief near it, by how rare false sightings are there and how much its
-detector score is like the target's, and a pass that misses it lowers it again. A controller
-pursues a sighting (its *lead*, `common.Lead`) only while the belief makes the target likely near
-it (`BeliefMap.lead_chance`): once that chance reaches `lead_pursue_p` (0.5), until it falls below
-`lead_drop_p` (0.1), or until it has no try left at it (its passes and verify flights made: it
-lets the lead go, `Lead.spend`, and takes it up again only on a new sighting near it). Below
-that, the search gets to it, or not, as the belief says, as it does any belief. With
-`sim.sighting_belief.mode: cue` a sighting raises nothing: each is a lead in turn, until the looks
-of robots that never sight wrongly have ruled out the target near it, where they can detect it. A sighting
-by a robot that never sights wrongly is a lead for good.
+sighting the UGV cannot reach (`ugv_timed_route`, *verifying a sighting*).
+
+**Leads.** A UAV flying high may sight things that are not the target
+([False sightings](README.md#13-visibility-layers-urban-needs-both-robot-types)): its sighting
+raises the belief near it, by how rare false sightings are there and how much its detector score
+is like the target's, and a pass that misses it lowers it again. A controller pursues one sighting
+at a time (its *lead*, `common.Lead`: the one most likely to be the target), and only while the
+belief makes the target likely near it (`BeliefMap.lead_chance`). With
+`sim.sighting_belief.mode: cue` a sighting raises nothing: its chance is that it is still
+unchecked, until the looks of robots that never sight wrongly have ruled out the target near it,
+where they can detect it.
+
+```mermaid
+stateDiagram-v2
+    state "In the belief only" as Belief
+    state "Pursued (the lead)" as Lead
+    state "Let go" as Spent
+    state "Certain (a lead for good)" as Hard
+
+    [*] --> Belief : sighted
+    Belief --> Lead : chance near it ≥ lead_pursue_p (0.5)
+    Lead --> Belief : looks that miss it bring it below lead_drop_p (0.1)
+    Lead --> Spent : no try left (passes and verify flights made)
+    Spent --> Belief : a new sighting near it
+    [*] --> Hard : sighted by a robot that never sights wrongly
+    Lead --> [*] : confirmed
+    Hard --> [*] : confirmed
+```
+
+*In the belief only*, the search gets to it, or not, as the belief says, as it does any belief.
+*Pursued*, the controllers drive and fly to it (`ugv_timed_route`'s *sightings*, *passes* and
+*verifying a sighting*). *Let go* (`Lead.spend`) is for a look that may miss: it can leave the
+chance above 0.1 for good, and a lead held with nothing left to do would block the next one.
 
 **What constrains them.** The dock shapes every plan. A UAV that is not docked has nowhere to wait
 except in the air, and a stay on the dock takes landing + swap + take-off (about 3 min), during
@@ -59,6 +80,15 @@ route, and each UAV picks its own stretch of that route and plans its tour on it
 node k agreed before take-off (Murray and Chu's flying sidekick TSP, with an orienteering
 objective). Because the landing point and time are fixed in advance, **a sortie needs no radio in
 flight**.
+
+![Two UAVs booking landings on the UGV's route: UAV A flies its tour from one road node to a later one, B has booked a landing after the pin, and the landings on the dock are a slot apart](docs/media/dock_booking_sorties.svg)
+
+The route the UGV has committed to, read left to right in route index (and so in its arrival
+time). Each UAV's sortie takes off from one road node and lands at a later one, after its tour;
+each stay on the dock (land, swap, take off) is a pair of stops the UGV has promised. The route up
+to the *pin*, the last promised stop, never changes; after it the UGV keeps re-planning, and the
+next booking must land there. Landings come a slot apart (see
+[`uav_greedy_tour`](#uav_greedy_tour)).
 
 1. **The UGV commits to a route.** Positions along it are *route indices*, and the UGV broadcasts
    the route with its arrival time at each one.
@@ -153,22 +183,54 @@ against 22 with `ugv_ctp_route`).
 
 **Standby UAVs.** A UAV whose status says `standby` (`uav_near_scout`) does not book sorties of its
 own: it stays on the dock until the UGV *calls* it, with a take-off stop marked as a call in the
-plan (`calls`). The UGV calls it in three cases:
+plan (`calls`). The UGV calls it in four cases:
+
+```mermaid
+flowchart LR
+    R1["Another UAV is about to land<br/>(the dock takes one UAV)"] --> C1["<b>Make room</b><br/>take-off timed to end<br/>just as it lands"]
+    R2["The route runs into a blocked node<br/>within call_radius_m (250 m), cutting off<br/>enough belief; its battery swapped"] --> C2["<b>Scout a blockage</b><br/>search round the<br/>cut-off road nodes"]
+    R3["A UAV out of touch that the UGV can<br/>no longer meet where it waits<br/>(messenger, with relay)"] --> C3["<b>Messenger</b><br/>fly to that UAV and<br/>wait to hear it"]
+    R4["A lead the UGV cannot get within<br/>sensor range of on its roads<br/>(verify, the near scout a confirmer)"] --> C4["<b>Verify a sighting</b><br/>fly to the sighting"]
+    C1 --> L1["Leaves either way,<br/>books its landing in the air"]
+    C2 --> B{"Landing booked within<br/>call_timeout_s (15 s)?"}
+    C3 --> B
+    C4 --> B
+    B -->|yes| T["Takes off"]
+    B -->|no| W["Call withdrawn<br/>(messenger, verify: not repeated there)"]
+```
 
 - *To make room.* Another UAV is about to land while it is on the dock (the dock takes one UAV):
   its take-off goes right before that landing, timed to end just as the other UAV lands. It leaves
   whether or not its own landing is booked.
 - *To search what a blockage cuts off.* The UGV's route runs into a blocked node within
-  `call_radius_m` (250 m) of the UGV. The road nodes it *cuts off* are those within `call_reach_m`
-  (500 m) of the UGV by road on the map before, that are now `call_gain_m` (200 m) further away by
-  road, or out of reach. The UGV calls the standby UAV (if its battery is swapped) only if the
-  belief that UAV can see round them (the UGV's footprint at each) is at least `call_min_belief`
-  (0.005), round nodes out of reach counting `pocket_weight` (2) times. Belief already searched by
-  any robot is gone from the UGV's map, so ground that has been looked at calls nobody. The call
-  lists the cut-off nodes; the UAV takes off where the UGV is, once it has booked its landing (a
-  call it has not booked within `call_timeout_s`, 15 s, is withdrawn). The generated maps keep the
-  roads connected round blocked nodes (unless `road_cutoff_fraction` lets blockages cut off part of
-  the network), so there a blockage only makes the way longer.
+  `call_radius_m` (250 m) of the UGV. With $d_0$ and $d_1$ the distances by road from the UGV's
+  node $g$ on the map before and after the blockage, the road nodes it *cuts off* are those within
+  `call_reach_m` (500 m) before that are now `call_gain_m` (200 m) further away, or out of reach
+  (`_cut_off`):
+
+  $$N_{cut} = \lbrace n : d_0(g, n) \le 500, \ d_1(g, n) - d_0(g, n) \ge 200 \rbrace$$
+
+  Those now out of reach are a *pocket*:
+
+  $$N_{pocket} = \lbrace n \in N_{cut} : d_1(g, n) = \infty \rbrace$$
+
+  The belief the standby UAV can see round a set of nodes $N$ sums, over the cells $c$ in the
+  UGV's footprints $F(n)$ there, the belief left times that UAV's chance of detecting the target:
+
+  $$m(N) = \sum_{c \in \bigcup_{n \in N} F(n)} p_{uav}(c) b(c)$$
+
+  The UGV calls it (if its battery is swapped) only if that belief reaches `call_min_belief`
+  (0.005), with belief round the pocket counting $w$ = `pocket_weight` (2) times:
+
+  $$m(N_{cut}) + (w - 1) m(N_{pocket}) \ge 0.005$$
+
+  ![A blocked node 225 m ahead of the UGV cuts off a road node past it (2 km by the way round) and a dead-end spur (out of reach); their footprints are summed](docs/media/blockage_cut_off.svg)
+
+  Belief already searched by any robot is gone from the UGV's map, so ground that has been looked
+  at calls nobody. The call lists the cut-off nodes; the UAV takes off where the UGV is, once it
+  has booked its landing (a call it has not booked within `call_timeout_s`, 15 s, is withdrawn).
+  The generated maps keep the roads connected round blocked nodes (unless `road_cutoff_fraction`
+  lets blockages cut off part of the network), so there a blockage only makes the way longer.
 - *As a messenger* (`messenger`, with `relay`). The UGV can no longer meet a UAV in time where it
   waits, and that UAV is out of radio contact, so it never hears the new plan: typically a blockage
   sent the UGV the long way round. If the standby UAV is on the dock (its battery swapped within a
@@ -200,6 +262,11 @@ plan (`calls`). The UGV calls it in three cases:
   - *It waits at the point.* The other UAV may still be on its tour; flying past would miss it.
 
   On 40 large maps with cut-offs it cut the UAVs lost from 18 to 6 ([results](README.md#34-results)).
+- *To verify a sighting* (`verify`, when the near scout's own sighting ends the mission). The UGV
+  cannot get within sensor range of its lead on its road map; it calls the near scout from the
+  road node it can reach nearest the lead (or sooner, if a blockage makes the drive there long).
+  See *verifying a sighting* under
+  [`ugv_timed_route`](#ugv_timed_route).
 
 A called UAV books its landing wherever the dock is free, not only after the pin: the plan lists
 the route indices each UAV is on the dock (`busy`). The UGV adds no take-off after that landing.
@@ -214,7 +281,13 @@ subclasses it and implements one method, `plan_sortie`, which picks the landing 
 
 Plans its road route greedily (chaining the best `belief in footprint / (distance + 100 m)`
 within 1.5 km, else the nearest road node with belief left) and keeps it planned
-at least one landing slot per UAV, plus one, plus a full UAV flight ahead. After the pin, the
+at least one landing slot per UAV, plus one, plus a full UAV flight ahead (`route_horizon_s`,
+when not set):
+
+$$H = (n + 1) s + \frac{E}{P_{idle} + \epsilon v}$$
+
+with $n$ the UAVs that book sorties (not standby, not lost), $s$ the slot spacing and the last
+term a flight on a full battery (see [`uav_greedy_tour`](#uav_greedy_tour)). After the pin, the
 route is re-planned on the current belief every 60 s.
 
 - *Sightings:* the UGV pursues its lead (above): a new lead starts the pursuit, its passes and
@@ -252,8 +325,24 @@ route is re-planned on the current belief every 60 s.
   out to be blocked, or when after a re-route the UGV would get there more than `recover_gain_s` (60
   s) late, the UGV moves the landing to where it best meets the UAV: any node of its route between
   the stops around it, or of the shortest way to the landing node (it then skips the route in
-  between). The best meeting lands the UAV soonest with the least waiting by the UGV, among those
-  the UAV can afford to fly to. The take-off follows to the first node the UGV reaches once the
+  between). The UAV flies to a candidate $m$ from where its tour ends ($x_0$, at $t_0$), a
+  distance $d_m$ at speed $v$, and the UGV gets there at $t^{ugv}_m$; they meet once both are
+  there:
+
+  $$t^{uav}_m = t_0 + \frac{d_m}{v}, \quad t_m = \max\left(t^{ugv}_m, \ t^{uav}_m\right)$$
+
+  The best meeting lands the UAV soonest plus the time the UGV waits for it (`_meet`):
+
+  $$m^* = \arg\min_m \ t_m + \max\left(0, \ t^{uav}_m - t^{ugv}_m\right)$$
+
+  among those the UAV can afford, flying there and hovering until the meeting on the energy it
+  can spend ($E_{spare}$, from its status, or as booked):
+
+  $$\epsilon d_m + P_{idle} (t_m - t_0) \le E_{spare}$$
+
+  ![Recovery: the candidate meetings are the route nodes between the stops around UAV A's landing and the nodes on the shortest way to it; out of touch, only those within radio range of where A's tour ends](docs/media/recovery_meeting.svg)
+
+  The take-off follows to the first node the UGV reaches once the
   battery is swapped. A landing moved onto its own take-off's index goes before it: a re-route that
   skips both can put them on one index, and with the take-off first the UGV waited for good for a
   UAV not yet on the dock (on `large` with a mismatch, map 0 timed out with both planners until this
@@ -292,13 +381,25 @@ recovery) goes on in any state, and the mission ends once the target is within i
 
 ### `uav_greedy_tour`
 
-1. **Landing slot (the split).** It aims to land `slot_s` after the last booked landing:
+1. **Landing slot (the split).** It aims to land a slot $s$ (`slot_s`) after the last booked
+   landing (`dock_booking.slot_spacing`). The $n$ UAVs share the dock, so in one cycle each flies
+   a sortie $S$ and stays on the dock $R$, and their landings take turns; a slot is never shorter
+   than one stay:
 
-   ```
-   slot_s = max(R, (S + R) / n_uavs)      S = full sortie, R = dock + swap + undock
-   ```
+   $$s = \max\left(R, \frac{S + R}{n}\right)$$
 
-   With 120 s swaps, `S ≈ 1290 s` and `R ≈ 170 s`, so the slots are about 730 s apart. If it can't reach that
+   The sortie is what the battery flies at speed $v$ above its reserve fraction $\rho$
+   (`uav_reserve_fraction`), and the stay is the landing, swap and take-off with a margin
+   (`stop_margin_s`) on each stop:
+
+   $$S = \frac{(1 - \rho) E}{P_{idle} + \epsilon v}, \quad R = t_{dock} + t_{swap} + t_{undock} + 2 t_{margin}$$
+
+   ($E$ the battery capacity, $P_{idle}$ the power drawn while airborne, $\epsilon$ the energy per
+   metre.) With 120 s swaps and two UAVs:
+
+   $$s = \max\left(170, \frac{1290 + 170}{2}\right) \approx 730 \mathrm{\ s}$$
+
+   If it can't reach that
    landing node in time, the UAV takes the latest earlier one it can. The UAVs therefore land in
    turn, each searching the stretch between its take-off and its landing. With
    `max_landing_risk` below 1 (off by default), it only considers landings that the UGV's plan

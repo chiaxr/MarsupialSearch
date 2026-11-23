@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 430" width="800" height="430" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#1f2937">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+  </defs>
+  <rect x="0" y="0" width="800" height="430" rx="10" fill="#ffffff"/>
+
+  <!-- call radius and call reach -->
+  <circle cx="210" cy="210" r="200" fill="none" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <circle cx="210" cy="210" r="100" fill="#f3f4f6" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="355" y="60" font-size="12" fill="#4b5563">call_reach_m: 500 m by road</text>
+  <text x="137" y="128" text-anchor="end" font-size="12" fill="#4b5563">call_radius_m: 250 m</text>
+
+  <!-- footprints round the cut-off nodes: the belief summed -->
+  <g fill="#fdba74" fill-opacity="0.45"><circle cx="360" cy="210" r="24"/></g>
+  <g fill="#f87171" fill-opacity="0.40"><circle cx="300" cy="160" r="24"/><circle cx="300" cy="110" r="24"/></g>
+
+  <!-- roads -->
+  <g stroke="#9ca3af" stroke-width="3" fill="none">
+    <line x1="60" y1="210" x2="540" y2="210"/>
+    <line x1="60" y1="330" x2="540" y2="330"/>
+    <line x1="120" y1="210" x2="120" y2="330"/>
+    <line x1="480" y1="210" x2="480" y2="330"/>
+    <line x1="300" y1="210" x2="300" y2="110"/>
+  </g>
+  <!-- the UGV's planned route, into the blockage -->
+  <line x1="222" y1="210" x2="286" y2="210" stroke="#2563eb" stroke-width="4" marker-end="url(#arr)"/>
+  <!-- the way round now -->
+  <polyline points="210,218 128,218 128,338 472,338 472,218 360,218" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="6 4"/>
+  <text x="300" y="356" text-anchor="middle" font-size="12" fill="#1d4ed8">the way round to the node past it: about 2 km, against 375 m before</text>
+
+  <!-- nodes -->
+  <g fill="#ffffff" stroke="#6b7280" stroke-width="1.5">
+    <circle cx="60" cy="210" r="5"/><circle cx="120" cy="210" r="5"/><circle cx="180" cy="210" r="5"/><circle cx="240" cy="210" r="5"/>
+    <circle cx="420" cy="210" r="5"/><circle cx="480" cy="210" r="5"/><circle cx="540" cy="210" r="5"/>
+    <circle cx="60" cy="330" r="5"/><circle cx="120" cy="330" r="5"/><circle cx="180" cy="330" r="5"/><circle cx="240" cy="330" r="5"/><circle cx="300" cy="330" r="5"/><circle cx="360" cy="330" r="5"/><circle cx="420" cy="330" r="5"/><circle cx="480" cy="330" r="5"/><circle cx="540" cy="330" r="5"/>
+  </g>
+  <circle cx="360" cy="210" r="6" fill="#f97316" stroke="#9a3412" stroke-width="1.5"/>
+  <circle cx="300" cy="160" r="6" fill="#dc2626" stroke="#7f1d1d" stroke-width="1.5"/>
+  <circle cx="300" cy="110" r="6" fill="#dc2626" stroke="#7f1d1d" stroke-width="1.5"/>
+
+  <!-- blocked node -->
+  <g stroke="#dc2626" stroke-width="4" stroke-linecap="round"><line x1="291" y1="201" x2="309" y2="219"/><line x1="309" y1="201" x2="291" y2="219"/></g>
+  <text x="314" y="238" font-size="12" fill="#b91c1c">blocked</text>
+
+  <!-- UGV -->
+  <rect x="196" y="201" width="28" height="18" rx="4" fill="#111827"/>
+  <text x="210" y="248" text-anchor="middle" font-weight="bold">UGV</text>
+
+  <!-- legend -->
+  <g font-size="12">
+    <circle cx="590" cy="150" r="6" fill="#f97316" stroke="#9a3412" stroke-width="1.5"/>
+    <text x="604" y="146">cut off: within 500 m by road</text>
+    <text x="604" y="161">before, ≥ 200 m further now</text>
+    <circle cx="590" cy="195" r="6" fill="#dc2626" stroke="#7f1d1d" stroke-width="1.5"/>
+    <text x="604" y="191">out of reach now (a pocket):</text>
+    <text x="604" y="206">its belief counts twice</text>
+    <circle cx="590" cy="242" r="13" fill="#fdba74" fill-opacity="0.45"/>
+    <text x="611" y="238">UGV's footprint at each:</text>
+    <text x="611" y="253">the belief the near scout</text>
+    <text x="611" y="268">can see there is summed</text>
+    <circle cx="590" cy="292" r="6" fill="#ffffff" stroke="#6b7280" stroke-width="1.5"/>
+    <text x="604" y="296">not cut off</text>
+  </g>
+  <text x="590" y="96" font-size="12" fill="#4b5563">The UGV's route runs into a</text>
+  <text x="590" y="111" font-size="12" fill="#4b5563">blocked node within 250 m:</text>
+  <text x="590" y="126" font-size="12" fill="#4b5563">which road nodes does it cut off?</text>
+  <text x="590" y="340" font-size="11" fill="#6b7280">Sketch: 1 px is 2.5 m.</text>
+</svg>

@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 420" width="820" height="420" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#1f2937">
+  <defs>
+    <marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+    <marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9ca3af"/></marker>
+  </defs>
+  <rect x="0" y="0" width="820" height="420" rx="10" fill="#ffffff"/>
+
+  <!-- radio range round where A's tour ends -->
+  <circle cx="330" cy="130" r="112" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="450" y="44" font-size="12" fill="#1d4ed8">radio range: A out of touch</text>
+  <text x="450" y="59" font-size="12" fill="#1d4ed8">is met only in here</text>
+
+  <!-- A's tour, ending at F -->
+  <polyline points="40,60 130,105 220,70 330,130" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrA)"/>
+  <g fill="#2563eb"><circle cx="130" cy="105" r="3.5"/><circle cx="220" cy="70" r="3.5"/></g>
+  <circle cx="330" cy="130" r="6" fill="#2563eb"/>
+  <text x="44" y="46" fill="#1d4ed8"><tspan font-weight="bold">UAV A</tspan>'s tour</text>
+  <text x="342" y="124" font-size="12" fill="#1d4ed8">tour ends: x<tspan baseline-shift="sub" font-size="9">0</tspan> at t<tspan baseline-shift="sub" font-size="9">0</tspan></text>
+
+  <!-- flights to some candidates -->
+  <line x1="330" y1="136" x2="562" y2="304" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrG)"/>
+  <line x1="330" y1="136" x2="360" y2="302" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrG)"/>
+  <line x1="330" y1="136" x2="302" y2="222" stroke="#2563eb" stroke-width="2.5" stroke-dasharray="7 4" marker-end="url(#arrA)"/>
+
+  <!-- the route: straight, a loop, straight -->
+  <polyline points="20,310 200,310 240,260 300,230 370,225 430,245 480,285 520,310 800,310" fill="none" stroke="#374151" stroke-width="4" stroke-linejoin="round"/>
+  <!-- the shortest way to the landing node -->
+  <line x1="200" y1="310" x2="520" y2="310" stroke="#16a34a" stroke-width="2.5" stroke-dasharray="8 5"/>
+  <text x="360" y="336" text-anchor="middle" font-size="12" fill="#15803d">shortest way to A's landing node (the UGV then skips the loop)</text>
+
+  <!-- route nodes outside the candidate window -->
+  <g fill="#ffffff" stroke="#374151" stroke-width="1.5">
+    <circle cx="40" cy="310" r="4"/><circle cx="80" cy="310" r="4"/><circle cx="120" cy="310" r="4"/><circle cx="720" cy="310" r="4"/><circle cx="760" cy="310" r="4"/>
+  </g>
+  <!-- candidates -->
+  <g fill="#bbf7d0" stroke="#16a34a" stroke-width="2">
+    <circle cx="200" cy="310" r="5"/><circle cx="240" cy="260" r="5"/><circle cx="370" cy="225" r="5"/><circle cx="430" cy="245" r="5"/><circle cx="480" cy="285" r="5"/><circle cx="520" cy="310" r="5"/><circle cx="600" cy="310" r="5"/><circle cx="640" cy="310" r="5"/>
+    <circle cx="280" cy="310" r="5"/><circle cx="360" cy="310" r="5"/><circle cx="440" cy="310" r="5"/>
+  </g>
+  <!-- chosen meeting -->
+  <circle cx="300" cy="230" r="8" fill="#2563eb" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="286" y="214" text-anchor="end" font-weight="bold" fill="#1e3a8a">m*</text>
+
+  <!-- booked landing the UGV can't make -->
+  <circle cx="560" cy="310" r="5" fill="#bbf7d0" stroke="#16a34a" stroke-width="2"/>
+  <g stroke="#dc2626" stroke-width="3" stroke-linecap="round"><line x1="551" y1="292" x2="569" y2="274"/><line x1="569" y1="292" x2="551" y2="274"/></g>
+  <text x="580" y="270" font-size="12" fill="#b91c1c">A's booked landing: the UGV gets</text>
+  <text x="580" y="285" font-size="12" fill="#b91c1c">there too late, or it is blocked</text>
+
+  <!-- stops on either side -->
+  <rect x="152" y="301" width="16" height="18" fill="#fef3c7" stroke="#d97706"/>
+  <rect x="672" y="301" width="16" height="18" fill="#fef3c7" stroke="#d97706"/>
+  <text x="160" y="360" text-anchor="middle" font-size="12" fill="#b45309">stop before</text>
+  <text x="160" y="374" text-anchor="middle" font-size="12" fill="#b45309">(B takes off)</text>
+  <text x="680" y="360" text-anchor="middle" font-size="12" fill="#b45309">stop after</text>
+  <text x="680" y="374" text-anchor="middle" font-size="12" fill="#b45309">(B lands)</text>
+
+  <!-- UGV -->
+  <rect x="66" y="301" width="28" height="18" rx="4" fill="#111827"/>
+  <text x="80" y="340" text-anchor="middle" font-weight="bold">UGV</text>
+
+  <!-- legend -->
+  <circle cx="248" cy="398" r="5" fill="#bbf7d0" stroke="#16a34a" stroke-width="2"/>
+  <text x="260" y="402" font-size="12">candidate meeting: a route node between the stops, or on the shortest way</text>
+</svg>
